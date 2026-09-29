@@ -480,3 +480,34 @@ modified or different file simply runs interpreted.
 Entry points that static analysis cannot find are supplied as source-derived
 metadata (`DOS2TEST.entries`, generated from the NASM listing), in line with
 the source-assisted design (#15).
+
+## 37. One portable system loop, proven on the desktop before hardware
+
+The desktop runner single-steps for tracing, which is the wrong shape for the
+RP2350. `md_dos2_system_run()` instead runs slices through the decoded-block
+cache and returns to the caller only at a slice boundary or when execution
+reaches a place where compiled code may run (a compiled entry in an attached
+segment, or `XXXX:0100` where DOS may just have started a known program).
+
+The Pico firmware is a thin wrapper around that loop. Before any hardware
+run, the identical loop is exercised by `microdos_dos2_e2e`, which boots the
+released kernel, drives the prompts with scripted keys released only after
+the prompt text appears (so DOS input flushes cannot eat them), and requires
+DOS2TEST to pass with and without AOT. This was also the first full DOS
+session run through the block cache.
+
+## 38. Pico memory layout: guest and disk in PSRAM, code in flash
+
+The whole 1 MiB guest space and the working copy of the disk live in PSRAM
+(`__uninitialized_psram`, so they do not inflate the UF2), placed and checked
+the same way microconsole's FastDoom PSRAM probe does. Runtime state and the
+decoded-block cache stay in SRAM. Interpreter, generated code, the kernel
+and the disk image run/read from flash through XIP.
+
+Known performance risk, deliberately measured before optimising: flash code
+and PSRAM data share the RP2350's 16 KiB XIP cache, and the DOS kernel keeps
+data beside its code, which causes frequent decoded-block invalidations
+(about 62k in one DOS2TEST session on the desktop). The first hardware run
+reports MIPS and cache statistics (Ctrl+]) so the next step, moving hot
+interpreter paths to SRAM or refining invalidation, is driven by numbers.
+Disk persistence to flash is a later milestone; this one keeps writes in RAM.

@@ -244,6 +244,19 @@ is preserved between runs; use `md.bat image dos2` to reset it.
 ```
 
 
+### M14 Pico 2 target and portable system loop
+
+`src/system/md_dos2_system.c` is a platform-neutral MS-DOS 2.0 loop: boot
+contract, decoded-block cache, and AOT attach/enter. Two things use it:
+
+- `pico/` builds firmware for the Pimoroni Pico Plus 2 (`.\md.bat build pico`,
+  see `pico/README.md`): USB serial console, 1 MiB guest memory and the disk
+  in PSRAM, kernel and compiled DOS2TEST in flash.
+- `microdos_dos2_e2e`, a ctest that boots DOS through the same loop, answers
+  the date/time prompts, runs DOS2TEST at `A>`, and requires 25/25, once with
+  compiled code and once interpreted (`dos2_e2e_aot`, `dos2_e2e_interp`).
+  It runs automatically when `third_party/msdos` is present.
+
 ### M13 compiled DOS programs inside real DOS
 
 `dosrecomp` v2 discovers code with the shared full 8086 decoder and compiles

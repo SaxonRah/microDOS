@@ -4,6 +4,7 @@ rem microDOS - single entry point for host/runtime/recompiler development.
 rem
 rem   .\md.bat deps msdos
 rem   .\md.bat build host
+rem   .\md.bat build pico           (Pimoroni Pico Plus 2 firmware, .uf2)
 rem   .\md.bat run host
 rem   .\md.bat run dos2 [budget]    (interactive; Ctrl+] exits; 0/omitted = unlimited)
 rem   .\md.bat test
@@ -49,12 +50,33 @@ echo   .\md.bat deps msdos
 exit /b 1
 
 :build
+if /i "%~1"=="pico" goto build_pico
 if /i not "%~1"=="host" (
-    echo ERROR: current build target is "host".
+    echo ERROR: build targets are "host" and "pico".
     exit /b 1
 )
 cmake -S "%MD_ROOT%" -B "%MD_ROOT%\build-host" -DMD_BUILD_HOST=ON -DMD_BUILD_TESTS=ON || exit /b 1
 cmake --build "%MD_ROOT%\build-host" --config Release || exit /b 1
+exit /b 0
+
+:build_pico
+rem Pico 2 / Pimoroni Pico Plus 2 firmware. Needs the desktop tools first
+rem (dosrecomp generates DOS2TEST's C, mkfat12 builds the embedded disk).
+call :build_host_if_needed || exit /b 1
+if not exist "%MD_ROOT%\third_party\msdos\v2.0\bin\MSDOS.SYS" (
+    echo ERROR: MS-DOS 2.0 binaries are missing. Run: .\md.bat deps msdos
+    exit /b 1
+)
+call "%MD_ROOT%\scripts\md_pico_env.bat" || exit /b 1
+if not exist "%MD_ROOT%\build-pico" mkdir "%MD_ROOT%\build-pico" || exit /b 1
+set "MKFAT_EXE=%MD_ROOT%\build-host\mkfat12.exe"
+if exist "%MD_ROOT%\build-host\Release\mkfat12.exe" set "MKFAT_EXE=%MD_ROOT%\build-host\Release\mkfat12.exe"
+"%MKFAT_EXE%" --command "%MD_ROOT%\third_party\msdos\v2.0\bin\COMMAND.COM" --add "%MD_ROOT%\tests\dos2\DOS2TEST.COM" DOS2TEST.COM --output "%MD_ROOT%\build-pico\pico_disk.img" || exit /b 1
+cmake -S "%MD_ROOT%\pico" -B "%MD_ROOT%\build-pico\out" -G Ninja "-DCMAKE_MAKE_PROGRAM=%NINJA_EXE%" "-DMICRODOS_HOST_BUILD=%MD_ROOT%\build-host" "-DMICRODOS_PICO_DISK=%MD_ROOT%\build-pico\pico_disk.img" || exit /b 1
+cmake --build "%MD_ROOT%\build-pico\out" || exit /b 1
+echo.
+echo Firmware: %MD_ROOT%\build-pico\out\microdos_pico.uf2
+echo Hold BOOTSEL while plugging in the Pico Plus 2, then copy the .uf2 to the RP2350 drive.
 exit /b 0
 
 :run
@@ -205,6 +227,7 @@ exit /b 0
 if exist "%MD_ROOT%\build-host" rmdir /s /q "%MD_ROOT%\build-host"
 if exist "%MD_ROOT%\build-recomp" rmdir /s /q "%MD_ROOT%\build-recomp"
 if exist "%MD_ROOT%\build-analysis" rmdir /s /q "%MD_ROOT%\build-analysis"
+if exist "%MD_ROOT%\build-pico" rmdir /s /q "%MD_ROOT%\build-pico"
 if /i "%~1"=="all" (
     if exist "%MD_ROOT%\build-disk" rmdir /s /q "%MD_ROOT%\build-disk"
     echo clean including persistent DOS disk image.
@@ -218,6 +241,7 @@ echo microDOS build, run, and recompilation driver.
 echo.
 echo   .\md.bat deps msdos
 echo   .\md.bat build host
+echo   .\md.bat build pico          ^(Pico Plus 2 firmware; needs Pico SDK 2.3.0^)
 echo   .\md.bat run host
 echo   .\md.bat run dos2 [budget]    ^(interactive; Ctrl+] exits; 0/omitted = unlimited^)
 echo   .\md.bat test

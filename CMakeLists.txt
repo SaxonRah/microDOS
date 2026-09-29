@@ -127,4 +127,31 @@ if(MD_BUILD_TESTS)
     add_test(NAME microdos_runtime COMMAND microdos_tests)
     add_test(NAME dosprobe_selftest COMMAND dosprobe --selftest)
     add_test(NAME mkfat12_selftest COMMAND mkfat12 --selftest)
+
+    # M14 end-to-end: boot the released MS-DOS 2.0 through the portable
+    # system loop (the code the Pico 2 runs) and pass DOS2TEST at A>.
+    # Needs the pinned Microsoft binaries (.\md.bat deps msdos).
+    set(MD_MSDOS2_BIN "${CMAKE_CURRENT_LIST_DIR}/third_party/msdos/v2.0/bin")
+    if(EXISTS "${MD_MSDOS2_BIN}/MSDOS.SYS" AND EXISTS "${MD_MSDOS2_BIN}/COMMAND.COM")
+        add_executable(microdos_dos2_e2e tests/test_dos2_e2e.c
+            src/system/md_dos2_system.c src/host/msdos2_boot.c
+            "${MD_RECOMP_dos2test_C}" "${MD_RECOMP_dos2test_H}")
+        target_link_libraries(microdos_dos2_e2e PRIVATE microdos::runtime)
+        target_include_directories(microdos_dos2_e2e PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/src/host" "${CMAKE_CURRENT_LIST_DIR}/src/system" "${MD_GENERATED_DIR}")
+        if(MSVC)
+            target_compile_definitions(microdos_dos2_e2e PRIVATE _CRT_SECURE_NO_WARNINGS)
+        endif()
+        set(MD_E2E_IMG "${CMAKE_CURRENT_BINARY_DIR}/e2e_msdos2.img")
+        add_test(NAME dos2_e2e_image COMMAND mkfat12
+            --command "${MD_MSDOS2_BIN}/COMMAND.COM"
+            --add "${CMAKE_CURRENT_LIST_DIR}/tests/dos2/DOS2TEST.COM" DOS2TEST.COM
+            --output "${MD_E2E_IMG}")
+        set_tests_properties(dos2_e2e_image PROPERTIES FIXTURES_SETUP dos2_image)
+        add_test(NAME dos2_e2e_aot COMMAND microdos_dos2_e2e "${MD_MSDOS2_BIN}/MSDOS.SYS" "${MD_E2E_IMG}")
+        add_test(NAME dos2_e2e_interp COMMAND microdos_dos2_e2e "${MD_MSDOS2_BIN}/MSDOS.SYS" "${MD_E2E_IMG}" --no-aot)
+        set_tests_properties(dos2_e2e_aot dos2_e2e_interp PROPERTIES FIXTURES_REQUIRED dos2_image)
+    else()
+        message(STATUS "microDOS: DOS 2 end-to-end tests skipped (run .\\md.bat deps msdos)")
+    endif()
 endif()
