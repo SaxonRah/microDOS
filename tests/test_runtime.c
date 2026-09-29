@@ -452,6 +452,64 @@ static void test_aot_self_modifying_code(uint8_t *memory)
     CHECK(cache.decodes >= 1u);
 }
 
+/* M13: attach-mode guard is byte-exact. hello.com is code at 0100-010B and
+   a string at 010C-0122; writing the string must not disable compiled code,
+   writing an instruction byte must. */
+static void test_aot_guard_byte_exact(uint8_t *memory)
+{
+    MdRuntime runtime;
+    MdHooks hooks = {0};
+    const MdAotProgram *prog = &md_recomp_hello_program;
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+
+    CHECK(!prog->attach(&runtime, 0x2000u));             /* nothing loaded yet */
+    CHECK(!prog->ready(&runtime, 0x2000u));
+
+    /* Load the real bytes the way DOS would (tracked writes), then attach. */
+    {
+        static const uint8_t hello[] = {
+            0xB4, 0x09, 0xBA, 0x0C, 0x01, 0xCD, 0x21, 0xB8, 0x00, 0x4C, 0xCD, 0x21,
+            'H','e','l','l','o',' ','f','r','o','m',' ','m','i','c','r','o','D','O','S','!',
+            0x0D, 0x0A, '$'
+        };
+        unsigned i;
+        for (i = 0; i < sizeof(hello); ++i) md_x86_write8(&runtime.cpu, 0x2000u, (uint16_t)(0x0100u + i), hello[i]);
+    }
+    CHECK(prog->attach(&runtime, 0x2000u));
+    CHECK(prog->ready(&runtime, 0x2000u));
+    CHECK(prog->is_entry(0x0100u));
+    CHECK(!prog->is_entry(0x0101u));
+    CHECK(prog->compiled_instructions == 5u);
+    CHECK(prog->hole_instructions == 0u);
+
+    md_x86_write8(&runtime.cpu, 0x2000u, 0x0110u, 'X');   /* data byte */
+    CHECK(prog->ready(&runtime, 0x2000u));
+
+    /* Enter compiled code at 0100: MOV AH,9 / MOV DX,010C / INT 21h. With an
+       empty IVT the INT leaves the segment, so enter() returns NONE after
+       exactly three compiled instructions. */
+    runtime.cpu.cs = 0x2000u;
+    runtime.cpu.ip = 0x0100u;
+    runtime.cpu.ss = 0x3000u;
+    runtime.cpu.r[MD_X86_SP] = 0xFFFEu;
+    CHECK(prog->enter(&runtime, 100u) == MD_STOP_NONE);
+    CHECK(runtime.aot_instructions == 3u);
+    CHECK(runtime.cpu.r[MD_X86_DX] == 0x010Cu);
+    CHECK(md_x86_get_reg8(&runtime.cpu, 4u) == 0x09u);
+
+    md_x86_write8(&runtime.cpu, 0x2000u, 0x0102u, 0x90u);   /* instruction byte */
+    CHECK(!prog->ready(&runtime, 0x2000u));
+    runtime.cpu.cs = 0x2000u;
+    runtime.cpu.ip = 0x0100u;
+    {
+        const uint64_t before = runtime.aot_instructions;
+        CHECK(prog->enter(&runtime, 100u) == MD_STOP_NONE);
+        CHECK(runtime.aot_instructions == before);         /* refused */
+    }
+}
+
 static void test_budget(uint8_t *memory)
 {
     MdRuntime runtime;
@@ -1547,6 +1605,7 @@ int main(void)
     test_cached_fallback(memory);
     test_page_code_invalidation(memory);
     test_hybrid_aot_cache_handoff(memory);
+    test_aot_guard_byte_exact(memory);
     test_aot_self_modifying_code(memory);
     test_budget(memory);
     test_phase_a_flag_semantics();

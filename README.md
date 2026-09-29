@@ -244,6 +244,25 @@ is preserved between runs; use `md.bat image dos2` to reset it.
 ```
 
 
+### M13 compiled DOS programs inside real DOS
+
+`dosrecomp` v2 discovers code with the shared full 8086 decoder and compiles
+most of the instruction set to C; the rest become explicit interpreter holes.
+DOS2TEST.COM is recompiled at build time (1132 of 1140 instructions native)
+and linked into `microdos_msdos2`. When you type `DOS2TEST` at `A>`, DOS
+loads the file itself; the runner recognises the bytes at `XXXX:0100`,
+attaches the compiled image, and enters native code at every compiled entry.
+DOS calls still go through the real MS-DOS 2.0 kernel. The summary line
+reports it:
+
+```
+[aot] DOS2TEST.COM attached 2 time(s), last at 1717:0100; ... (87.9% native)
+```
+
+Guest output is identical with `MICRODOS_NO_AOT=1` (pure interpreter). A
+write to any compiled instruction byte disables that copy immediately; writes
+to its variables do not (DECISIONS #34).
+
 ### M12.5 disk writes survive any exit; Ctrl+C belongs to DOS
 
 Every sector DOS writes is now written straight through to

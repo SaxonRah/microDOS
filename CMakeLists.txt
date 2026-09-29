@@ -27,6 +27,7 @@ add_library(microdos::decode ALIAS microdos_decode)
 target_include_directories(microdos_decode PUBLIC "${CMAKE_CURRENT_LIST_DIR}/include")
 
 add_executable(dosrecomp tools/dosrecomp/main.c)
+target_link_libraries(dosrecomp PRIVATE microdos::decode)
 add_executable(dosprobe tools/dosprobe/main.c)
 add_executable(mkfat12 tools/mkfat12/main.c)
 target_link_libraries(dosprobe PRIVATE microdos::decode)
@@ -55,6 +56,8 @@ endif()
 set(MD_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${MD_GENERATED_DIR}")
 
+# Extra arguments after code_end are passed to dosrecomp unchanged
+# (--entry N, --entries FILE, --interp-at N, --name NAME).
 function(md_recompile_com name symbol input code_end)
     set(out_c "${MD_GENERATED_DIR}/${name}_recomp.c")
     set(out_h "${MD_GENERATED_DIR}/${name}_recomp.h")
@@ -66,7 +69,8 @@ function(md_recompile_com name symbol input code_end)
             --output-h "${out_h}"
             --symbol "${symbol}"
             --code-end "${code_end}"
-        DEPENDS dosrecomp "${CMAKE_CURRENT_LIST_DIR}/${input}"
+            ${ARGN}
+        DEPENDS dosrecomp "${CMAKE_CURRENT_LIST_DIR}/${input}" ${MD_RECOMP_EXTRA_DEPENDS}
         COMMENT "dosrecomp ${name}.com"
         VERBATIM
     )
@@ -76,17 +80,27 @@ endfunction()
 
 md_recompile_com(hello md_recomp_hello tests/programs/hello.com 0x10c)
 md_recompile_com(loop md_recomp_loop tests/programs/loop.com 0x107)
-md_recompile_com(hybrid md_recomp_hybrid tests/programs/hybrid.com 0x109)
+# 0105h MOV BX,AX is compiled by dosrecomp v2; pin it as an interpreter hole so
+# this fixture keeps proving the AOT -> cached interpreter -> AOT handoff.
+md_recompile_com(hybrid md_recomp_hybrid tests/programs/hybrid.com 0x109 --interp-at 0x105)
 md_recompile_com(selfmod md_recomp_selfmod tests/programs/selfmod.com 0x107)
+
+# M13: DOS2TEST.COM compiled natively and attached when DOS loads it at A>.
+# Entry points come from the NASM listing (tests reached via CALL BX).
+set(MD_RECOMP_EXTRA_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tests/dos2/DOS2TEST.entries")
+md_recompile_com(dos2test md_recomp_dos2test tests/dos2/DOS2TEST.COM 0x0B97
+    --entries "${CMAKE_CURRENT_LIST_DIR}/tests/dos2/DOS2TEST.entries" --name DOS2TEST.COM)
+unset(MD_RECOMP_EXTRA_DEPENDS)
 
 if(MD_BUILD_HOST)
     add_executable(microdos_host src/host/main.c src/host/host_dos.c "${MD_RECOMP_hello_C}" "${MD_RECOMP_hello_H}")
     target_link_libraries(microdos_host PRIVATE microdos::runtime)
     target_include_directories(microdos_host PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/host" "${MD_GENERATED_DIR}")
 
-    add_executable(microdos_msdos2 src/host/msdos2_main.c src/host/msdos2_boot.c)
+    add_executable(microdos_msdos2 src/host/msdos2_main.c src/host/msdos2_boot.c
+        "${MD_RECOMP_dos2test_C}" "${MD_RECOMP_dos2test_H}")
     target_link_libraries(microdos_msdos2 PRIVATE microdos::runtime)
-    target_include_directories(microdos_msdos2 PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/host")
+    target_include_directories(microdos_msdos2 PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/host" "${MD_GENERATED_DIR}")
     if(MSVC)
         target_compile_definitions(microdos_msdos2 PRIVATE _CRT_SECURE_NO_WARNINGS)
         target_compile_options(microdos_msdos2 PRIVATE /W4 /permissive- $<$<CONFIG:Release>:/O2>)

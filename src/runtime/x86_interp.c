@@ -156,32 +156,15 @@ static inline void md_fault(MdRuntime *runtime, uint8_t opcode, uint16_t ip_befo
     runtime->stop_reason = MD_STOP_FAULT;
 }
 
+/* One ALU implementation for interpreter and generated code (ops.h). */
 static inline uint8_t md_alu8(MdX86 *cpu, unsigned operation, uint8_t lhs, uint8_t rhs)
 {
-    switch (operation & 7u) {
-        case 0u: return md_x86_add8(cpu, lhs, rhs);
-        case 1u: return md_x86_logic8(cpu, (uint8_t)(lhs | rhs));
-        case 2u: return md_x86_adc8(cpu, lhs, rhs);
-        case 3u: return md_x86_sbb8(cpu, lhs, rhs);
-        case 4u: return md_x86_logic8(cpu, (uint8_t)(lhs & rhs));
-        case 5u: return md_x86_sub8(cpu, lhs, rhs);
-        case 6u: return md_x86_logic8(cpu, (uint8_t)(lhs ^ rhs));
-        default: return md_x86_sub8(cpu, lhs, rhs); /* CMP */
-    }
+    return md_x86_alu8(cpu, operation, lhs, rhs);
 }
 
 static inline uint16_t md_alu16(MdX86 *cpu, unsigned operation, uint16_t lhs, uint16_t rhs)
 {
-    switch (operation & 7u) {
-        case 0u: return md_x86_add16(cpu, lhs, rhs);
-        case 1u: return md_x86_logic16(cpu, (uint16_t)(lhs | rhs));
-        case 2u: return md_x86_adc16(cpu, lhs, rhs);
-        case 3u: return md_x86_sbb16(cpu, lhs, rhs);
-        case 4u: return md_x86_logic16(cpu, (uint16_t)(lhs & rhs));
-        case 5u: return md_x86_sub16(cpu, lhs, rhs);
-        case 6u: return md_x86_logic16(cpu, (uint16_t)(lhs ^ rhs));
-        default: return md_x86_sub16(cpu, lhs, rhs); /* CMP */
-    }
+    return md_x86_alu16(cpu, operation, lhs, rhs);
 }
 
 static inline void md_op_mov_r8_imm(MdRuntime *runtime, uint8_t opcode)

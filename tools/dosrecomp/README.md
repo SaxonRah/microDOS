@@ -1,46 +1,56 @@
 # dosrecomp
 
-`dosrecomp` is microDOS's source-assisted 8086 static recompiler. The binary is authoritative; original source, maps, symbols, and manual metadata improve analysis but do not replace the machine code.
+`dosrecomp` is microDOS's source-assisted 8086 static recompiler. The binary is
+authoritative; source-derived metadata (entry points, forced interpreter
+points) improves analysis but never replaces the machine code.
 
-## Working milestone
+## v2 (M13)
 
-The tool now:
+1. Loads a `.COM` image at its architectural `0100h` origin.
+2. Discovers reachable code with the shared structural decoder
+   (`md_decode_8086`, the same one `dosprobe` uses), so discovery never stops
+   at an instruction the emitter cannot compile.
+3. Forms blocks at every branch target, call return point, and re-entry point.
+4. Emits portable C against `MdRuntime`/`MdX86`, using the same `ops.h`
+   helpers as the interpreter (`md_x86_alu8/16`, shifts, conditions).
+5. Leaves anything it does not compile as an explicit **interpreter hole**:
+   generated code hands CS:IP to the interpreter, which executes it and
+   returns at the next compiled entry.
+6. Embeds a one-bit-per-byte code map and arms a byte-exact write guard, so
+   writes to data that shares a page with code do not disable compiled code,
+   while writes to instruction bytes do, immediately.
+7. Exports two ways to run: standalone (`md_recomp_X(runtime, seg, budget)`,
+   loads the embedded image) and attach mode (`md_recomp_X_program`, see
+   `include/microdos/aot.h`) for images loaded by a real DOS.
 
-1. loads a `.COM` image at its architectural `0100h` origin;
-2. discovers reachable instructions before forming blocks;
-3. marks direct branch/call targets and control-flow fallthroughs;
-4. forms non-overlapping basic blocks;
-5. emits readable portable C against `MdRuntime`/`MdX86`;
-6. embeds the complete original image so guest data addresses remain valid;
-7. emits interpreter fallback points for reachable instructions the AOT decoder does not yet understand;
-8. re-enters AOT when interpreted execution reaches a known compiled `CS:IP`.
-
-Current AOT coverage includes immediate register moves, INC/DEC/PUSH/POP, AL/AX immediate ADD/SUB/CMP, JZ/JNZ/JMP/CALL/RET, moffs MOV forms, INT, NOP, and HLT.
-
-The high-throughput interpreter remains separate; `md_interp_step()` exists only for correctness-first mixed-mode handoff. The future decoded-block cache will return to AOT at block boundaries rather than checking after every fallback instruction.
+Compiled natively: all ALU forms (00-3D, 80-83), MOV/XCHG/TEST/LEA/LES/LDS,
+segment moves and pushes, INC/DEC/PUSH/POP (register and r/m), all Jcc,
+LOOP/LOOPZ/LOOPNZ/JCXZ, CALL/RET/JMP (near direct and indirect, RETF),
+shifts and rotates, NOT/NEG, CBW/CWD, flag instructions, PUSHF/POPF/SAHF/LAHF,
+single string operations, INT, HLT. Holes: MUL/IMUL/DIV/IDIV, REP strings,
+BCD adjust, IRET, IN/OUT, far CALL/JMP, and anything invalid.
 
 ## Usage
 
-```bat
-.\md.bat recomp tests\programs\hello.com hello 0x10c
+```text
+dosrecomp --input file.com --output-c out.c --output-h out.h --symbol md_recomp_name
+          [--code-start N] [--code-end N] [--entry N]... [--entries FILE]
+          [--interp-at N]... [--name NAME] [--dump]
 ```
 
-Direct form:
+- `--code-end` is exclusive: data after code in a `.COM` image is not decoded.
+- `--entry N` / `--entries FILE` add entry points that static analysis cannot
+  find (for example procedures reached only through a table of pointers).
+  The file has one address per line; `#` starts a comment; a line
+  `0xNNNN interp` is the same as `--interp-at`.
+- `--interp-at N` forces the instruction at N to run in the interpreter.
+
+Example (what the build does for DOS2TEST):
 
 ```text
-dosrecomp --input file.com --output-c out.c --output-h out.h --symbol md_recomp_name [--code-start N] [--code-end N] [--dump]
+dosrecomp --input tests/dos2/DOS2TEST.COM --code-end 0x0B97 \
+          --entries tests/dos2/DOS2TEST.entries --name DOS2TEST.COM \
+          --output-c dos2test_recomp.c --output-h dos2test_recomp.h --symbol md_recomp_dos2test
 ```
 
-`--code-end` is exclusive and controls analysis only. This is useful when executable bytes are immediately followed by data in a `.COM` image.
-
-## Next
-
-The next compiler/runtime milestone is a shared instruction-description decoder with complete 8086 ModR/M and prefix handling. Both `dosrecomp` and the decoded-block interpreter cache should consume that description instead of growing two decoders.
-
-## Mixed execution after milestone 3
-
-Generated code now includes a compact resume predicate listing valid compiled block entries. If execution reaches unknown code, an indirect target, or code invalidated by a guest write, AOT enters the runtime-owned decoded block cache with `md_interp_run_cached_until()`.
-
-The cached path may execute any number of blocks and canonical interpreter fallbacks before returning. It hands control back only when `CS:IP` reaches a still-valid compiled entry. If guest code has modified a compiled code page, the generated image-wide write epoch is stale and AOT remains disabled for the rest of that invocation.
-
-This keeps correctness simple for overlays and self-modifying code while preserving a fast path back into native code for ordinary unresolved control flow.
+Result: 1140 instructions, 1132 compiled, 8 interpreter holes.

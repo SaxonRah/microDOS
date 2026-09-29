@@ -1,6 +1,26 @@
+#include "microdos/aot.h"
 #include "microdos/block_cache.h"
 #include "microdos/runtime.h"
 #include "msdos2_boot.h"
+
+#include "dos2test_recomp.h"
+
+/* M13: programs compiled by dosrecomp and linked into the runner. When DOS
+   starts one of them (CS:IP = XXXX:0100 with matching bytes) the runner
+   attaches it and enters native code at every compiled entry point. */
+static const MdAotProgram *const g_md_aot_programs[] = {
+    &md_recomp_dos2test_program,
+};
+#define MD_AOT_PROGRAM_COUNT (sizeof(g_md_aot_programs) / sizeof(g_md_aot_programs[0]))
+#define MD_AOT_CHUNK 65536u
+
+typedef struct MdAotStats {
+    uint32_t attaches;
+    uint32_t enters;
+    uint64_t interp_in_image;   /* instructions interpreted while CS was attached */
+    uint16_t last_segment;
+    const MdAotProgram *last_program;
+} MdAotStats;
 
 #include <signal.h>
 #include <stdio.h>
@@ -807,6 +827,10 @@ int main(int argc, char **argv)
     uint32_t user_write_sequence = 0u;
     const bool trace_first_dollar = md_env_enabled("MICRODOS_TRACE_FIRST_DOLLAR");
     const bool trace_disk = md_env_enabled("MICRODOS_TRACE_DISK");
+    /* AOT stays off in the '$' diagnostic mode (it needs every instruction in
+       its trace ring) and when explicitly disabled for differential runs. */
+    const bool aot_enabled = !md_env_enabled("MICRODOS_NO_AOT") && !trace_first_dollar;
+    MdAotStats aot = {0};
     bool trace_stop = false;
 
     if (argc > 2) {
@@ -908,7 +932,7 @@ int main(int argc, char **argv)
     if (system_mode) {
         printf("  disk:    %s (%zu bytes, %s)\n", disk_path, disk.size,
                disk.file != NULL ? "write-through" : "saved at exit");
-        puts("  keys:    Ctrl+C -> DOS ^C, Ctrl+] -> exit, Ctrl+Break -> emergency exit");
+        puts("  keys:    Ctrl+C -> DOS ^C, Ctrl+] -> exit");
     }
     printf("  memory:  %u paragraphs (%u KiB)\n",
            boot.memory_paragraphs, (unsigned)(boot.memory_paragraphs / 64u));
@@ -916,6 +940,18 @@ int main(int argc, char **argv)
         puts("  budget:  unlimited (Ctrl+] exits)");
     } else {
         printf("  budget:  %llu guest instructions\n", (unsigned long long)budget);
+    }
+    if (system_mode) {
+        size_t pi;
+        if (!aot_enabled) {
+            puts("  aot:     disabled");
+        }
+        for (pi = 0; aot_enabled && pi < MD_AOT_PROGRAM_COUNT; ++pi) {
+            const MdAotProgram *prog = g_md_aot_programs[pi];
+            printf("  aot:     %s (%u instructions compiled, %u interpreter holes, %u entries)\n",
+                   prog->name, (unsigned)prog->compiled_instructions,
+                   (unsigned)prog->hole_instructions, (unsigned)prog->entry_count);
+        }
     }
     if (system_mode && trace_disk) {
         puts("  trace:   disk requests after COMMAND.COM (MICRODOS_TRACE_DISK)");
@@ -943,6 +979,39 @@ int main(int argc, char **argv)
                    boot.command_image_match ? "match" : "mismatch",
                    boot.command_psp_valid ? "valid" : "invalid");
             puts("[system] COMMAND.COM execution continuing; interactive CON active (Ctrl+] exits microDOS)");
+        }
+
+        if (aot_enabled && system_mode && boot.command_entered &&
+            runtime.cpu.cs != boot.dos_segment && runtime.cpu.cs != boot.bios_segment) {
+            const uint16_t cs = runtime.cpu.cs;
+            const MdAotProgram *prog = NULL;
+            size_t pi;
+
+            for (pi = 0; pi < MD_AOT_PROGRAM_COUNT; ++pi) {
+                const MdAotProgram *cand = g_md_aot_programs[pi];
+                if (cand->ready(&runtime, cs)) { prog = cand; break; }
+                if (runtime.cpu.ip == 0x0100u && cand->attach(&runtime, cs)) {
+                    prog = cand;
+                    /* Reported in the summary: an inline message would land
+                       in the middle of the program's own console output. */
+                    ++aot.attaches;
+                    break;
+                }
+            }
+            if (prog != NULL) {
+                aot.last_segment = cs;
+                aot.last_program = prog;
+                if (prog->is_entry(runtime.cpu.ip)) {
+                    const uint64_t before = runtime.instructions;
+                    const uint64_t left = budget - steps;
+                    MdStopReason reason = prog->enter(&runtime, left < MD_AOT_CHUNK ? left : MD_AOT_CHUNK);
+                    ++aot.enters;
+                    steps += runtime.instructions - before;
+                    if (reason != MD_STOP_NONE || runtime.stop_reason != MD_STOP_NONE) break;
+                    if (runtime.instructions != before) continue;
+                }
+                ++aot.interp_in_image;
+            }
         }
 
         if (!boot.entered_dosinit && runtime.cpu.cs == boot.dos_segment &&
@@ -1067,6 +1136,15 @@ int main(int argc, char **argv)
            (unsigned)boot.console_write_calls,
            (unsigned)boot.console_bytes_written,
            (unsigned)boot.console_dollar_writes);
+    if (aot.attaches != 0u) {
+        const uint64_t total = runtime.aot_instructions + aot.interp_in_image;
+        printf("[aot] %s attached %u time(s), last at %04X:0100; enters=%u compiled=%llu interpreted-in-image=%llu (%.1f%% native)\n",
+               aot.last_program != NULL ? aot.last_program->name : "?",
+               (unsigned)aot.attaches, aot.last_segment, (unsigned)aot.enters,
+               (unsigned long long)runtime.aot_instructions,
+               (unsigned long long)aot.interp_in_image,
+               total != 0u ? 100.0 * (double)runtime.aot_instructions / (double)total : 0.0);
+    }
     if (console.idle_sleeps != 0u) {
         printf("[host] idle sleeps=%u (CON polled with no input)\n",
                (unsigned)console.idle_sleeps);

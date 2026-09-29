@@ -1,0 +1,30 @@
+# DOS2TEST.COM dosrecomp metadata (source-assisted).
+# The test procedures are reached only through test_table (CALL BX),
+# which static analysis cannot follow. Regenerate after editing the source:
+#   nasm -f bin -O9 -o DOS2TEST.COM dos2test.asm -l dos2test.lst
+#   (addresses of every t_* label; code ends at label cs_seg = 0x0B97)
+0x0258  t_version
+0x0264  t_handle_write
+0x027F  t_char_io
+0x02A4  t_drive
+0x02C0  t_date
+0x030A  t_time
+0x0338  t_dta
+0x035B  t_vectors
+0x03A5  t_flags
+0x0400  t_diskfree
+0x0434  t_ioctl
+0x044F  t_dup
+0x0497  t_open_missing
+0x04B4  t_dirs
+0x0515  t_create_write
+0x055D  t_read_seek
+0x0661  t_append
+0x0710  t_attrib
+0x0781  t_filetime
+0x07F6  t_rename_find
+0x08CB  t_delete_rmdir
+0x092F  t_memory
+0x099A  t_fcb
+0x0B0A  t_exec_child
+0x0B26  t_exec_command

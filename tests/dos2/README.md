@@ -65,3 +65,18 @@ persistent image does not get it until it is reset:
 ```
 .\md.bat image dos2
 ```
+
+## Compiled mode (M13)
+
+The build also recompiles `DOS2TEST.COM` with `dosrecomp` using
+`DOS2TEST.entries` and links the result into `microdos_msdos2`. Running
+`DOS2TEST` at `A>` then executes the compiled code (look for the `[aot]`
+summary line at exit). To compare against the pure interpreter:
+
+```
+set MICRODOS_NO_AOT=1        (cmd)   /   $env:MICRODOS_NO_AOT = '1'   (PowerShell)
+```
+
+If you edit `dos2test.asm`, reassemble with a listing and regenerate the
+entries (every `t_*` label address) and the `--code-end` value in
+`CMakeLists.txt` (address of label `cs_seg`).

@@ -43,6 +43,20 @@ enum {
 #define MD_X86_CODE_PAGE_MASK (MD_X86_CODE_PAGE_SIZE - 1u)
 #define MD_X86_CODE_PAGE_COUNT (MD_X86_ADDRESS_SPACE / MD_X86_CODE_PAGE_SIZE)
 
+/* M13 byte-exact AOT invalidation. A generated image registers one guard per
+   loaded copy: `base` is the linear address of image byte 0 and `code_bits`
+   has one bit per image byte that belongs to a compiled instruction. Writes
+   to other bytes of the image (variables next to code) leave it valid. */
+typedef struct MdAotGuard {
+    uint32_t base;
+    uint32_t size;
+    const uint8_t *code_bits;
+    struct MdAotGuard *next;
+    uint32_t invalidations;
+    uint8_t valid;
+    uint8_t registered;
+} MdAotGuard;
+
 typedef struct MdX86 {
     uint16_t r[8];
     uint16_t es;
@@ -58,6 +72,9 @@ typedef struct MdX86 {
     uint32_t *code_page_generation;
     uint8_t *code_page_executable;
     uint32_t *code_write_epoch;
+
+    /* Optional generated-image guards (see MdAotGuard). */
+    MdAotGuard *aot_guards;
 } MdX86;
 
 static inline uint32_t md_x86_linear(uint16_t segment, uint16_t offset)
@@ -89,6 +106,21 @@ static inline void md_x86_note_code_write(MdX86 *cpu, uint32_t address)
         next = *cpu->code_write_epoch + 1u;
         if (next == 0u) next = 1u;
         *cpu->code_write_epoch = next;
+    }
+
+    /* Only reached for executable pages, so ordinary data writes never pay
+       for this walk. */
+    {
+        MdAotGuard *guard;
+        const uint32_t a = address & MD_X86_ADDRESS_MASK;
+        for (guard = cpu->aot_guards; guard != NULL; guard = guard->next) {
+            const uint32_t off = (a - guard->base) & MD_X86_ADDRESS_MASK;
+            if (off < guard->size &&
+                ((guard->code_bits[off >> 3] >> (off & 7u)) & 1u) != 0u) {
+                guard->valid = 0u;
+                ++guard->invalidations;
+            }
+        }
     }
 }
 

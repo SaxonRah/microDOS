@@ -122,6 +122,34 @@ void md_runtime_mark_code_range(MdRuntime *runtime, uint16_t segment,
     }
 }
 
+void md_runtime_register_aot_guard(MdRuntime *runtime, MdAotGuard *guard)
+{
+    MdAotGuard *it;
+    for (it = runtime->cpu.aot_guards; it != NULL; it = it->next) {
+        if (it == guard) {
+            guard->registered = 1u;
+            return;
+        }
+    }
+    guard->next = runtime->cpu.aot_guards;
+    runtime->cpu.aot_guards = guard;
+    guard->registered = 1u;
+}
+
+void md_runtime_unregister_aot_guard(MdRuntime *runtime, MdAotGuard *guard)
+{
+    MdAotGuard **link = &runtime->cpu.aot_guards;
+    while (*link != NULL) {
+        if (*link == guard) {
+            *link = guard->next;
+            break;
+        }
+        link = &(*link)->next;
+    }
+    guard->next = NULL;
+    guard->registered = 0u;
+}
+
 void md_runtime_request_exit(MdRuntime *runtime, uint8_t exit_code)
 {
     runtime->exit_code = exit_code;

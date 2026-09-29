@@ -435,3 +435,48 @@ session so Ctrl+C reaches `_getch()` as 03h, and restores the console mode at
 exit. Host-level interruption is Ctrl+] (normal) or Ctrl+Break / window close
 (emergency); both set a flag the main loop polls, so every stop path runs the
 same shutdown code. POSIX builds treat SIGINT the same way.
+
+## 34. AOT invalidation is byte-exact per image
+
+Decision #13 disabled an entire generated image on the first write to any of
+its 4 KiB pages. Real `.COM` programs keep variables beside their code, so
+DOS2TEST would have lost native execution on its first counter update.
+
+Each generated image now carries a one-bit-per-byte map of the instructions
+it compiled. Attaching an image registers an `MdAotGuard` (linear base, size,
+map) with the CPU. The existing write-tracking hook, which already runs only
+for executable pages, checks registered guards and clears `valid` when a
+written byte is compiled code. Generated code checks `valid` after every
+store it performs, so self-modification is caught before the next compiled
+instruction (the selfmod fixture still passes unchanged). Writes by DOS, the
+interpreter, or the disk driver go through the same hook, which is how a
+program loaded over a previous one at the same segment is never run with
+stale native code.
+
+## 35. dosrecomp discovers with the shared decoder; unsupported code is a hole
+
+Discovery and emission are separate problems (#15). `dosrecomp` now uses
+`md_decode_8086` for boundaries and control flow, so the whole program is
+discovered even where the emitter has no translation. Untranslated
+instructions become holes: compiled code hands CS:IP to the interpreter and
+re-enters at the instruction after, which is always a block entry. A block
+that begins with a hole is never a dispatch entry, so entering can always
+make progress.
+
+Emission uses the same `ops.h` semantics as the interpreter (the ALU dispatch
+moved there so there is one implementation). Correctness is checked three
+ways: the existing fixtures, DOS2TEST's own assertions, and a differential
+run with `MICRODOS_NO_AOT=1` whose guest output must be identical.
+
+## 36. Attach, don't load: DOS owns program loading
+
+The runner never loads a compiled program itself. DOS reads the file, builds
+the PSP, and jumps to `XXXX:0100`; the runner then compares the bytes there
+with the embedded image and attaches on an exact match. This keeps EXEC, the
+PSP, memory ownership, and return codes fully DOS-controlled, lets multiple
+copies (a program EXECing itself) attach at different segments, and means a
+modified or different file simply runs interpreted.
+
+Entry points that static analysis cannot find are supplied as source-derived
+metadata (`DOS2TEST.entries`, generated from the NASM listing), in line with
+the source-assisted design (#15).

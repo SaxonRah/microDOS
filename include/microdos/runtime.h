@@ -39,6 +39,8 @@ struct MdRuntime {
     MdX86 cpu;
     MdHooks hooks;
     uint64_t instructions;
+    /* Subset of `instructions` retired by generated AOT code. */
+    uint64_t aot_instructions;
     MdStopReason stop_reason;
     uint32_t fault_linear;
     uint8_t fault_opcode;
@@ -77,6 +79,10 @@ void md_runtime_mark_code_range(MdRuntime *runtime, uint16_t segment,
 /* Returns true when a host/native hook handled the interrupt. If it did not,
    the function performs real-mode 8086 interrupt-vector dispatch through the IVT. */
 bool md_runtime_interrupt(MdRuntime *runtime, uint8_t vector);
+
+/* Link a generated-image guard into the write-tracking path (idempotent). */
+void md_runtime_register_aot_guard(MdRuntime *runtime, MdAotGuard *guard);
+void md_runtime_unregister_aot_guard(MdRuntime *runtime, MdAotGuard *guard);
 
 MdStopReason md_interp_step(MdRuntime *runtime);
 MdStopReason md_interp_run(MdRuntime *runtime, uint64_t instruction_budget);
