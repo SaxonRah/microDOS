@@ -3,50 +3,63 @@
 ## Execution model
 
 ```text
-                    executable image
-                          |
-                +---------+---------+
-                |                   |
-          known AOT block      unresolved code
-                |                   |
-                v                   v
-          generated C        8086 interpreter
-                |                   |
-                +---------+---------+
-                          |
-                       MdRuntime
-                          |
-          +---------------+----------------+
-          |               |                |
-       memory          interrupts          I/O
-          |               |                |
-      20-bit RAM     DOS / BIOS / IVT    devices
+                         executable image
+                               |
+                        dosrecomp analysis
+                               |
+                 +-------------+-------------+
+                 |                           |
+            known AOT block            unresolved code
+                 |                           |
+                 v                           v
+          generated native C          8086 interpreter
+                 |                           |
+                 +-------------+-------------+
+                               |
+                         guest CS:IP
+                               |
+                           MdRuntime
+                               |
+             +-----------------+----------------+
+             |                 |                |
+          memory           interrupts           I/O
+             |                 |                |
+         20-bit RAM       DOS / BIOS / IVT    devices
 ```
 
-A compiled block and the interpreter can hand control to one another. The eventual block dispatcher will key native blocks by guest `CS:IP` / linear target. A miss enters the interpreter. An interpreted jump into a known block returns to native execution.
+Generated code and interpreted code use the same `MdRuntime` and `MdX86`. A known guest offset enters a generated C block. An unknown offset executes through the interpreter; when the interpreter reaches a known offset again, execution returns to AOT.
 
-## CPU state
+The current mixed-mode fallback checks dispatch after each interpreted instruction. This is intentionally the correctness-first implementation. The high-performance version will execute cached decoded blocks and return to the common dispatcher only at block boundaries.
 
-`MdX86` stores the 8086 general registers, segment registers, IP, FLAGS, and the guest memory base. General registers use the 8086 opcode encoding order (`AX,CX,DX,BX,SP,BP,SI,DI`) so ModR/M and opcode-low-bit register selection avoid translation tables.
+## CPU state and shared semantics
 
-8-bit registers are views of the first four 16-bit registers:
+`MdX86` stores AX/CX/DX/BX/SP/BP/SI/DI, ES/CS/SS/DS, IP, FLAGS, and the guest-memory base. Register order follows 8086 opcode encoding.
+
+`include/microdos/ops.h` is shared by the interpreter and generated C for arithmetic and FLAGS behavior. Recompilation changes control-flow representation, not instruction semantics.
 
 ```text
-0 AL   1 CL   2 DL   3 BL
-4 AH   5 CH   6 DH   7 BH
+interpreter opcode ----+
+                       +--> shared op helper --> MdX86
+AOT generated C -------+
 ```
 
-## Guest memory
+Future ADC/SBB, shifts/rotates, logic, multiply/divide, BCD, and string primitives should follow the same rule.
 
-The architectural address space is exactly 1 MiB and addresses wrap at 20 bits.
+## Memory
 
-Host builds allocate the region normally. On Pico Plus 2 the target design is a directly addressable PSRAM window so ordinary memory instructions stay pointer-based instead of calling a generic memory callback for every byte.
+Guest physical space is exactly 1 MiB and wraps at 20 bits:
 
-Memory-mapped device interception, if needed later, should be page-based so normal RAM remains the fast case.
+```text
+physical = ((segment << 4) + offset) & 0xFFFFF
+```
+
+Host builds use a normal 1 MiB allocation. Pico Plus 2 is intended to back this directly with PSRAM so ordinary guest memory accesses remain pointer-based.
+
+Decoded-block invalidation for self-modifying code will be page-granular. Pages become tracked only when executable code is decoded/AOT-associated; ordinary data pages should avoid expensive cache-maintenance work.
 
 ## Interrupts
 
-`md_runtime_interrupt()` first offers the vector to the native platform hook. If the hook declines it, the runtime performs real 8086 IVT dispatch:
+`md_runtime_interrupt()` offers an interrupt to the native hook first. If unclaimed it performs real IVT dispatch:
 
 ```text
 push FLAGS
@@ -57,57 +70,105 @@ IP = word [vector*4]
 CS = word [vector*4+2]
 ```
 
-During early bootstrap the host shim claims a tiny subset of INT 21h. Later, recompiled DOS will own its actual DOS service vector and the native layer will primarily implement BIOS/device boundaries.
+AOT code advances guest IP before calling the shared interrupt routine, matching the interpreter's architectural return address.
+
+## dosrecomp CFG
+
+The analyzer uses two phases.
+
+### 1. Instruction reachability
+
+Start at the configured code entry and decode one reachable instruction at a time. Direct branch/call targets and fallthroughs are queued before block construction.
+
+This avoids overlapping blocks on backward branches. The loop fixture:
+
+```asm
+0100  mov cx,ffffh
+0103  dec cx
+0104  jnz 0103
+0106  hlt
+```
+
+becomes:
+
+```text
+block 0100 : mov cx,ffffh
+block 0103 : dec cx / jnz 0103
+block 0106 : hlt
+```
+
+### 2. Basic-block formation
+
+Reachable instructions are grouped using entry, branch-target, and control-flow-fallthrough boundaries. A reachable instruction outside current AOT coverage becomes a fallback point rather than a compiler error.
+
+`.COM` files may place data immediately after code, so `--code-start` and `--code-end` constrain analysis. The complete input image is still embedded in generated output.
+
+## Generated C
+
+A generated translation contains the original image, an instruction budget, a `CS:IP` dispatcher, known blocks, and an interpreter fallback.
+
+Conceptually:
+
+```c
+md_dispatch:
+    if (cpu->cs != segment) goto md_fallback;
+    switch (cpu->ip) {
+        case 0x0100: goto md_block_0100;
+        case 0x0107: goto md_block_0107;
+        default:     goto md_fallback;
+    }
+
+md_fallback:
+    md_interp_step(runtime);
+    goto md_dispatch;
+```
+
+Known branches currently return through the dispatcher. Once executable-page generations exist, safe hot edges can chain directly without a central switch.
+
+## Hybrid proof
+
+`tests/programs/hybrid.com` intentionally contains an instruction supported by the interpreter but not by the first AOT decoder:
+
+```text
+AOT 0100  mov ax,1234h
+AOT 0103  jz 0108h       ; not taken
+             |
+             v
+fallback 0105
+interp    mov bx,ax      ; 89 C3
+interp    nop
+             |
+             v
+AOT 0108  hlt
+```
+
+The test verifies `BX == 1234h` and exactly five guest instructions executed. This is the first real proof that the two paths form one execution engine rather than two separate demos.
 
 ## Interpreter performance plan
 
-Phase 1 already separates dispatcher choice from opcode semantics. GCC/Clang builds use direct-threaded dispatch for selected hot opcodes; MSVC uses the generic decoder loop.
+The normal interpreter remains `md_interp_run()`. GCC/Clang uses direct-threaded dispatch for hot opcodes; MSVC keeps switch dispatch for portability. `md_interp_step()` is not the performance path.
 
-Next performance layers, in order:
+Next layers:
 
-1. fill out the complete 8086/8088 instruction set;
-2. add prefix state without allocating decoder objects;
-3. split common ModR/M forms into hot handlers;
-4. add decoded basic-block cache entries keyed by physical start address and code-generation epoch;
-5. terminate cached blocks at control flow, interrupt, I/O, segment-state hazards, or writes to covered code pages;
-6. chain cached blocks directly where safe;
-7. collect low-cost block counters so frequently interpreted regions become candidates for AOT metadata.
+1. complete 8086/8088 instruction and prefix coverage;
+2. factor decode into a shared instruction-description layer;
+3. hot ModR/M forms in threaded handlers;
+4. decoded basic-block cache keyed by guest address + executable-page generation;
+5. interpreted block return to the common AOT dispatcher;
+6. safe direct block chaining;
+7. block counters for AOT candidate discovery.
 
-The target is not cycle accuracy by default. An optional timing model can accumulate approximate 8088/8086 cycles when required by software.
+The current validation machine measured roughly 257 MIPS for threaded interpretation and 506 MIPS for generated AOT on the same branch-heavy guest loop. These are host regression measurements, not RP2350 predictions. Switch-dispatch interpretation measured roughly 192 MIPS in the same run.
 
-## Recompiler shape
-
-The recompiler should emit readable portable C close to the architectural operations rather than reconstructing high-level source.
-
-Example input:
-
-```asm
-mov ah,09h
-mov dx,message
-int 21h
-```
-
-Conceptual output:
-
-```c
-md_x86_set_reg8(cpu, 4, 0x09);
-cpu->r[MD_X86_DX] = MESSAGE;
-md_runtime_interrupt(runtime, 0x21);
-```
-
-Control-flow targets that resolve to known compiled blocks become native calls or dispatcher transitions. Unknown indirect targets enter the shared block dispatcher and can fall back to interpretation.
-
-## Hardware integration
-
-Pico hardware support is intentionally above the CPU core:
+## Hardware boundary
 
 ```text
-DOS/BIOS service
-     |
+DOS / BIOS service
+       |
 platform/pico2
-     +--> MicroRender --> ST7796 / other displays
-     +--> MicroWave   --> I2S audio
-     +--> MicroConsole/catBUS --> buttons, sticks, SD, USB
+       +--> MicroRender --> ST7796 / other displays
+       +--> MicroWave   --> I2S audio
+       +--> MicroConsole/catBUS --> controls, SD, USB
 ```
 
-This lets the exact same DOS execution core run under a desktop validation frontend.
+The CPU/recompiler core remains platform-neutral so the same execution state can be tested on desktop and RP2350.

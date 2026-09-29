@@ -106,7 +106,7 @@ static inline void md_op_inc_r16(MdRuntime *runtime, uint8_t opcode)
     MdX86 *cpu = &runtime->cpu;
     const uint16_t old_cf = cpu->flags & MD_X86_FLAG_CF;
     const unsigned reg = opcode & 7u;
-    cpu->r[reg] = md_add16(cpu, cpu->r[reg], 1u);
+    cpu->r[reg] = md_x86_add16(cpu, cpu->r[reg], 1u);
     cpu->flags = (uint16_t)((cpu->flags & ~MD_X86_FLAG_CF) | old_cf);
 }
 
@@ -115,7 +115,7 @@ static inline void md_op_dec_r16(MdRuntime *runtime, uint8_t opcode)
     MdX86 *cpu = &runtime->cpu;
     const uint16_t old_cf = cpu->flags & MD_X86_FLAG_CF;
     const unsigned reg = opcode & 7u;
-    cpu->r[reg] = md_sub16(cpu, cpu->r[reg], 1u);
+    cpu->r[reg] = md_x86_sub16(cpu, cpu->r[reg], 1u);
     cpu->flags = (uint16_t)((cpu->flags & ~MD_X86_FLAG_CF) | old_cf);
 }
 
@@ -146,9 +146,9 @@ static inline void md_op_alu_rm_r(MdRuntime *runtime, uint8_t opcode)
         const uint8_t lhs = direction ? md_x86_get_reg8(cpu, reg) : md_operand_read8(runtime, rm);
         const uint8_t rhs = direction ? md_operand_read8(runtime, rm) : md_x86_get_reg8(cpu, reg);
         uint8_t result;
-        if (family == 0x00u) result = md_add8(cpu, lhs, rhs);
-        else if (family == 0x28u) result = md_sub8(cpu, lhs, rhs);
-        else result = md_sub8(cpu, lhs, rhs);
+        if (family == 0x00u) result = md_x86_add8(cpu, lhs, rhs);
+        else if (family == 0x28u) result = md_x86_sub8(cpu, lhs, rhs);
+        else result = md_x86_sub8(cpu, lhs, rhs);
         if (family != 0x38u) {
             if (direction) md_x86_set_reg8(cpu, reg, result);
             else md_operand_write8(runtime, rm, result);
@@ -157,9 +157,9 @@ static inline void md_op_alu_rm_r(MdRuntime *runtime, uint8_t opcode)
         const uint16_t lhs = direction ? cpu->r[reg] : md_operand_read16(runtime, rm);
         const uint16_t rhs = direction ? md_operand_read16(runtime, rm) : cpu->r[reg];
         uint16_t result;
-        if (family == 0x00u) result = md_add16(cpu, lhs, rhs);
-        else if (family == 0x28u) result = md_sub16(cpu, lhs, rhs);
-        else result = md_sub16(cpu, lhs, rhs);
+        if (family == 0x00u) result = md_x86_add16(cpu, lhs, rhs);
+        else if (family == 0x28u) result = md_x86_sub16(cpu, lhs, rhs);
+        else result = md_x86_sub16(cpu, lhs, rhs);
         if (family != 0x38u) {
             if (direction) cpu->r[reg] = result;
             else md_operand_write16(runtime, rm, result);
@@ -208,12 +208,12 @@ static inline int md_execute_opcode(MdRuntime *runtime, uint8_t opcode, uint16_t
     }
 
     switch (opcode) {
-        case 0x04: md_x86_set_reg8(cpu, 0u, md_add8(cpu, md_x86_get_reg8(cpu, 0u), md_fetch8(runtime))); break;
-        case 0x05: cpu->r[MD_X86_AX] = md_add16(cpu, cpu->r[MD_X86_AX], md_fetch16(runtime)); break;
-        case 0x2C: md_x86_set_reg8(cpu, 0u, md_sub8(cpu, md_x86_get_reg8(cpu, 0u), md_fetch8(runtime))); break;
-        case 0x2D: cpu->r[MD_X86_AX] = md_sub16(cpu, cpu->r[MD_X86_AX], md_fetch16(runtime)); break;
-        case 0x3C: (void)md_sub8(cpu, md_x86_get_reg8(cpu, 0u), md_fetch8(runtime)); break;
-        case 0x3D: (void)md_sub16(cpu, cpu->r[MD_X86_AX], md_fetch16(runtime)); break;
+        case 0x04: md_x86_set_reg8(cpu, 0u, md_x86_add8(cpu, md_x86_get_reg8(cpu, 0u), md_fetch8(runtime))); break;
+        case 0x05: cpu->r[MD_X86_AX] = md_x86_add16(cpu, cpu->r[MD_X86_AX], md_fetch16(runtime)); break;
+        case 0x2C: md_x86_set_reg8(cpu, 0u, md_x86_sub8(cpu, md_x86_get_reg8(cpu, 0u), md_fetch8(runtime))); break;
+        case 0x2D: cpu->r[MD_X86_AX] = md_x86_sub16(cpu, cpu->r[MD_X86_AX], md_fetch16(runtime)); break;
+        case 0x3C: (void)md_x86_sub8(cpu, md_x86_get_reg8(cpu, 0u), md_fetch8(runtime)); break;
+        case 0x3D: (void)md_x86_sub16(cpu, cpu->r[MD_X86_AX], md_fetch16(runtime)); break;
 
         case 0x74: {
             const int8_t rel = (int8_t)md_fetch8(runtime);
@@ -375,6 +375,18 @@ static MdStopReason md_interp_run_switch(MdRuntime *runtime, uint64_t instructio
     return runtime->stop_reason;
 }
 #endif
+
+MdStopReason md_interp_step(MdRuntime *runtime)
+{
+    uint16_t ip_before;
+    uint8_t opcode;
+    if (runtime->stop_reason != MD_STOP_NONE) return runtime->stop_reason;
+    ++runtime->instructions;
+    ip_before = runtime->cpu.ip;
+    opcode = md_fetch8(runtime);
+    (void)md_execute_opcode(runtime, opcode, ip_before);
+    return runtime->stop_reason;
+}
 
 MdStopReason md_interp_run(MdRuntime *runtime, uint64_t instruction_budget)
 {

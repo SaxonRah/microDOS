@@ -52,12 +52,9 @@ void md_runtime_request_exit(MdRuntime *runtime, uint8_t exit_code);
    the function performs real-mode 8086 interrupt-vector dispatch through the IVT. */
 bool md_runtime_interrupt(MdRuntime *runtime, uint8_t vector);
 
+MdStopReason md_interp_step(MdRuntime *runtime);
 MdStopReason md_interp_run(MdRuntime *runtime, uint64_t instruction_budget);
 const char *md_stop_reason_name(MdStopReason reason);
-
-/* First AOT proof object. It intentionally uses the same runtime API as generated
-   recompilation output will use. */
-MdStopReason md_recomp_hello(MdRuntime *runtime, uint16_t segment);
 
 #ifdef __cplusplus
 }
