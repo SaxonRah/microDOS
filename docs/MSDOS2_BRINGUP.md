@@ -201,3 +201,148 @@ window, while preserving counters and final CPU state.
    blocks/opcodes into cache-specialized and AOT execution.
 6. Replace host shims one boundary at a time with Pico 2 / MicroRender / MicroWave /
    MicroConsole backends.
+
+## Milestone 10: real FAT12 block I/O after DOSINIT
+
+M9 proved that the released kernel can initialize all five OEM devices, use the DOS 2
+character-device contract, print its banner, and return from `DOSINIT`. M10 keeps that
+exact path available as:
+
+```powershell
+.\md.bat boot msdos2
+```
+
+and adds:
+
+```powershell
+.\md.bat image dos2
+.\md.bat run dos2
+```
+
+`image dos2` uses `mkfat12` to build `build-disk/msdos2.img` from the pinned released
+`COMMAND.COM`. The image is a real 360 KiB FAT12 volume matching the BPB returned by
+the synthetic OEM block device.
+
+The native block boundary now implements the DOS 2 request packet commands needed for
+a normal fixed-media volume:
+
+```text
+0  INIT
+1  MEDIA CHECK
+2  BUILD BPB
+4  READ
+8  WRITE
+9  WRITE WITH VERIFY
+```
+
+MEDIA CHECK returns "not changed" for the fixed host image. BUILD BPB returns the
+same 13-byte DOS 2 BPB exposed during INIT. READ/WRITE use the transfer far pointer,
+sector count, and starting logical sector from the DOS request packet. No FAT parsing
+exists in the host block layer.
+
+Once `DOSINIT` returns, the M10 system path jumps to a small guest-side continuation
+in the OEM segment. That code executes:
+
+```text
+INT 21h AH=3Dh  open A:\COMMAND.COM
+INT 21h AH=3Fh  read 64 bytes
+INT 21h AH=3Eh  close
+```
+
+The calls go through the interrupt vector installed by the released kernel. Therefore
+finding the root entry, following FAT12 clusters, managing the DOS handle, and issuing
+block requests are all performed by Microsoft DOS code. The host compares the 64
+bytes placed in guest memory with the pinned `COMMAND.COM` only after DOS reports a
+successful read.
+
+The M10 success signature is:
+
+```text
+[boot] dosinit_entered=yes dosinit_returned=yes
+[system] completed=yes success=yes bytes_read=64 error=0 header_match=yes
+```
+
+This is deliberately one step short of EXEC. Once this filesystem smoke passes on the
+real Microsoft binaries, the next milestone can replace the OPEN/READ continuation
+with a DOS 2 EXEC parameter block and let DOS load and transfer control to the actual
+`COMMAND.COM`.
+
+## Milestone 11: real DOS EXEC into COMMAND.COM
+
+M10 proved that the released DOS filesystem could locate and read the released
+`COMMAND.COM` through the FAT12 block device. M11 replaces the open/read smoke
+continuation with the same DOS 2 EXEC contract used by Microsoft's `SYSINIT.ASM`:
+
+```text
+AX = 4B00h
+DS:DX -> A:\COMMAND.COM
+ES:BX -> Exec0 argument block
+```
+
+The guest-side `Exec0` block contains an inherited environment (`0`), a 128-byte
+command-tail pointer containing `/P`, and two default FCB pointers. The host does
+not allocate the child, construct the PSP, or copy the COM image. Those operations
+are performed by the released DOS `EXEC.ASM` path.
+
+`run dos2` observes execution at a boundary rather than intercepting it. When the
+CPU reaches a non-kernel segment at offset `0100h`, the runner compares the entire
+guest image against the pinned 15,480-byte `COMMAND.COM`. It also validates the
+child PSP:
+
+```text
+PSP:0000 = CD 20
+PSP:0080 = 02
+PSP:0081 = '/'
+PSP:0082 = 'P'
+PSP:0083 = 0D
+CS = DS = ES = SS = PSP segment
+```
+
+The M11 success signature is:
+
+```text
+[system] COMMAND.COM entered at xxxx:0100; image=match PSP=valid
+[system] command_entered=yes ... image_match=yes psp_valid=yes
+```
+
+The runner intentionally stops at that entry boundary. Interactive console input
+and running the command processor through its prompt are the next milestone; this
+keeps M11 focused on proving the DOS loader/process boundary independently from
+terminal input behavior.
+
+
+## Milestone 12: interactive COMMAND.COM console
+
+M12 continues execution after the verified `COMMAND.COM:0100h` entry instead of
+stopping there. The host CON backend now supplies both halves of the DOS 2
+character-device contract:
+
+- non-destructive input uses a one-byte typeahead buffer;
+- destructive reads block for host keyboard input and consume the typeahead byte
+  first;
+- Enter is normalized to carriage return;
+- `Ctrl+]` is reserved as a host escape that stops microDOS without requiring a
+  DOS command.
+
+The DOS-facing device layer remains platform-neutral. The Windows host uses
+`_kbhit()` / `_getch()`; a future Pico backend can bind the same callbacks to
+catBUS / MicroConsole buttons or a software keyboard without changing DOS.
+
+The CLOCK device now supports DOS 2 request functions 4, 8 and 9 using the
+six-byte sample-driver packet layout: days since 1980, minutes, hours,
+hundredths, seconds. The desktop runner seeds it from local host time; a DOS
+clock write changes the emulated clock only and never changes the host clock.
+
+`run dos2` preserves an existing `build-disk/msdos2.img` so filesystem changes
+can survive a shell session. Use `md.bat image dos2` explicitly to rebuild/reset
+the 360 KiB FAT12 image from the pinned released `COMMAND.COM`.
+
+Expected M12 progression:
+
+```text
+DOSINIT -> EXEC COMMAND.COM -> PSP:0100 -> COMMAND startup -> CON read -> prompt
+```
+
+Useful first interactive commands are `VER`, `DIR`, and `ECHO HELLO`. Use
+`Ctrl+]` to return to the host. Any new device error or CPU fault after
+`COMMAND.COM:0100h` is now a genuine shell/runtime bring-up boundary.

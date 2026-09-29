@@ -13,16 +13,18 @@ enum {
     MD_DEV_HEADER_SIZE = 18
 };
 
-/* Static request header / INIT packet offsets. */
+/* Static request header and command-specific DOS 2 request offsets. */
 enum {
     MD_REQ_LEN = 0,
     MD_REQ_UNIT = 1,
     MD_REQ_FUNC = 2,
     MD_REQ_STATUS = 3,
     MD_REQ_MEDIA = 13,
+    MD_REQ_MEDIA_RESULT = 14,
     MD_REQ_TRANSFER = 14,
     MD_REQ_COUNT = 18,
     MD_REQ_START = 20,
+    MD_REQ_BPB = 18,
     MD_REQ_INIT_UNITS = 13,
     MD_REQ_INIT_BREAK = 14,
     MD_REQ_INIT_BPB = 18
@@ -40,6 +42,9 @@ enum {
 
 enum {
     MD_DEV_INIT = 0u,
+    MD_DEV_MEDIA_CHECK = 1u,
+    MD_DEV_BUILD_BPB = 2u,
+    MD_DEV_IOCTL_READ = 3u,
     MD_DEV_READ = 4u,
     MD_DEV_READ_ND = 5u,
     MD_DEV_INPUT_STATUS = 6u,
@@ -49,6 +54,15 @@ enum {
     MD_DEV_OUTPUT_STATUS = 10u,
     MD_DEV_OUTPUT_FLUSH = 11u,
     MD_DEV_IOCTL_WRITE = 12u
+};
+
+enum {
+    MD_DEV_ERR_UNKNOWN_UNIT = 1u,
+    MD_DEV_ERR_NOT_READY = 2u,
+    MD_DEV_ERR_UNKNOWN_COMMAND = 3u,
+    MD_DEV_ERR_SECTOR_NOT_FOUND = 8u,
+    MD_DEV_ERR_WRITE_FAULT = 10u,
+    MD_DEV_ERR_READ_FAULT = 11u
 };
 
 static void md_read_far(const MdX86 *cpu, uint16_t segment, uint16_t offset,
@@ -111,6 +125,74 @@ void md_msdos2_boot_init(MdMsdos2Boot *boot)
     boot->bios_segment = MD_MSDOS2_DEFAULT_BIOS_SEGMENT;
     boot->stack_segment = MD_MSDOS2_DEFAULT_STACK_SEGMENT;
     boot->memory_paragraphs = MD_MSDOS2_DEFAULT_MEMORY_PARAGRAPHS;
+    boot->disk.sector_size = 512u;
+    boot->disk.sector_count = 720u;
+}
+
+static void md_install_postinit_program(MdRuntime *runtime, const MdMsdos2Boot *boot)
+{
+    MdX86 *cpu = &runtime->cpu;
+    const uint16_t s = boot->bios_segment;
+    uint16_t p = MD_MSDOS2_POSTINIT_OFFSET;
+    static const char kPath[] = "A:\\COMMAND.COM";
+    unsigned i;
+
+#define EMIT8(v) md_x86_write8(cpu, s, p++, (uint8_t)(v))
+#define EMIT16(v) do { const uint16_t md_v_ = (uint16_t)(v); EMIT8(md_v_ & 0xffu); EMIT8(md_v_ >> 8); } while (0)
+
+    /* Match the EXEC path in Microsoft's SYSINIT.ASM: DS=ES=SYSINIT,
+       DS:DX -> COMMAND.COM, ES:BX -> Exec0, AX=4B00h. */
+    EMIT8(0x0Eu);                    /* PUSH CS */
+    EMIT8(0x1Fu);                    /* POP DS */
+    EMIT8(0x0Eu);                    /* PUSH CS */
+    EMIT8(0x07u);                    /* POP ES */
+    EMIT8(0xBAu); EMIT16(MD_MSDOS2_POSTINIT_PATH_OFFSET); /* MOV DX,path */
+    EMIT8(0xBBu); EMIT16(MD_MSDOS2_EXEC_BLOCK_OFFSET);    /* MOV BX,Exec0 */
+    EMIT8(0xB8u); EMIT16(0x4B00u);   /* MOV AX,4B00h */
+    EMIT8(0xCDu); EMIT8(0x21u);      /* EXEC; success transfers to child. */
+    EMIT8(0x72u); EMIT8(0x03u);      /* JC exec_failed */
+    EMIT8(0xCDu); EMIT8(MD_MSDOS2_NATIVE_POSTINIT_OK_INT); /* child returned */
+    EMIT8(0xF4u);
+    EMIT8(0xCDu); EMIT8(MD_MSDOS2_NATIVE_POSTINIT_FAIL_INT);
+    EMIT8(0xF4u);
+
+#undef EMIT16
+#undef EMIT8
+
+    for (i = 0u; i < sizeof(kPath); ++i) {
+        md_x86_write8(cpu, s, (uint16_t)(MD_MSDOS2_POSTINIT_PATH_OFFSET + i),
+                      (uint8_t)kPath[i]);
+    }
+
+    /* DOS 2 Exec0: environment segment, command-tail FAR ptr, FCB1 FAR ptr,
+       FCB2 FAR ptr. Environment 0 means inherit the current PDB environment. */
+    md_x86_write16(cpu, s, MD_MSDOS2_EXEC_BLOCK_OFFSET + 0u, 0u);
+    md_write_far(cpu, s, MD_MSDOS2_EXEC_BLOCK_OFFSET + 2u,
+                 MD_MSDOS2_COMMAND_TAIL_OFFSET, s);
+    md_write_far(cpu, s, MD_MSDOS2_EXEC_BLOCK_OFFSET + 6u,
+                 MD_MSDOS2_FCB1_OFFSET, s);
+    md_write_far(cpu, s, MD_MSDOS2_EXEC_BLOCK_OFFSET + 10u,
+                 MD_MSDOS2_FCB2_OFFSET, s);
+
+    /* COMMAND.COM's permanent-shell tail: length=2, "/P", CR. EXEC copies
+       all 128 bytes into the child's PSP at offset 80h. */
+    for (i = 0u; i < 128u; ++i) {
+        md_x86_write8(cpu, s, (uint16_t)(MD_MSDOS2_COMMAND_TAIL_OFFSET + i), 0u);
+    }
+    md_x86_write8(cpu, s, MD_MSDOS2_COMMAND_TAIL_OFFSET + 0u, 2u);
+    md_x86_write8(cpu, s, MD_MSDOS2_COMMAND_TAIL_OFFSET + 1u, (uint8_t)'/');
+    md_x86_write8(cpu, s, MD_MSDOS2_COMMAND_TAIL_OFFSET + 2u, (uint8_t)'P');
+    md_x86_write8(cpu, s, MD_MSDOS2_COMMAND_TAIL_OFFSET + 3u, 0x0Du);
+
+    /* Default FCBs: drive 0, blank/zero name. DOS only needs the first 12
+       bytes from each pointer while constructing the child PSP. */
+    for (i = 0u; i < 16u; ++i) {
+        md_x86_write8(cpu, s, (uint16_t)(MD_MSDOS2_FCB1_OFFSET + i), 0u);
+        md_x86_write8(cpu, s, (uint16_t)(MD_MSDOS2_FCB2_OFFSET + i), 0u);
+    }
+
+    md_runtime_mark_code_range(runtime, s, MD_MSDOS2_POSTINIT_OFFSET,
+                               (uint32_t)(p - MD_MSDOS2_POSTINIT_OFFSET));
 }
 
 void md_msdos2_boot_install_devices(MdRuntime *runtime, MdMsdos2Boot *boot)
@@ -154,8 +236,7 @@ void md_msdos2_boot_install_devices(MdRuntime *runtime, MdMsdos2Boot *boot)
     md_x86_write8(cpu, seg, MD_MSDOS2_RETURN_OFFSET + 1u, MD_MSDOS2_NATIVE_RETURN_INT);
     md_x86_write8(cpu, seg, MD_MSDOS2_RETURN_OFFSET + 2u, 0xF4u);
 
-    /* One-entry BPB pointer table and a conventional 360 KiB FAT12 BPB.
-       DOS 2.x consumes the 13-byte BPB beginning with bytes/sector. */
+    /* One-entry BPB pointer table and conventional 360 KiB FAT12 BPB. */
     md_x86_write16(cpu, seg, MD_MSDOS2_BPB_TABLE_OFFSET, MD_MSDOS2_BPB_OFFSET);
     md_x86_write16(cpu, seg, MD_MSDOS2_BPB_OFFSET + 0u, 512u);
     md_x86_write8(cpu, seg, MD_MSDOS2_BPB_OFFSET + 2u, 2u);
@@ -165,6 +246,8 @@ void md_msdos2_boot_install_devices(MdRuntime *runtime, MdMsdos2Boot *boot)
     md_x86_write16(cpu, seg, MD_MSDOS2_BPB_OFFSET + 8u, 720u);
     md_x86_write8(cpu, seg, MD_MSDOS2_BPB_OFFSET + 10u, 0xFDu);
     md_x86_write16(cpu, seg, MD_MSDOS2_BPB_OFFSET + 11u, 2u);
+
+    md_install_postinit_program(runtime, boot);
 
     md_runtime_mark_code_range(runtime, seg, MD_MSDOS2_STRATEGY_OFFSET, 3u);
     md_runtime_mark_code_range(runtime, seg, MD_MSDOS2_INTERRUPT_OFFSET, 3u);
@@ -189,7 +272,7 @@ void md_msdos2_boot_prepare_cpu(MdRuntime *runtime, MdMsdos2Boot *boot,
     cpu->r[MD_X86_SP] = 0xFFFEu;
     cpu->flags = (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_IF);
 
-    /* Recreate SYSINIT's FAR CALL MSDOS stack frame. RETF must pop IP then CS. */
+    /* Recreate SYSINIT's FAR CALL MSDOS stack frame. RETF pops IP then CS. */
     md_x86_push(cpu, boot->bios_segment);
     md_x86_push(cpu, MD_MSDOS2_RETURN_OFFSET);
 }
@@ -200,6 +283,11 @@ static void md_device_status(MdRuntime *runtime, const MdMsdos2Boot *boot, uint1
                    (uint16_t)(boot->request_offset + MD_REQ_STATUS), status);
 }
 
+static void md_device_error(MdRuntime *runtime, const MdMsdos2Boot *boot, uint8_t code)
+{
+    md_device_status(runtime, boot,
+                     (uint16_t)(MD_DEV_STATUS_ERROR | MD_DEV_STATUS_DONE | code));
+}
 
 static void md_console_write(MdRuntime *runtime, MdMsdos2Boot *boot)
 {
@@ -217,6 +305,33 @@ static void md_console_write(MdRuntime *runtime, MdMsdos2Boot *boot)
 
     ++boot->console_write_calls;
     boot->console_bytes_written += count;
+
+    if (count != 0u) {
+        for (i = 0u; i < count; ++i) {
+            const uint8_t value = md_x86_read8(cpu, data_segment,
+                                                (uint16_t)(data_offset + i));
+            if (value == (uint8_t)'$') {
+                ++boot->console_dollar_writes;
+                if (!boot->console_first_dollar_valid) {
+                    boot->console_first_dollar_valid = true;
+                    boot->console_first_dollar_data_segment = data_segment;
+                    boot->console_first_dollar_data_offset = (uint16_t)(data_offset + i);
+                    boot->console_first_dollar_count = count;
+                    boot->console_first_dollar_request_segment = boot->request_segment;
+                    boot->console_first_dollar_request_offset = boot->request_offset;
+
+                    /* The native F1 interrupt executes inside the shared device
+                       trampoline. The far CALL made by DOS still has its return
+                       IP:CS at SS:SP, so retain that call-site boundary too. */
+                    boot->console_first_dollar_return_offset =
+                        md_x86_read16(cpu, cpu->ss, cpu->r[MD_X86_SP]);
+                    boot->console_first_dollar_return_segment =
+                        md_x86_read16(cpu, cpu->ss,
+                                      (uint16_t)(cpu->r[MD_X86_SP] + 2u));
+                }
+            }
+        }
+    }
 
     if (boot->console.write != NULL && count != 0u) {
         uint8_t chunk[128];
@@ -247,8 +362,6 @@ static void md_console_read_nondestructive(MdRuntime *runtime, MdMsdos2Boot *boo
                       (uint16_t)(boot->request_offset + MD_REQ_MEDIA), value);
         md_device_status(runtime, boot, MD_DEV_STATUS_DONE);
     } else {
-        /* DOS 2 sample drivers report BUSY|DONE for an empty non-destructive
-           console read. This is not an error and must not set bit 15. */
         md_device_status(runtime, boot, (uint16_t)(MD_DEV_STATUS_BUSY | MD_DEV_STATUS_DONE));
     }
 }
@@ -269,10 +382,12 @@ static bool md_console_read(MdRuntime *runtime, MdMsdos2Boot *boot)
     count = md_x86_read16(cpu, boot->request_segment,
                           (uint16_t)(boot->request_offset + MD_REQ_COUNT));
 
+    ++boot->console_read_calls;
     for (i = 0u; i < count; ++i) {
         uint8_t value;
         if (!boot->console.read(boot->console.user, &value)) return false;
         md_x86_write8(cpu, data_segment, (uint16_t)(data_offset + i), value);
+        ++boot->console_bytes_read;
     }
 
     md_device_status(runtime, boot, MD_DEV_STATUS_DONE);
@@ -304,6 +419,165 @@ static bool md_console_service(MdRuntime *runtime, MdMsdos2Boot *boot)
         case MD_DEV_OUTPUT_FLUSH:
         case MD_DEV_IOCTL_WRITE:
             md_device_status(runtime, boot, MD_DEV_STATUS_DONE);
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool md_clock_service(MdRuntime *runtime, MdMsdos2Boot *boot)
+{
+    MdX86 *cpu = &runtime->cpu;
+    uint16_t data_offset;
+    uint16_t data_segment;
+
+    if (boot->last_request_function != MD_DEV_READ &&
+        boot->last_request_function != MD_DEV_WRITE &&
+        boot->last_request_function != MD_DEV_WRITE_VERIFY) {
+        return false;
+    }
+
+    md_read_far(cpu, boot->request_segment,
+                (uint16_t)(boot->request_offset + MD_REQ_TRANSFER),
+                &data_offset, &data_segment);
+
+    if (boot->last_request_function == MD_DEV_READ) {
+        ++boot->clock_read_calls;
+        md_x86_write16(cpu, data_segment, data_offset, boot->clock_days);
+        md_x86_write8(cpu, data_segment, (uint16_t)(data_offset + 2u), boot->clock_minutes);
+        md_x86_write8(cpu, data_segment, (uint16_t)(data_offset + 3u), boot->clock_hours);
+        md_x86_write8(cpu, data_segment, (uint16_t)(data_offset + 4u), boot->clock_hundredths);
+        md_x86_write8(cpu, data_segment, (uint16_t)(data_offset + 5u), boot->clock_seconds);
+    } else {
+        ++boot->clock_write_calls;
+        boot->clock_days = md_x86_read16(cpu, data_segment, data_offset);
+        boot->clock_minutes = md_x86_read8(cpu, data_segment, (uint16_t)(data_offset + 2u));
+        boot->clock_hours = md_x86_read8(cpu, data_segment, (uint16_t)(data_offset + 3u));
+        boot->clock_hundredths = md_x86_read8(cpu, data_segment, (uint16_t)(data_offset + 4u));
+        boot->clock_seconds = md_x86_read8(cpu, data_segment, (uint16_t)(data_offset + 5u));
+    }
+
+    md_device_status(runtime, boot, MD_DEV_STATUS_DONE);
+    return true;
+}
+
+static bool md_disk_transfer(MdRuntime *runtime, MdMsdos2Boot *boot, bool write)
+{
+    MdX86 *cpu = &runtime->cpu;
+    const uint8_t unit = md_x86_read8(cpu, boot->request_segment,
+                                      (uint16_t)(boot->request_offset + MD_REQ_UNIT));
+    uint16_t data_offset;
+    uint16_t data_segment;
+    uint16_t count;
+    uint16_t start;
+    uint16_t sector_index;
+    uint16_t i;
+    uint8_t sector[512];
+
+    if (unit != 0u) {
+        md_device_error(runtime, boot, MD_DEV_ERR_UNKNOWN_UNIT);
+        return true;
+    }
+    if (boot->disk.sector_size != sizeof(sector) || boot->disk.sector_count == 0u) {
+        md_device_error(runtime, boot, MD_DEV_ERR_NOT_READY);
+        return true;
+    }
+
+    md_read_far(cpu, boot->request_segment,
+                (uint16_t)(boot->request_offset + MD_REQ_TRANSFER),
+                &data_offset, &data_segment);
+    count = md_x86_read16(cpu, boot->request_segment,
+                          (uint16_t)(boot->request_offset + MD_REQ_COUNT));
+    start = md_x86_read16(cpu, boot->request_segment,
+                          (uint16_t)(boot->request_offset + MD_REQ_START));
+
+    if ((uint32_t)start + count > boot->disk.sector_count) {
+        md_device_error(runtime, boot, MD_DEV_ERR_SECTOR_NOT_FOUND);
+        return true;
+    }
+
+    if (write) ++boot->disk_write_calls;
+    else ++boot->disk_read_calls;
+
+    for (sector_index = 0u; sector_index < count; ++sector_index) {
+        const uint32_t lba = (uint32_t)start + sector_index;
+        const uint16_t guest_base = (uint16_t)(data_offset +
+                                  (uint16_t)(sector_index * boot->disk.sector_size));
+
+        if (write) {
+            if (!boot->disk.writable || boot->disk.write == NULL) {
+                md_device_error(runtime, boot, MD_DEV_ERR_WRITE_FAULT);
+                return true;
+            }
+            for (i = 0u; i < boot->disk.sector_size; ++i) {
+                sector[i] = md_x86_read8(cpu, data_segment,
+                                         (uint16_t)(guest_base + i));
+            }
+            if (!boot->disk.write(boot->disk.user, lba, sector, boot->disk.sector_size)) {
+                md_device_error(runtime, boot, MD_DEV_ERR_WRITE_FAULT);
+                return true;
+            }
+            ++boot->disk_sectors_written;
+        } else {
+            if (boot->disk.read == NULL ||
+                !boot->disk.read(boot->disk.user, lba, sector, boot->disk.sector_size)) {
+                md_device_error(runtime, boot, MD_DEV_ERR_READ_FAULT);
+                return true;
+            }
+            for (i = 0u; i < boot->disk.sector_size; ++i) {
+                md_x86_write8(cpu, data_segment, (uint16_t)(guest_base + i), sector[i]);
+            }
+            ++boot->disk_sectors_read;
+        }
+    }
+
+    md_x86_write16(cpu, boot->request_segment,
+                   (uint16_t)(boot->request_offset + MD_REQ_COUNT), count);
+    md_device_status(runtime, boot, MD_DEV_STATUS_DONE);
+    return true;
+}
+
+static bool md_disk_service(MdRuntime *runtime, MdMsdos2Boot *boot)
+{
+    MdX86 *cpu = &runtime->cpu;
+    const uint8_t unit = md_x86_read8(cpu, boot->request_segment,
+                                      (uint16_t)(boot->request_offset + MD_REQ_UNIT));
+
+    switch (boot->last_request_function) {
+        case MD_DEV_MEDIA_CHECK:
+            ++boot->disk_media_checks;
+            if (unit != 0u) {
+                md_device_error(runtime, boot, MD_DEV_ERR_UNKNOWN_UNIT);
+            } else {
+                /* Fixed host image: media has not changed. */
+                md_x86_write8(cpu, boot->request_segment,
+                              (uint16_t)(boot->request_offset + MD_REQ_MEDIA_RESULT), 1u);
+                md_device_status(runtime, boot, MD_DEV_STATUS_DONE);
+            }
+            return true;
+
+        case MD_DEV_BUILD_BPB:
+            ++boot->disk_bpb_calls;
+            if (unit != 0u) {
+                md_device_error(runtime, boot, MD_DEV_ERR_UNKNOWN_UNIT);
+            } else {
+                md_x86_write8(cpu, boot->request_segment,
+                              (uint16_t)(boot->request_offset + MD_REQ_MEDIA), 0xFDu);
+                md_write_far(cpu, boot->request_segment,
+                             (uint16_t)(boot->request_offset + MD_REQ_BPB),
+                             MD_MSDOS2_BPB_OFFSET, boot->bios_segment);
+                md_device_status(runtime, boot, MD_DEV_STATUS_DONE);
+            }
+            return true;
+
+        case MD_DEV_READ:
+            return md_disk_transfer(runtime, boot, false);
+        case MD_DEV_WRITE:
+        case MD_DEV_WRITE_VERIFY:
+            return md_disk_transfer(runtime, boot, true);
+        case MD_DEV_IOCTL_READ:
+        case MD_DEV_IOCTL_WRITE:
+            md_device_error(runtime, boot, MD_DEV_ERR_UNKNOWN_COMMAND);
             return true;
         default:
             return false;
@@ -349,8 +623,7 @@ bool md_msdos2_boot_interrupt(MdRuntime *runtime, uint8_t vector, void *user)
         if (!boot->have_request || !md_known_device_offset(boot->last_device_offset)) {
             ++boot->unknown_device_calls;
             if (boot->have_request) {
-                md_device_status(runtime, boot,
-                                 (uint16_t)(MD_DEV_STATUS_ERROR | MD_DEV_STATUS_DONE | 3u));
+                md_device_error(runtime, boot, MD_DEV_ERR_UNKNOWN_COMMAND);
             }
             return true;
         }
@@ -361,17 +634,46 @@ bool md_msdos2_boot_interrupt(MdRuntime *runtime, uint8_t vector, void *user)
             md_device_init(runtime, boot);
         } else if (boot->last_device_offset == MD_MSDOS2_CON_OFFSET &&
                    md_console_service(runtime, boot)) {
-            /* Handled by the DOS 2 character-device contract above. */
+            /* Handled by the DOS 2 character-device contract. */
+        } else if (boot->last_device_offset == MD_MSDOS2_CLOCK_OFFSET &&
+                   md_clock_service(runtime, boot)) {
+            /* DOS 2 CLOCK$ six-byte date/time packet. */
+        } else if (boot->last_device_offset == MD_MSDOS2_DISK_OFFSET &&
+                   md_disk_service(runtime, boot)) {
+            /* Handled by the DOS 2 block-device contract. */
         } else {
             ++boot->unknown_device_calls;
-            md_device_status(runtime, boot,
-                             (uint16_t)(MD_DEV_STATUS_ERROR | MD_DEV_STATUS_DONE | 3u));
+            md_device_error(runtime, boot, MD_DEV_ERR_UNKNOWN_COMMAND);
         }
         return true;
     }
 
     if (vector == MD_MSDOS2_NATIVE_RETURN_INT) {
         boot->returned_from_dosinit = true;
+        if (boot->continue_after_dosinit) {
+            boot->postinit_started = true;
+            cpu->cs = boot->bios_segment;
+            cpu->ip = MD_MSDOS2_POSTINIT_OFFSET;
+        } else {
+            runtime->stop_reason = MD_STOP_HALT;
+        }
+        return true;
+    }
+
+    if (vector == MD_MSDOS2_NATIVE_POSTINIT_OK_INT) {
+        /* A successful EXEC normally does not return until the child exits.
+           Reaching this hook therefore means COMMAND.COM returned. */
+        boot->postinit_completed = true;
+        boot->postinit_succeeded = true;
+        boot->postinit_error = 0u;
+        runtime->stop_reason = MD_STOP_HALT;
+        return true;
+    }
+
+    if (vector == MD_MSDOS2_NATIVE_POSTINIT_FAIL_INT) {
+        boot->postinit_completed = true;
+        boot->postinit_succeeded = false;
+        boot->postinit_error = cpu->r[MD_X86_AX];
         runtime->stop_reason = MD_STOP_HALT;
         return true;
     }

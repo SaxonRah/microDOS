@@ -5,12 +5,14 @@ rem
 rem   .\md.bat deps msdos
 rem   .\md.bat build host
 rem   .\md.bat run host
+rem   .\md.bat run dos2 [budget]    (interactive; Ctrl+] exits)
 rem   .\md.bat test
 rem   .\md.bat bench [rounds]
 rem   .\md.bat recomp input.com name [code-end]
 rem   .\md.bat analyze [dos2^|msdos^|command]
+rem   .\md.bat image dos2
 rem   .\md.bat boot msdos2 [budget]
-rem   .\md.bat clean
+rem   .\md.bat clean [all]
 rem ===========================================================================
 setlocal EnableExtensions
 cd /d "%~dp0"
@@ -26,6 +28,7 @@ if /i "%CMD%"=="test"   goto test
 if /i "%CMD%"=="bench"  goto bench
 if /i "%CMD%"=="recomp" goto recomp
 if /i "%CMD%"=="analyze" goto analyze
+if /i "%CMD%"=="image"  goto image
 if /i "%CMD%"=="boot"   goto boot
 if /i "%CMD%"=="clean"  goto clean
 if /i "%CMD%"=="help"   goto help
@@ -55,16 +58,33 @@ cmake --build "%MD_ROOT%\build-host" --config Release || exit /b 1
 exit /b 0
 
 :run
-if /i not "%~1"=="host" (
-    echo ERROR: current run target is "host".
-    exit /b 1
-)
+if /i "%~1"=="host" goto run_host
+if /i "%~1"=="dos2" goto run_dos2
+echo Usage:
+echo   .\md.bat run host
+echo   .\md.bat run dos2 [budget]    ^(interactive; Ctrl+] exits^)
+exit /b 1
+
+:run_host
 call :build_host_if_needed || exit /b 1
 if exist "%MD_ROOT%\build-host\Release\microdos_host.exe" (
     "%MD_ROOT%\build-host\Release\microdos_host.exe"
 ) else (
     "%MD_ROOT%\build-host\microdos_host.exe"
 )
+exit /b %ERRORLEVEL%
+
+:run_dos2
+set "RUN_BUDGET=%~2"
+if "%RUN_BUDGET%"=="" set "RUN_BUDGET=5000000"
+call :ensure_dos2_image || exit /b 1
+set "RUN_EXE=%MD_ROOT%\build-host\microdos_msdos2.exe"
+if exist "%MD_ROOT%\build-host\Release\microdos_msdos2.exe" set "RUN_EXE=%MD_ROOT%\build-host\Release\microdos_msdos2.exe"
+if not exist "%RUN_EXE%" (
+    echo ERROR: microdos_msdos2 executable was not built.
+    exit /b 1
+)
+"%RUN_EXE%" "%MD_ROOT%\third_party\msdos\v2.0\bin\MSDOS.SYS" %RUN_BUDGET% "%MD_ROOT%\build-disk\msdos2.img" "%MD_ROOT%\third_party\msdos\v2.0\bin\COMMAND.COM"
 exit /b %ERRORLEVEL%
 
 :test
@@ -116,6 +136,34 @@ call :build_host_if_needed || exit /b 1
 call "%MD_ROOT%\scripts\md_analyze.bat" "%ANALYZE_TARGET%"
 exit /b %ERRORLEVEL%
 
+:image
+if /i not "%~1"=="dos2" (
+    echo Usage:
+    echo   .\md.bat image dos2
+    exit /b 1
+)
+call :make_dos2_image
+exit /b %ERRORLEVEL%
+
+:ensure_dos2_image
+if exist "%MD_ROOT%\build-disk\msdos2.img" exit /b 0
+call :make_dos2_image
+exit /b %ERRORLEVEL%
+
+:make_dos2_image
+call :build_host_if_needed || exit /b 1
+if not exist "%MD_ROOT%\third_party\msdos\v2.0\bin\COMMAND.COM" (
+    echo ERROR: MS-DOS 2.0 COMMAND.COM is missing.
+    echo Run: .\md.bat deps msdos
+    exit /b 1
+)
+if not exist "%MD_ROOT%\build-disk" mkdir "%MD_ROOT%\build-disk" || exit /b 1
+set "MKFAT_EXE=%MD_ROOT%\build-host\mkfat12.exe"
+if exist "%MD_ROOT%\build-host\Release\mkfat12.exe" set "MKFAT_EXE=%MD_ROOT%\build-host\Release\mkfat12.exe"
+"%MKFAT_EXE%" --command "%MD_ROOT%\third_party\msdos\v2.0\bin\COMMAND.COM" --output "%MD_ROOT%\build-disk\msdos2.img"
+exit /b %ERRORLEVEL%
+
+
 :boot
 if /i not "%~1"=="msdos2" (
     echo Usage:
@@ -139,6 +187,7 @@ exit /b %ERRORLEVEL%
 echo Usage:
 echo   .\md.bat recomp input.com name [code-end]
 echo   .\md.bat analyze [dos2^|msdos^|command]
+echo   .\md.bat image dos2
 echo Example:
 echo   .\md.bat recomp tests\programs\hello.com hello 0x10c
 exit /b 1
@@ -154,7 +203,12 @@ exit /b 0
 if exist "%MD_ROOT%\build-host" rmdir /s /q "%MD_ROOT%\build-host"
 if exist "%MD_ROOT%\build-recomp" rmdir /s /q "%MD_ROOT%\build-recomp"
 if exist "%MD_ROOT%\build-analysis" rmdir /s /q "%MD_ROOT%\build-analysis"
-echo clean.
+if /i "%~1"=="all" (
+    if exist "%MD_ROOT%\build-disk" rmdir /s /q "%MD_ROOT%\build-disk"
+    echo clean including persistent DOS disk image.
+) else (
+    echo clean. persistent build-disk preserved; use ".\md.bat image dos2" to reset it.
+)
 exit /b 0
 
 :help
@@ -163,17 +217,21 @@ echo.
 echo   .\md.bat deps msdos
 echo   .\md.bat build host
 echo   .\md.bat run host
+echo   .\md.bat run dos2 [budget]    ^(interactive; Ctrl+] exits^)
 echo   .\md.bat test
 echo   .\md.bat bench [rounds]
 echo   .\md.bat recomp input.com name [code-end]
 echo   .\md.bat analyze [dos2^|msdos^|command]
+echo   .\md.bat image dos2          ^(rebuild/reset FAT12 image^)
 echo   .\md.bat boot msdos2 [budget]
-echo   .\md.bat clean
+echo   .\md.bat clean [all]     ^(default preserves build-disk; all removes it^)
 echo.
 echo MS-DOS 2.0 bring-up:
 echo   .\md.bat deps msdos
 echo   .\md.bat analyze dos2
 echo   .\md.bat boot msdos2
+echo   .\md.bat image dos2
+echo   .\md.bat run dos2
 echo.
 echo dosrecomp example:
 echo   .\md.bat recomp tests\programs\hello.com hello 0x10c

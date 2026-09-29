@@ -289,3 +289,80 @@ explicit unsupported boundary until a platform input source is connected.
 High-frequency successful console polls/status calls are not logged individually, and
 repeated error traces are capped. Counters remain authoritative, so diagnostics stay
 useful without drowning the actual DOS output.
+
+
+## M10: DOS owns FAT and file loading
+
+The desktop host may construct and expose a FAT12 block image, but it must not satisfy
+DOS path, directory, handle, or file-read operations by translating them to the host
+filesystem. The DOS-facing native boundary is sectors only. This keeps the same
+contract usable for a host image, Pico SD storage, RAM disk, and later physical media.
+
+`boot msdos2` remains the minimal kernel/DOSINIT regression. `run dos2` is the
+full-system bring-up path and may advance beyond the synthetic SYSINIT return boundary.
+The first post-DOSINIT step is a guest-side INT 21h OPEN/READ/CLOSE smoke test for the
+released `COMMAND.COM`; EXEC is intentionally deferred until sector/FAT behavior is
+proven independently.
+
+
+## M11: prove EXEC before interactive shell I/O
+
+M11 stops when the released DOS EXEC path transfers to the released
+`COMMAND.COM:0100h`, after verifying the complete loaded image and PSP. It does not
+add host-side COM loading or filesystem shortcuts. Keyboard/interactive shell work
+is deliberately deferred until the DOS process loader is independently proven.
+
+## 23. Host console is a callback boundary, not a DOS shortcut
+
+M12 keeps keyboard input below the DOS character-device interface. The desktop
+host provides nonblocking peek, blocking read, output, and flush callbacks;
+MS-DOS still performs its own cooked/raw console semantics. `Ctrl+]` is reserved
+only as a host escape. The same callback boundary is intended for Pico/catBUS.
+
+## 24. DOS disk images persist until explicitly rebuilt
+
+`md.bat run dos2` no longer recreates the FAT12 image on every invocation. This
+allows DOS writes to persist across interactive sessions. `md.bat image dos2`
+is the explicit reset operation and reconstructs the image from the pinned
+released `COMMAND.COM`.
+
+
+## 25. Captured DOS diagnostics keep native stdout live
+
+The PowerShell capture runner must not assign the result of a function that invokes a
+native child process, because PowerShell treats that child's stdout as function output.
+Doing so collapsed the complete DOS session into the `run exit` variable. The runner
+now streams `md.bat` output directly to the console/transcript and communicates only
+the exit status through a script-scoped variable. This keeps `_kbhit/_getch` attached
+to the real console and preserves line-oriented diagnostics in `logs\latest.txt`.
+
+## 26. The FAT12 image is persistent guest state
+
+A normal `md.bat clean` removes compiler/recompiler/analysis outputs but deliberately
+preserves `build-disk\msdos2.img`. `md.bat image dos2` is the explicit disk reset,
+while `md.bat clean all` removes the disk as well. This prevents the standard
+clean-build-test-run capture workflow from silently destroying DOS filesystem changes.
+
+## 27. Diagnose the first impossible console byte, not the resulting flood
+
+The first M12 interactive run showed that DOS reached `COMMAND.COM` correctly but then
+printed literal `$` terminators and adjacent resident/transient data. Console write-call
+and byte counters were essentially one-to-one, so the initial hypothesis is not a giant
+host-side transfer count. M12.1 therefore latches the first post-COMMAND `$` reaching
+CON and, when `MICRODOS_TRACE_FIRST_DOLLAR=1`, dumps a bounded ring of the preceding
+192 guest instructions plus request, stack, register, and flag state. The diagnostic
+then stops immediately rather than allowing the corrupted output path to consume the
+entire instruction budget.
+
+
+## 28. Trace character-device corruption at both sides of INT 21h/AH=40h
+
+The M12.1 captures reproduced the first bad `$` with both a preserved and freshly
+rebuilt FAT12 image. DOS passed that byte to CON in a one-character request, so the
+native CON backend is not extending a caller buffer. M12.2 keeps the bounded first-`$`
+stop but also snapshots the most recent user `INT 21h/AH=40h` write and recognizes the
+released COMMAND.COM `REPNZ SCASB / NEG CX / DEC CX / DEC CX / AH=40h` STRING_OUT
+sequence. The trace records whether `$` was already inside the caller's CX or was the
+first byte beyond it, and checks the REP scan's actual post-CX/DI against the expected
+8086 result. This distinguishes a COMMAND-side scan/count error from a DOS write-loop
+overrun without changing guest behavior.

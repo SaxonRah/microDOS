@@ -949,6 +949,9 @@ typedef struct TestConsoleCapture {
     size_t size;
     uint8_t peek_value;
     bool have_peek;
+    const uint8_t *read_data;
+    size_t read_size;
+    size_t read_pos;
     unsigned flushes;
 } TestConsoleCapture;
 
@@ -966,6 +969,14 @@ static bool test_console_peek_cb(void *user, uint8_t *value)
     TestConsoleCapture *cap = (TestConsoleCapture *)user;
     if (!cap->have_peek) return false;
     *value = cap->peek_value;
+    return true;
+}
+
+static bool test_console_read_cb(void *user, uint8_t *value)
+{
+    TestConsoleCapture *cap = (TestConsoleCapture *)user;
+    if (cap->read_pos >= cap->read_size) return false;
+    *value = cap->read_data[cap->read_pos++];
     return true;
 }
 
@@ -994,6 +1005,7 @@ static void test_msdos2_console_device_contract(uint8_t *memory)
     md_msdos2_boot_init(&boot);
     boot.console.write = test_console_write_cb;
     boot.console.peek = test_console_peek_cb;
+    boot.console.read = test_console_read_cb;
     boot.console.flush = test_console_flush_cb;
     boot.console.user = &cap;
     hooks.interrupt = md_msdos2_boot_interrupt;
@@ -1023,6 +1035,26 @@ static void test_msdos2_console_device_contract(uint8_t *memory)
     CHECK(md_x86_read16(&runtime.cpu, req_seg, req_off + 3u) == 0x0100u);
     CHECK(md_x86_read8(&runtime.cpu, req_seg, req_off + 13u) == (uint8_t)'X');
 
+    /* Function 4: destructive read consumes exactly COUNT bytes. */
+    {
+        static const uint8_t input[] = {'V','E','R','\r'};
+        cap.read_data = input;
+        cap.read_size = sizeof(input);
+        cap.read_pos = 0u;
+        md_x86_write16(&runtime.cpu, req_seg, req_off + 14u, data_off);
+        md_x86_write16(&runtime.cpu, req_seg, req_off + 16u, data_seg);
+        md_x86_write16(&runtime.cpu, req_seg, req_off + 18u, (uint16_t)sizeof(input));
+        md_x86_write8(&runtime.cpu, req_seg, req_off + 2u, 4u);
+        CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_STRATEGY_INT, &boot));
+        CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_DEVICE_INT, &boot));
+        CHECK(md_x86_read16(&runtime.cpu, req_seg, req_off + 3u) == 0x0100u);
+        for (i = 0u; i < sizeof(input); ++i) {
+            CHECK(md_x86_read8(&runtime.cpu, data_seg, (uint16_t)(data_off + i)) == input[i]);
+        }
+        CHECK(boot.console_read_calls == 1u);
+        CHECK(boot.console_bytes_read == sizeof(input));
+    }
+
     /* Function 10: console output status is immediately ready. */
     md_x86_write8(&runtime.cpu, req_seg, req_off + 2u, 10u);
     CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_STRATEGY_INT, &boot));
@@ -1045,6 +1077,29 @@ static void test_msdos2_console_device_contract(uint8_t *memory)
     CHECK(boot.console_write_calls == 1u);
     CHECK(boot.console_bytes_written == sizeof(text));
 
+    /* M12.1 diagnostic latch records the first literal '$' reaching CON,
+       including the transfer location and the far device-call return frame. */
+    runtime.cpu.ss = 0x1400u;
+    runtime.cpu.r[MD_X86_SP] = 0x0100u;
+    md_x86_write16(&runtime.cpu, runtime.cpu.ss, 0x0100u, 0x4567u);
+    md_x86_write16(&runtime.cpu, runtime.cpu.ss, 0x0102u, 0x2345u);
+    md_x86_write8(&runtime.cpu, data_seg, data_off, (uint8_t)'$');
+    md_x86_write16(&runtime.cpu, req_seg, req_off + 14u, data_off);
+    md_x86_write16(&runtime.cpu, req_seg, req_off + 16u, data_seg);
+    md_x86_write16(&runtime.cpu, req_seg, req_off + 18u, 1u);
+    md_x86_write8(&runtime.cpu, req_seg, req_off + 2u, 8u);
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_STRATEGY_INT, &boot));
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_DEVICE_INT, &boot));
+    CHECK(boot.console_dollar_writes == 1u);
+    CHECK(boot.console_first_dollar_valid);
+    CHECK(boot.console_first_dollar_data_segment == data_seg);
+    CHECK(boot.console_first_dollar_data_offset == data_off);
+    CHECK(boot.console_first_dollar_count == 1u);
+    CHECK(boot.console_first_dollar_request_segment == req_seg);
+    CHECK(boot.console_first_dollar_request_offset == req_off);
+    CHECK(boot.console_first_dollar_return_segment == 0x2345u);
+    CHECK(boot.console_first_dollar_return_offset == 0x4567u);
+
     md_x86_write8(&runtime.cpu, req_seg, req_off + 2u, 7u);
     CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_STRATEGY_INT, &boot));
     CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_DEVICE_INT, &boot));
@@ -1052,6 +1107,299 @@ static void test_msdos2_console_device_contract(uint8_t *memory)
     CHECK(!cap.have_peek);
     CHECK(boot.unknown_device_calls == 0u);
 }
+
+
+
+static void test_msdos2_clock_device_contract(uint8_t *memory)
+{
+    MdRuntime runtime;
+    MdMsdos2Boot boot;
+    MdHooks hooks = {0};
+    const uint16_t req_seg = 0x1200u;
+    const uint16_t req_off = 0x0200u;
+    const uint16_t data_seg = 0x1300u;
+    const uint16_t data_off = 0x0040u;
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_msdos2_boot_init(&boot);
+    boot.clock_days = 17000u;
+    boot.clock_hours = 12u;
+    boot.clock_minutes = 34u;
+    boot.clock_seconds = 56u;
+    boot.clock_hundredths = 78u;
+    hooks.interrupt = md_msdos2_boot_interrupt;
+    hooks.user = &boot;
+    md_runtime_init(&runtime, memory, &hooks);
+    md_msdos2_boot_install_devices(&runtime, &boot);
+
+    runtime.cpu.r[MD_X86_SI] = MD_MSDOS2_CLOCK_OFFSET;
+    runtime.cpu.es = req_seg;
+    runtime.cpu.r[MD_X86_BX] = req_off;
+    md_x86_write16(&runtime.cpu, req_seg, req_off + 14u, data_off);
+    md_x86_write16(&runtime.cpu, req_seg, req_off + 16u, data_seg);
+    md_x86_write16(&runtime.cpu, req_seg, req_off + 18u, 6u);
+    md_x86_write8(&runtime.cpu, req_seg, req_off + 2u, 4u);
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_STRATEGY_INT, &boot));
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_DEVICE_INT, &boot));
+    CHECK(md_x86_read16(&runtime.cpu, req_seg, req_off + 3u) == 0x0100u);
+    CHECK(md_x86_read16(&runtime.cpu, data_seg, data_off) == 17000u);
+    CHECK(md_x86_read8(&runtime.cpu, data_seg, data_off + 2u) == 34u);
+    CHECK(md_x86_read8(&runtime.cpu, data_seg, data_off + 3u) == 12u);
+    CHECK(md_x86_read8(&runtime.cpu, data_seg, data_off + 4u) == 78u);
+    CHECK(md_x86_read8(&runtime.cpu, data_seg, data_off + 5u) == 56u);
+    CHECK(boot.clock_read_calls == 1u);
+
+    md_x86_write16(&runtime.cpu, data_seg, data_off, 18000u);
+    md_x86_write8(&runtime.cpu, data_seg, data_off + 2u, 2u);
+    md_x86_write8(&runtime.cpu, data_seg, data_off + 3u, 1u);
+    md_x86_write8(&runtime.cpu, data_seg, data_off + 4u, 4u);
+    md_x86_write8(&runtime.cpu, data_seg, data_off + 5u, 3u);
+    md_x86_write8(&runtime.cpu, req_seg, req_off + 2u, 8u);
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_STRATEGY_INT, &boot));
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_DEVICE_INT, &boot));
+    CHECK(boot.clock_days == 18000u);
+    CHECK(boot.clock_hours == 1u);
+    CHECK(boot.clock_minutes == 2u);
+    CHECK(boot.clock_seconds == 3u);
+    CHECK(boot.clock_hundredths == 4u);
+    CHECK(boot.clock_write_calls == 1u);
+    CHECK(boot.unknown_device_calls == 0u);
+}
+
+typedef struct TestDiskImage {
+    uint8_t data[4u * 512u];
+    unsigned reads;
+    unsigned writes;
+} TestDiskImage;
+
+static bool test_disk_read_cb(void *user, uint32_t sector, uint8_t *data, size_t size)
+{
+    TestDiskImage *disk = (TestDiskImage *)user;
+    if (size != 512u || sector >= 4u) return false;
+    memcpy(data, disk->data + (size_t)sector * 512u, 512u);
+    ++disk->reads;
+    return true;
+}
+
+static bool test_disk_write_cb(void *user, uint32_t sector, const uint8_t *data, size_t size)
+{
+    TestDiskImage *disk = (TestDiskImage *)user;
+    if (size != 512u || sector >= 4u) return false;
+    memcpy(disk->data + (size_t)sector * 512u, data, 512u);
+    ++disk->writes;
+    return true;
+}
+
+static void test_msdos2_disk_device_contract(uint8_t *memory)
+{
+    MdRuntime runtime;
+    MdMsdos2Boot boot;
+    MdHooks hooks = {0};
+    TestDiskImage disk;
+    const uint16_t req_seg = 0x1200u;
+    const uint16_t req_off = 0x0200u;
+    const uint16_t data_seg = 0x1300u;
+    const uint16_t data_off = 0x0100u;
+    unsigned i;
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    memset(&disk, 0, sizeof(disk));
+    for (i = 0u; i < sizeof(disk.data); ++i) disk.data[i] = (uint8_t)(i ^ (i >> 8));
+
+    md_msdos2_boot_init(&boot);
+    boot.disk.read = test_disk_read_cb;
+    boot.disk.write = test_disk_write_cb;
+    boot.disk.user = &disk;
+    boot.disk.sector_size = 512u;
+    boot.disk.sector_count = 4u;
+    boot.disk.writable = true;
+    hooks.interrupt = md_msdos2_boot_interrupt;
+    hooks.user = &boot;
+    md_runtime_init(&runtime, memory, &hooks);
+    md_msdos2_boot_install_devices(&runtime, &boot);
+
+    runtime.cpu.ds = boot.bios_segment;
+    runtime.cpu.r[MD_X86_SI] = MD_MSDOS2_DISK_OFFSET;
+    runtime.cpu.es = req_seg;
+    runtime.cpu.r[MD_X86_BX] = req_off;
+    md_x86_write8(&runtime.cpu, req_seg, req_off + 1u, 0u);
+
+    /* MEDIA CHECK: a fixed image is unchanged. */
+    md_x86_write8(&runtime.cpu, req_seg, req_off + 2u, 1u);
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_STRATEGY_INT, &boot));
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_DEVICE_INT, &boot));
+    CHECK(md_x86_read16(&runtime.cpu, req_seg, req_off + 3u) == 0x0100u);
+    CHECK(md_x86_read8(&runtime.cpu, req_seg, req_off + 14u) == 1u);
+
+    /* BUILD BPB returns the same BPB installed during INIT. */
+    md_x86_write8(&runtime.cpu, req_seg, req_off + 2u, 2u);
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_STRATEGY_INT, &boot));
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_DEVICE_INT, &boot));
+    CHECK(md_x86_read16(&runtime.cpu, req_seg, req_off + 18u) == MD_MSDOS2_BPB_OFFSET);
+    CHECK(md_x86_read16(&runtime.cpu, req_seg, req_off + 20u) == boot.bios_segment);
+
+    /* READ two sectors starting at LBA 1 into guest memory. */
+    md_x86_write16(&runtime.cpu, req_seg, req_off + 14u, data_off);
+    md_x86_write16(&runtime.cpu, req_seg, req_off + 16u, data_seg);
+    md_x86_write16(&runtime.cpu, req_seg, req_off + 18u, 2u);
+    md_x86_write16(&runtime.cpu, req_seg, req_off + 20u, 1u);
+    md_x86_write8(&runtime.cpu, req_seg, req_off + 2u, 4u);
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_STRATEGY_INT, &boot));
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_DEVICE_INT, &boot));
+    CHECK(md_x86_read16(&runtime.cpu, req_seg, req_off + 3u) == 0x0100u);
+    CHECK(disk.reads == 2u);
+    for (i = 0u; i < 1024u; ++i) {
+        CHECK(md_x86_read8(&runtime.cpu, data_seg, (uint16_t)(data_off + i)) == disk.data[512u + i]);
+    }
+
+    /* WRITE one sector back through the same DOS 2 request layout. */
+    for (i = 0u; i < 512u; ++i) {
+        md_x86_write8(&runtime.cpu, data_seg, (uint16_t)(data_off + i), (uint8_t)(0xA5u ^ i));
+    }
+    md_x86_write16(&runtime.cpu, req_seg, req_off + 18u, 1u);
+    md_x86_write16(&runtime.cpu, req_seg, req_off + 20u, 3u);
+    md_x86_write8(&runtime.cpu, req_seg, req_off + 2u, 8u);
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_STRATEGY_INT, &boot));
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_DEVICE_INT, &boot));
+    CHECK(md_x86_read16(&runtime.cpu, req_seg, req_off + 3u) == 0x0100u);
+    CHECK(disk.writes == 1u);
+    for (i = 0u; i < 512u; ++i) CHECK(disk.data[3u * 512u + i] == (uint8_t)(0xA5u ^ i));
+
+    CHECK(boot.disk_media_checks == 1u);
+    CHECK(boot.disk_bpb_calls == 1u);
+    CHECK(boot.disk_read_calls == 1u);
+    CHECK(boot.disk_sectors_read == 2u);
+    CHECK(boot.disk_write_calls == 1u);
+    CHECK(boot.disk_sectors_written == 1u);
+    CHECK(boot.unknown_device_calls == 0u);
+}
+
+static void test_msdos2_postinit_continuation(uint8_t *memory)
+{
+    MdRuntime runtime;
+    MdMsdos2Boot boot;
+    MdHooks hooks = {0};
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_msdos2_boot_init(&boot);
+    boot.continue_after_dosinit = true;
+    hooks.interrupt = md_msdos2_boot_interrupt;
+    hooks.user = &boot;
+    md_runtime_init(&runtime, memory, &hooks);
+    md_msdos2_boot_install_devices(&runtime, &boot);
+
+    runtime.cpu.cs = boot.bios_segment;
+    runtime.cpu.ip = (uint16_t)(MD_MSDOS2_RETURN_OFFSET + 2u);
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_RETURN_INT, &boot));
+    CHECK(boot.returned_from_dosinit);
+    CHECK(boot.postinit_started);
+    CHECK(runtime.stop_reason == MD_STOP_NONE);
+    CHECK(runtime.cpu.cs == boot.bios_segment);
+    CHECK(runtime.cpu.ip == MD_MSDOS2_POSTINIT_OFFSET);
+
+    CHECK(md_x86_read8(&runtime.cpu, boot.bios_segment, MD_MSDOS2_POSTINIT_OFFSET + 0u) == 0x0Eu);
+    CHECK(md_x86_read8(&runtime.cpu, boot.bios_segment, MD_MSDOS2_POSTINIT_OFFSET + 1u) == 0x1Fu);
+    CHECK(md_x86_read8(&runtime.cpu, boot.bios_segment, MD_MSDOS2_POSTINIT_OFFSET + 2u) == 0x0Eu);
+    CHECK(md_x86_read8(&runtime.cpu, boot.bios_segment, MD_MSDOS2_POSTINIT_OFFSET + 3u) == 0x07u);
+    CHECK(md_x86_read8(&runtime.cpu, boot.bios_segment, MD_MSDOS2_POSTINIT_PATH_OFFSET) == (uint8_t)'A');
+
+    CHECK(md_x86_read16(&runtime.cpu, boot.bios_segment, MD_MSDOS2_EXEC_BLOCK_OFFSET + 0u) == 0u);
+    CHECK(md_x86_read16(&runtime.cpu, boot.bios_segment, MD_MSDOS2_EXEC_BLOCK_OFFSET + 2u) == MD_MSDOS2_COMMAND_TAIL_OFFSET);
+    CHECK(md_x86_read16(&runtime.cpu, boot.bios_segment, MD_MSDOS2_EXEC_BLOCK_OFFSET + 4u) == boot.bios_segment);
+    CHECK(md_x86_read16(&runtime.cpu, boot.bios_segment, MD_MSDOS2_EXEC_BLOCK_OFFSET + 6u) == MD_MSDOS2_FCB1_OFFSET);
+    CHECK(md_x86_read16(&runtime.cpu, boot.bios_segment, MD_MSDOS2_EXEC_BLOCK_OFFSET + 8u) == boot.bios_segment);
+    CHECK(md_x86_read16(&runtime.cpu, boot.bios_segment, MD_MSDOS2_EXEC_BLOCK_OFFSET + 10u) == MD_MSDOS2_FCB2_OFFSET);
+    CHECK(md_x86_read16(&runtime.cpu, boot.bios_segment, MD_MSDOS2_EXEC_BLOCK_OFFSET + 12u) == boot.bios_segment);
+    CHECK(md_x86_read8(&runtime.cpu, boot.bios_segment, MD_MSDOS2_COMMAND_TAIL_OFFSET + 0u) == 2u);
+    CHECK(md_x86_read8(&runtime.cpu, boot.bios_segment, MD_MSDOS2_COMMAND_TAIL_OFFSET + 1u) == (uint8_t)'/');
+    CHECK(md_x86_read8(&runtime.cpu, boot.bios_segment, MD_MSDOS2_COMMAND_TAIL_OFFSET + 2u) == (uint8_t)'P');
+    CHECK(md_x86_read8(&runtime.cpu, boot.bios_segment, MD_MSDOS2_COMMAND_TAIL_OFFSET + 3u) == 0x0Du);
+}
+
+typedef struct TestPostinitEnv {
+    MdMsdos2Boot boot;
+    unsigned execs;
+} TestPostinitEnv;
+
+static bool test_postinit_interrupt_hook(MdRuntime *runtime, uint8_t vector, void *user)
+{
+    TestPostinitEnv *env = (TestPostinitEnv *)user;
+    MdX86 *cpu = &runtime->cpu;
+
+    if (vector == 0x21u) {
+        const uint8_t ah = md_x86_get_reg8(cpu, 4u);
+        const uint8_t al = md_x86_get_reg8(cpu, 0u);
+        if (ah == 0x4Bu && al == 0u) {
+            const uint16_t seg = env->boot.bios_segment;
+            CHECK(cpu->ds == seg);
+            CHECK(cpu->es == seg);
+            CHECK(cpu->r[MD_X86_DX] == MD_MSDOS2_POSTINIT_PATH_OFFSET);
+            CHECK(cpu->r[MD_X86_BX] == MD_MSDOS2_EXEC_BLOCK_OFFSET);
+            CHECK(md_x86_read8(cpu, seg, MD_MSDOS2_POSTINIT_PATH_OFFSET) == (uint8_t)'A');
+            CHECK(md_x86_read16(cpu, seg, MD_MSDOS2_EXEC_BLOCK_OFFSET) == 0u);
+            CHECK(md_x86_read16(cpu, seg, MD_MSDOS2_EXEC_BLOCK_OFFSET + 2u) == MD_MSDOS2_COMMAND_TAIL_OFFSET);
+            CHECK(md_x86_read16(cpu, seg, MD_MSDOS2_EXEC_BLOCK_OFFSET + 4u) == seg);
+            CHECK(md_x86_read8(cpu, seg, MD_MSDOS2_COMMAND_TAIL_OFFSET) == 2u);
+            CHECK(md_x86_read8(cpu, seg, MD_MSDOS2_COMMAND_TAIL_OFFSET + 1u) == (uint8_t)'/');
+            CHECK(md_x86_read8(cpu, seg, MD_MSDOS2_COMMAND_TAIL_OFFSET + 2u) == (uint8_t)'P');
+            CHECK(md_x86_read8(cpu, seg, MD_MSDOS2_COMMAND_TAIL_OFFSET + 3u) == 0x0Du);
+
+            /* Simulate DOS EXEC transferring to a freshly built COM PSP. */
+            md_x86_write8(cpu, 0x3000u, 0x0000u, 0xCDu);
+            md_x86_write8(cpu, 0x3000u, 0x0001u, 0x20u);
+            md_x86_write8(cpu, 0x3000u, 0x0080u, 2u);
+            md_x86_write8(cpu, 0x3000u, 0x0081u, (uint8_t)'/');
+            md_x86_write8(cpu, 0x3000u, 0x0082u, (uint8_t)'P');
+            md_x86_write8(cpu, 0x3000u, 0x0083u, 0x0Du);
+            md_x86_write8(cpu, 0x3000u, MD_MSDOS2_COMMAND_ENTRY_OFFSET, 0xF4u);
+            cpu->cs = 0x3000u;
+            cpu->ds = 0x3000u;
+            cpu->es = 0x3000u;
+            cpu->ss = 0x3000u;
+            cpu->ip = MD_MSDOS2_COMMAND_ENTRY_OFFSET;
+            cpu->r[MD_X86_SP] = 0xFFFEu;
+            cpu->flags &= (uint16_t)~MD_X86_FLAG_CF;
+            ++env->execs;
+            return true;
+        }
+        cpu->flags |= MD_X86_FLAG_CF;
+        cpu->r[MD_X86_AX] = 1u;
+        return true;
+    }
+
+    return md_msdos2_boot_interrupt(runtime, vector, &env->boot);
+}
+
+static void test_msdos2_postinit_program_execution(uint8_t *memory)
+{
+    MdRuntime runtime;
+    TestPostinitEnv env;
+    MdHooks hooks = {0};
+    MdStopReason reason;
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    memset(&env, 0, sizeof(env));
+    md_msdos2_boot_init(&env.boot);
+    env.boot.continue_after_dosinit = true;
+    hooks.interrupt = test_postinit_interrupt_hook;
+    hooks.user = &env;
+    md_runtime_init(&runtime, memory, &hooks);
+    md_msdos2_boot_install_devices(&runtime, &env.boot);
+    runtime.cpu.ss = env.boot.stack_segment;
+    runtime.cpu.r[MD_X86_SP] = 0xFFFEu;
+    runtime.cpu.flags = MD_X86_FLAG_ALWAYS1;
+
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_RETURN_INT, &env.boot));
+    reason = md_interp_run(&runtime, 100u);
+    CHECK(reason == MD_STOP_HALT);
+    CHECK(env.execs == 1u);
+    CHECK(runtime.cpu.cs == 0x3000u);
+    CHECK(runtime.cpu.ds == 0x3000u);
+    CHECK(runtime.cpu.es == 0x3000u);
+    CHECK(runtime.cpu.ss == 0x3000u);
+    CHECK(runtime.cpu.ip == (uint16_t)(MD_MSDOS2_COMMAND_ENTRY_OFFSET + 1u));
+}
+
 
 static void test_ivt(uint8_t *memory)
 {
@@ -1104,6 +1452,10 @@ int main(void)
     test_raw_loader_and_msdos2_bootstrap(memory);
     test_msdos2_native_device_init(memory);
     test_msdos2_console_device_contract(memory);
+    test_msdos2_clock_device_contract(memory);
+    test_msdos2_disk_device_contract(memory);
+    test_msdos2_postinit_continuation(memory);
+    test_msdos2_postinit_program_execution(memory);
     test_ivt(memory);
 
     free(memory);

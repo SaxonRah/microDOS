@@ -11,29 +11,28 @@ The interpreted path itself has two tiers: a fast decoded basic-block cache and 
 
 ## Current status
 
-Milestone 9 is the first real DOS 2.x **runtime character-device** milestone. The
-released `MSDOS.SYS` now enters `DOSINIT`, initializes the complete synthetic OEM
-device chain, and reaches normal DOS console traffic. The M8 run showed that the
-first remaining boundary was not CPU execution at all: DOS repeatedly requested CON
-functions 5 (non-destructive input), 10 (output status), and 8 (write), while the M8
-shim incorrectly returned unknown-command error `8103h`.
+Milestone 10 moves beyond kernel initialization into the real DOS filesystem path.
+The released `MSDOS.SYS` already completes `DOSINIT` and prints its own MS-DOS 2.00
+banner through the native CON device. M10 keeps that kernel-only path as a permanent
+regression test and adds a separate full-system bring-up path.
 
-M9 implements those requests using the real DOS 2 request-packet layout and status
-semantics. With no pending input, function 5 returns `0300h` (`BUSY|DONE`) rather
-than an error; output status returns `0100h`; writes consume the transfer far pointer
-and byte count from the request packet and send the bytes through a platform-neutral
-console callback. Input/output flush and write-with-verify are also handled according
-to the DOS 2 character-device contract.
+The native DOS 2 block device now implements MEDIA CHECK, BUILD BPB, sector READ,
+sector WRITE, and WRITE+VERIFY using a platform-neutral block callback. The desktop
+host binds that callback to a 360 KiB in-memory FAT12 disk image; a future Pico target
+can bind the same sector interface to SD or other storage without changing the DOS
+request-packet layer.
 
-The console callback layer is intentionally platform-neutral. The Windows bring-up
-runner binds output to stdout; Pico 2 can later bind the same DOS-facing device to
-MicroRender/MicroConsole without changing kernel-facing code. Destructive input is
-only accepted when a platform read callback is present, so unsupported input is not
-silently fabricated.
+`mkfat12` builds a deterministic 720-sector image containing the released
+`COMMAND.COM`. DOS owns the filesystem: the host never translates DOS path or handle
+operations into host filesystem calls. After `DOSINIT` returns, a tiny guest-side
+SYSINIT continuation invokes real INT 21h OPEN/READ/CLOSE on `A:\COMMAND.COM` and
+reads its first 64 bytes through `MSDOS.SYS` and the block driver. The host compares
+those returned guest bytes against the pinned `COMMAND.COM` only as a validation
+check.
 
-The permanent execution architecture is unchanged: generated AOT for known native
-blocks, a high-performance decoded cache for general legacy code, and one canonical
-8086 interpreter/semantics layer for correctness and fallback.
+The permanent execution architecture remains generated AOT for known native blocks,
+a high-performance decoded cache for general legacy code, and one canonical 8086
+interpreter/semantics layer for correctness and fallback.
 
 ## MS-DOS 2.0 reference bring-up
 
@@ -44,6 +43,8 @@ MS-DOS 2.0 kernel:
 .\md.bat deps msdos
 .\md.bat analyze dos2
 .\md.bat boot msdos2
+.\md.bat image dos2
+.\md.bat run dos2
 ```
 
 This analyzes `v2.0/bin/MSDOS.SYS` as a raw image at `0000h` and
@@ -217,3 +218,64 @@ shared MdRuntime / MdX86 / instruction semantics
 The original MS-DOS source is source-level metadata and documentation; the binary remains the behavioral authority for recompilation.
 
 See `docs/ARCHITECTURE.md`, `docs/MSDOS2_BRINGUP.md`, `DECISIONS.md`, `tools/dosrecomp/README.md`, and `tools/dosprobe/README.md`.
+
+
+### MS-DOS 2.0 milestone 11
+
+The current `run dos2` path asks the released DOS 2 kernel to `EXEC` the released
+`COMMAND.COM` from the generated FAT12 image. Success requires DOS to allocate the
+child, build a valid PSP, load the complete COM image, and transfer to offset
+`0100h`; the runner verifies the full loaded image and `/P` PSP command tail before
+stopping at the entry boundary.
+
+
+### Interactive DOS 2 shell bring-up (M12)
+
+After the M11 EXEC milestone, `md.bat run dos2` now continues into the released
+`COMMAND.COM` with an interactive host console. Keyboard input reaches DOS
+through the normal CON request packets; `Ctrl+]` exits back to the host. The
+CLOCK request packet is implemented as well. Existing `build-disk\msdos2.img`
+is preserved between runs; use `md.bat image dos2` to reset it.
+
+```powershell
+.\md.bat run dos2
+# at the DOS prompt try: VER, DIR, ECHO HELLO
+# Ctrl+] returns to the host
+```
+
+
+### M12.2 upstream string-output diagnostic
+
+The first interactive M12 run reached the released `COMMAND.COM` and printed its
+`Command v. 2.02` banner, but later emitted `$` delimiters and adjacent command
+interpreter data as ordinary console characters until the execution budget expired.
+The host CON driver received almost entirely one-byte writes, so M12.1 does not assume
+a bad request length. Instead it records the guest execution immediately preceding the
+first post-COMMAND literal `$` that reaches CON.
+
+Use the permanent capture front door:
+
+```powershell
+.\capture.bat
+```
+
+By default it runs clean -> build -> tests -> DOS and enables the bounded string
+diagnostic. M12.1 proved that the bad `$` arrives at CON as a normal one-byte DOS
+device request, so M12.2 additionally records the originating user `INT 21h/AH=40h`
+WRITE and COMMAND.COM's immediately preceding `REPNZ SCASB` string scan. The first
+post-COMMAND `$` therefore dumps: the original caller DS:DX/CX, the requested last
+byte and first byte beyond the request, the STRING_OUT scan pre/post state and derived
+count, plus the preceding 192 guest instructions and DOS request/stack state. It then
+exits the DOS runner with code 6. The capture script allows that diagnostic exit and
+writes both a timestamped transcript and `logs\latest.txt`.
+
+For a normal interactive run without the diagnostic stop:
+
+```powershell
+.\capture.bat -NoStringTrace
+```
+
+`md.bat clean` now preserves `build-disk\msdos2.img`, because the disk image is
+persistent guest state rather than a compiler build product. Use `md.bat image dos2`
+to explicitly reset the FAT12 disk, or `md.bat clean all` when a complete removal of
+build products *and* the disk image is desired.

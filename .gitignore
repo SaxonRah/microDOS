@@ -14,3 +14,7 @@ build-*/
 
 /third_party/msdos/
 /build-analysis/
+
+/build-disk/
+
+/logs/
