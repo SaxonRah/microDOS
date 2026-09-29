@@ -818,7 +818,7 @@ static void dr_emit_inst(FILE *file, const DrInst *inst)
 
         case DR_PUSH_R16:
             fprintf(file,
-                    "    md_x86_push(cpu, cpu->r[%uu]);\n"
+                    "    md_x86_push_reg(cpu, %uu);\n"
                     "    if (runtime->code_write_epoch != aot_write_epoch) goto md_fallback;\n",
                     (unsigned)inst->reg);
             break;

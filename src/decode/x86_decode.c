@@ -372,15 +372,25 @@ static int md_base_interp_opcode(uint8_t opcode)
     if ((opcode & 0xF8u) == 0xB0u || (opcode & 0xF8u) == 0xB8u ||
         (opcode & 0xF8u) == 0x40u || (opcode & 0xF8u) == 0x48u ||
         (opcode & 0xF8u) == 0x50u || (opcode & 0xF8u) == 0x58u) return 1;
-    if (opcode >= 0x88u && opcode <= 0x8Bu) return 1;
-    if (opcode <= 0x03u || (opcode >= 0x28u && opcode <= 0x2Bu) ||
-        (opcode >= 0x38u && opcode <= 0x3Bu)) return 1;
+
+    if (opcode <= 0x3Bu && (opcode & 0x04u) == 0u) return 1;
+    if (opcode <= 0x3Du && (opcode & 0x06u) == 0x04u) return 1;
+
+    if (opcode >= 0x70u && opcode <= 0x7Fu) return 1;
+    if (opcode >= 0x80u && opcode <= 0x8Fu) return 1;
+    if (opcode >= 0x90u && opcode <= 0x9Fu) return 1;
+    if (opcode >= 0xA0u && opcode <= 0xA9u) return 1;
+    if (opcode >= 0xAAu && opcode <= 0xAFu) return 1;
+    if (opcode >= 0xC2u && opcode <= 0xC7u) return 1;
+    if (opcode >= 0xCAu && opcode <= 0xCFu) return 1;
+    if (opcode >= 0xD0u && opcode <= 0xD7u) return 1;
+    if (opcode >= 0xE0u && opcode <= 0xEFu) return 1;
+    if (opcode >= 0xF4u) return 1;
+
     switch (opcode) {
-        case 0x04u: case 0x05u: case 0x2Cu: case 0x2Du:
-        case 0x3Cu: case 0x3Du: case 0x74u: case 0x75u:
-        case 0x90u: case 0xA0u: case 0xA1u: case 0xA2u:
-        case 0xA3u: case 0xC3u: case 0xCDu: case 0xE8u:
-        case 0xE9u: case 0xEBu: case 0xF4u:
+        case 0x06u: case 0x07u: case 0x0Eu: case 0x0Fu:
+        case 0x16u: case 0x17u: case 0x1Eu: case 0x1Fu:
+        case 0x27u: case 0x2Fu: case 0x37u: case 0x3Fu:
             return 1;
         default:
             return 0;
@@ -389,8 +399,26 @@ static int md_base_interp_opcode(uint8_t opcode)
 
 bool md_decode_interp_supported(const MdDecodedInstruction *inst)
 {
-    return inst != NULL && inst->valid_8086 && inst->prefix_count == 0u &&
-           md_base_interp_opcode(inst->opcode) != 0;
+    unsigned ext;
+    unsigned mod;
+    if (inst == NULL || !inst->valid_8086 ||
+        md_base_interp_opcode(inst->opcode) == 0) return false;
+
+    ext = (inst->modrm >> 3) & 7u;
+    mod = inst->modrm >> 6;
+    if ((inst->opcode == 0x8Cu || inst->opcode == 0x8Eu) && ext >= 4u) return false;
+    if (inst->opcode == 0x8Eu && ext == 1u) return false; /* MOV CS,r/m16 */
+    if (inst->opcode == 0x8Du && mod == 3u) return false; /* LEA requires memory EA. */
+    if (inst->opcode == 0x8Fu && ext != 0u) return false;
+    if ((inst->opcode == 0xC4u || inst->opcode == 0xC5u) && mod == 3u) return false;
+    if ((inst->opcode == 0xC6u || inst->opcode == 0xC7u) && ext != 0u) return false;
+    if ((inst->opcode == 0xF6u || inst->opcode == 0xF7u) && ext == 1u) return false;
+    if (inst->opcode == 0xFEu && ext > 1u) return false;
+    if (inst->opcode == 0xFFu) {
+        if (ext == 7u) return false;
+        if ((ext == 3u || ext == 5u) && mod == 3u) return false;
+    }
+    return true;
 }
 
 bool md_decode_aot_supported(const MdDecodedInstruction *inst)

@@ -175,6 +175,19 @@ static inline uint16_t md_x86_pop(MdX86 *cpu)
     return value;
 }
 
+/* The original 8086/8088 has a famous PUSH SP quirk: the value written is
+   the already-decremented SP, not the pre-instruction SP used by later x86. */
+static inline void md_x86_push_reg(MdX86 *cpu, unsigned reg)
+{
+    reg &= 7u;
+    if (reg == MD_X86_SP) {
+        cpu->r[MD_X86_SP] = (uint16_t)(cpu->r[MD_X86_SP] - 2u);
+        md_x86_write16(cpu, cpu->ss, cpu->r[MD_X86_SP], cpu->r[MD_X86_SP]);
+    } else {
+        md_x86_push(cpu, cpu->r[reg]);
+    }
+}
+
 #ifdef __cplusplus
 }
 #endif

@@ -80,6 +80,16 @@ if(MD_BUILD_HOST)
     target_link_libraries(microdos_host PRIVATE microdos::runtime)
     target_include_directories(microdos_host PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/host" "${MD_GENERATED_DIR}")
 
+    add_executable(microdos_msdos2 src/host/msdos2_main.c src/host/msdos2_boot.c)
+    target_link_libraries(microdos_msdos2 PRIVATE microdos::runtime)
+    target_include_directories(microdos_msdos2 PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/host")
+    if(MSVC)
+        target_compile_definitions(microdos_msdos2 PRIVATE _CRT_SECURE_NO_WARNINGS)
+        target_compile_options(microdos_msdos2 PRIVATE /W4 /permissive- $<$<CONFIG:Release>:/O2>)
+    else()
+        target_compile_options(microdos_msdos2 PRIVATE -Wall -Wextra -Wpedantic $<$<CONFIG:Release>:-O3>)
+    endif()
+
     add_executable(microdos_bench src/host/bench.c "${MD_RECOMP_loop_C}" "${MD_RECOMP_loop_H}")
     target_link_libraries(microdos_bench PRIVATE microdos::runtime)
     target_include_directories(microdos_bench PRIVATE "${MD_GENERATED_DIR}")
@@ -89,7 +99,7 @@ if(MD_BUILD_TESTS)
     include(CTest)
     enable_testing()
     add_executable(microdos_tests
-        tests/test_runtime.c src/host/host_dos.c
+        tests/test_runtime.c src/host/host_dos.c src/host/msdos2_boot.c
         "${MD_RECOMP_hello_C}" "${MD_RECOMP_hello_H}"
         "${MD_RECOMP_loop_C}" "${MD_RECOMP_loop_H}"
         "${MD_RECOMP_hybrid_C}" "${MD_RECOMP_hybrid_H}"

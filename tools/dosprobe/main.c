@@ -274,7 +274,9 @@ static const char *dp_opcode_name(uint8_t op)
     if (op == 0x8Cu) return "MOV r/m,Sreg";
     if (op == 0x8Du) return "LEA";
     if (op == 0x8Eu) return "MOV Sreg,r/m";
+    if (op == 0x87u) return "XCHG r/m,reg";
     if (op == 0x8Fu) return "POP r/m16";
+    if (op == 0xA8u || op == 0xA9u) return "TEST accumulator,imm";
     if (op == 0xA4u || op == 0xA5u) return "MOVS";
     if (op == 0xA6u || op == 0xA7u) return "CMPS";
     if (op == 0xAAu || op == 0xABu) return "STOS";
@@ -297,10 +299,17 @@ static const char *dp_opcode_name(uint8_t op)
         case 0x17u: return "POP SS";
         case 0x1Eu: return "PUSH DS";
         case 0x1Fu: return "POP DS";
+        case 0x98u: return "CBW";
+        case 0x99u: return "CWD";
         case 0x9Cu: return "PUSHF";
         case 0x9Du: return "POPF";
         case 0x9Eu: return "SAHF";
         case 0x9Fu: return "LAHF";
+        case 0xCFu: return "IRET";
+        case 0xF8u: return "CLC";
+        case 0xF9u: return "STC";
+        case 0xFAu: return "CLI";
+        case 0xFBu: return "STI";
         case 0xFCu: return "CLD";
         case 0xFDu: return "STD";
         default: return "other";
@@ -502,6 +511,9 @@ static int dp_selftest(void)
     static const uint8_t indirect_jmp[] = {0xFFu, 0x26u, 0x34u, 0x12u};
     static const uint8_t mov_imm_mem[] = {0xC7u, 0x06u, 0x00u, 0x20u, 0x34u, 0x12u};
     static const uint8_t jz_back[] = {0x74u, 0xFEu};
+    static const uint8_t grp3_neg[] = {0xF7u, 0xD8u};
+    static const uint8_t shift_cl[] = {0xD3u, 0xE8u};
+    static const uint8_t les_mem[] = {0xC4u, 0x06u, 0x34u, 0x12u};
     static const uint8_t push_186[] = {0x68u, 0x34u, 0x12u};
     static uint8_t flow_image[] = {
         0xE9u, 0x03u, 0x00u,       /* jmp 0006 */
@@ -518,10 +530,13 @@ static int dp_selftest(void)
                            MD_DECODE_FLOW_FALLTHROUGH, 1);
     ok &= md_decode_8086(rep_movsb, sizeof(rep_movsb), 0x0100u, 0x0100u, &inst) &&
           inst.prefix_count == 1u && inst.prefixes[0] == 0xF3u;
+    ok &= md_decode_interp_supported(&inst) && !md_decode_aot_supported(&inst);
     ok &= dp_expect_decode(mov_bp, sizeof(mov_bp), 0x0100u, 0x0100u, 4u, 0x8Bu,
                            MD_DECODE_FLOW_FALLTHROUGH, 1);
     ok &= dp_expect_decode(grp1, sizeof(grp1), 0x0100u, 0x0100u, 4u, 0x83u,
                            MD_DECODE_FLOW_FALLTHROUGH, 1);
+    ok &= md_decode_8086(grp1, sizeof(grp1), 0x0100u, 0x0100u, &inst) &&
+          md_decode_interp_supported(&inst) && !md_decode_aot_supported(&inst);
     ok &= dp_expect_decode(kernel_jmp, sizeof(kernel_jmp), 0u, 0u, 3u, 0xE9u,
                            MD_DECODE_FLOW_JUMP, 1);
     ok &= md_decode_8086(kernel_jmp, sizeof(kernel_jmp), 0u, 0u, &inst) && inst.target == 0x3E7Bu;
@@ -529,9 +544,17 @@ static int dp_selftest(void)
                            MD_DECODE_FLOW_INDIRECT_JUMP, 1);
     ok &= dp_expect_decode(mov_imm_mem, sizeof(mov_imm_mem), 0x0100u, 0x0100u, 6u, 0xC7u,
                            MD_DECODE_FLOW_FALLTHROUGH, 1);
+    ok &= md_decode_8086(mov_imm_mem, sizeof(mov_imm_mem), 0x0100u, 0x0100u, &inst) &&
+          md_decode_interp_supported(&inst) && !md_decode_aot_supported(&inst);
     ok &= dp_expect_decode(jz_back, sizeof(jz_back), 0x0100u, 0x0100u, 2u, 0x74u,
                            MD_DECODE_FLOW_CONDITIONAL, 1);
     ok &= md_decode_8086(jz_back, sizeof(jz_back), 0x0100u, 0x0100u, &inst) && inst.target == 0x0100u;
+    ok &= md_decode_8086(grp3_neg, sizeof(grp3_neg), 0x0100u, 0x0100u, &inst) &&
+          md_decode_interp_supported(&inst) && !md_decode_aot_supported(&inst);
+    ok &= md_decode_8086(shift_cl, sizeof(shift_cl), 0x0100u, 0x0100u, &inst) &&
+          md_decode_interp_supported(&inst) && !md_decode_aot_supported(&inst);
+    ok &= md_decode_8086(les_mem, sizeof(les_mem), 0x0100u, 0x0100u, &inst) &&
+          md_decode_interp_supported(&inst) && !md_decode_aot_supported(&inst);
     ok &= dp_expect_decode(push_186, sizeof(push_186), 0x0100u, 0x0100u, 3u, 0x68u,
                            MD_DECODE_FLOW_FALLTHROUGH, 0);
 

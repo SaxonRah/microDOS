@@ -1,10 +1,12 @@
 #include "microdos/block_cache.h"
+#include "microdos/ops.h"
 #include "microdos/runtime.h"
 #include "hello_recomp.h"
 #include "hybrid_recomp.h"
 #include "loop_recomp.h"
 #include "selfmod_recomp.h"
 #include "host_dos.h"
+#include "msdos2_boot.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +28,191 @@ static const uint8_t kHello[] = {
 static const uint8_t kLoop[] = {0xB9,0xFF,0xFF,0x49,0x75,0xFD,0xF4};
 static const uint8_t kHybrid[] = {0xB8,0x34,0x12,0x74,0x03,0x89,0xC3,0x90,0xF4};
 static const uint8_t kPatchAx[] = {0xB8,0x11,0x11,0xF4};
+
+static const uint8_t kSegmentOps[] = {
+    0xB8,0x34,0x12,       /* mov ax,1234h */
+    0x8E,0xD8,            /* mov ds,ax */
+    0x1E,                 /* push ds */
+    0xB8,0x78,0x56,       /* mov ax,5678h */
+    0x8E,0xC0,            /* mov es,ax */
+    0x07,                 /* pop es */
+    0x8C,0xC0,            /* mov ax,es */
+    0xF4                  /* hlt */
+};
+
+static const uint8_t kGroup1Ops[] = {
+    0xC7,0x06,0x00,0x02,0x34,0x12, /* mov word [0200h],1234h */
+    0xC6,0x06,0x02,0x02,0x80,      /* mov byte [0202h],80h */
+    0xB8,0xFF,0x00,                 /* mov ax,00ffh */
+    0x33,0x06,0x00,0x02,            /* xor ax,[0200h] -> 12cbh */
+    0x83,0xC0,0xFF,                 /* add ax,-1 -> 12cah */
+    0x83,0xE8,0x0A,                 /* sub ax,10 -> 12c0h */
+    0x80,0x3E,0x02,0x02,0x80,      /* cmp byte [0202h],80h */
+    0x74,0x03,                      /* jz good */
+    0xB8,0xAD,0xDE,                 /* must be skipped */
+    0xF4                            /* good: hlt */
+};
+
+static const uint8_t kStringOps[] = {
+    0xB8,0x00,0x20,                 /* mov ax,2000h */
+    0x8E,0xD8,                      /* mov ds,ax */
+    0xB8,0x00,0x30,                 /* mov ax,3000h */
+    0x8E,0xC0,                      /* mov es,ax */
+    0xBE,0x00,0x01,                 /* mov si,0100h */
+    0xBF,0x00,0x02,                 /* mov di,0200h */
+    0xB9,0x04,0x00,                 /* mov cx,4 */
+    0xFC,                           /* cld */
+    0x3E,0xF3,0xA4,                 /* ds: rep movsb (multiple prefixes) */
+    0x26,0xC6,0x06,0x02,0x02,0x99,/* mov byte es:[0202h],99h */
+    0xBE,0x00,0x01,                 /* mov si,0100h */
+    0xBF,0x00,0x02,                 /* mov di,0200h */
+    0xB9,0x04,0x00,                 /* mov cx,4 */
+    0xF3,0xA6,                      /* repe cmpsb; stop at changed byte */
+    0xBE,0x01,0x02,                 /* mov si,0201h */
+    0x26,0xAC,                      /* es: lodsb */
+    0xBF,0x04,0x02,                 /* mov di,0204h */
+    0xAA,                           /* stosb */
+    0xFD,                           /* std */
+    0xB8,0xEF,0xBE,                 /* mov ax,beefh */
+    0xBF,0x08,0x02,                 /* mov di,0208h */
+    0xAB,                           /* stosw, backwards */
+    0xFC,                           /* cld */
+    0xF4                            /* hlt */
+};
+
+static const uint8_t kScasOps[] = {
+    0xB8,0x00,0x30,                 /* mov ax,3000h */
+    0x8E,0xC0,                      /* mov es,ax */
+    0xBF,0x00,0x02,                 /* mov di,0200h */
+    0xB0,0x99,                      /* mov al,99h */
+    0xB9,0x04,0x00,                 /* mov cx,4 */
+    0xFC,                           /* cld */
+    0xF2,0xAE,                      /* repne scasb */
+    0xF4                            /* hlt */
+};
+
+static const uint8_t kLoopOps[] = {
+    0xB9,0x03,0x00,                 /* mov cx,3 */
+    0xB8,0x00,0x00,                 /* mov ax,0 */
+    0x40,                           /* again: inc ax */
+    0xE2,0xFD,                      /* loop again */
+    0xE3,0x03,                      /* jcxz done */
+    0xB8,0xAD,0xDE,                 /* must be skipped */
+    0xF4                            /* done: hlt */
+};
+
+static const uint8_t kLoopzOps[] = {
+    0xB9,0x02,0x00,                 /* mov cx,2 */
+    0xB8,0x00,0x00,                 /* mov ax,0 */
+    0x3D,0x00,0x00,                 /* cmp ax,0 -> ZF=1 */
+    0xE1,0xFE,                      /* loopz self */
+    0xF4
+};
+
+static const uint8_t kLoopnzOps[] = {
+    0xB9,0x02,0x00,                 /* mov cx,2 */
+    0xB8,0x00,0x00,                 /* mov ax,0 */
+    0x3D,0x01,0x00,                 /* cmp ax,1 -> ZF=0 */
+    0xE0,0xFE,                      /* loopnz self */
+    0xF4
+};
+
+
+static const uint8_t kCoreControlOps[] = {
+    0xB0,0x80,                      /* mov al,80h */
+    0x98,                           /* cbw -> ax=ff80 */
+    0x99,                           /* cwd -> dx=ffff */
+    0xF9,                           /* stc */
+    0x9C,                           /* pushf */
+    0xF8,                           /* clc */
+    0x9D,                           /* popf: restore CF */
+    0x72,0x03,                      /* jc good */
+    0xB8,0xAD,0xDE,                 /* skipped */
+    0xFA,                           /* good: cli */
+    0xFB,                           /* sti */
+    0xA9,0x80,0xFF,                 /* test ax,ff80h */
+    0xF4
+};
+
+static const uint8_t kAddressingOps[] = {
+    0xC5,0x1E,0x00,0x02,            /* lds bx,[0200h] */
+    0x2E,0xC4,0x06,0x04,0x02,       /* cs: les ax,[0204h] */
+    0x8D,0x36,0x34,0x12,            /* lea si,[1234h] */
+    0x93,                           /* xchg ax,bx */
+    0x50,                           /* push ax */
+    0x8F,0x06,0x08,0x02,            /* pop word [0208h] */
+    0xF4
+};
+
+static const uint8_t kGroup3Unsigned[] = {
+    0xB0,0x12,                      /* mov al,12h */
+    0xB3,0x10,                      /* mov bl,10h */
+    0xF6,0xE3,                      /* mul bl -> ax=0120h */
+    0xBB,0x03,0x00,                 /* mov bx,3 */
+    0xF7,0xF3,                      /* div bx -> ax=0060h, dx=0 */
+    0xF4
+};
+
+static const uint8_t kGroup3Signed[] = {
+    0xB0,0xF6,                      /* mov al,-10 */
+    0xB3,0x03,                      /* mov bl,3 */
+    0xF6,0xEB,                      /* imul bl -> ax=-30 */
+    0xF6,0xFB,                      /* idiv bl -> al=-10, ah=0 */
+    0xF4
+};
+
+static const uint8_t kGroup3Logic[] = {
+    0xB8,0x34,0x12,                 /* mov ax,1234h */
+    0xF7,0xD0,                      /* not ax -> edcbh */
+    0xF7,0xD8,                      /* neg ax -> 1235h */
+    0xF7,0xC0,0x35,0x12,            /* test ax,1235h */
+    0xF4
+};
+
+static const uint8_t kGroup45Memory[] = {
+    0xC7,0x06,0x00,0x02,0xFF,0x00, /* mov word [0200h],00ffh */
+    0xFF,0x06,0x00,0x02,            /* inc word [0200h] */
+    0xFF,0x0E,0x00,0x02,            /* dec word [0200h] */
+    0xFF,0x36,0x00,0x02,            /* push word [0200h] */
+    0x58,                           /* pop ax */
+    0xC6,0x06,0x02,0x02,0x7F,      /* mov byte [0202h],7fh */
+    0xFE,0x06,0x02,0x02,            /* inc byte [0202h] */
+    0xFE,0x0E,0x02,0x02,            /* dec byte [0202h] */
+    0xF4
+};
+
+static const uint8_t kNearIndirectCall[] = {
+    0xBB,0x0B,0x01,                 /* mov bx,010bh */
+    0xB8,0x00,0x00,                 /* mov ax,0 */
+    0xFF,0xD3,                      /* call bx */
+    0xF4,                           /* return here */
+    0x90,0x90,                      /* padding */
+    0x40,                           /* 010b: inc ax */
+    0xC3                            /* ret */
+};
+
+static const uint8_t kNearIndirectJump[] = {
+    0xBB,0x08,0x01,                 /* mov bx,0108h */
+    0xFF,0xE3,                      /* jmp bx */
+    0xB8,0xAD,0xDE,                 /* skipped */
+    0xF4                            /* 0108 */
+};
+
+static const uint8_t kFarCall[] = {
+    0xB8,0x00,0x00,                 /* mov ax,0 */
+    0x9A,0x00,0x01,0x00,0x20,       /* call far 2000:0100 */
+    0xF4
+};
+
+static const uint8_t kIretOps[] = {0xCF,0xF4};
+static const uint8_t kPushSpOps[] = {0x54,0x58,0xF4};
+static const uint8_t kAamAadOps[] = {0xB0,0x2A,0xD4,0x0A,0xD5,0x0A,0xF4};
+static const uint8_t kShiftOps[] = {
+    0xB0,0x81,0xD0,0xE0,            /* shl al,1 -> 02h */
+    0xB1,0x01,0xD2,0xC8,            /* ror al,cl -> 01h */
+    0xB8,0x00,0x80,0xD1,0xF8,       /* sar ax,1 -> c000h */
+    0xF4
+};
 
 static void test_address_wrap(uint8_t *memory)
 {
@@ -279,6 +466,593 @@ static void test_budget(uint8_t *memory)
     CHECK(runtime.instructions == 3u);
 }
 
+
+static void test_phase_a_flag_semantics(void)
+{
+    MdX86 cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.flags = (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF);
+    CHECK(md_x86_adc8(&cpu, 0x7Fu, 0x00u) == 0x80u);
+    CHECK((cpu.flags & MD_X86_FLAG_OF) != 0u);
+    CHECK((cpu.flags & MD_X86_FLAG_CF) == 0u);
+    CHECK((cpu.flags & MD_X86_FLAG_AF) != 0u);
+    CHECK((cpu.flags & MD_X86_FLAG_SF) != 0u);
+
+    cpu.flags = (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF);
+    CHECK(md_x86_adc16(&cpu, 0xFFFFu, 0x0000u) == 0x0000u);
+    CHECK((cpu.flags & MD_X86_FLAG_CF) != 0u);
+    CHECK((cpu.flags & MD_X86_FLAG_ZF) != 0u);
+
+    cpu.flags = (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF);
+    CHECK(md_x86_sbb8(&cpu, 0x80u, 0x00u) == 0x7Fu);
+    CHECK((cpu.flags & MD_X86_FLAG_OF) != 0u);
+    CHECK((cpu.flags & MD_X86_FLAG_CF) == 0u);
+
+    cpu.flags = (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF | MD_X86_FLAG_OF | MD_X86_FLAG_AF);
+    CHECK(md_x86_logic16(&cpu, (uint16_t)(0x55AAu ^ 0xFFFFu)) == 0xAA55u);
+    CHECK((cpu.flags & (MD_X86_FLAG_CF | MD_X86_FLAG_OF | MD_X86_FLAG_AF)) == 0u);
+}
+
+static void test_all_jcc_conditions(void)
+{
+    MdX86 cpu;
+    memset(&cpu, 0, sizeof(cpu));
+
+    cpu.flags = MD_X86_FLAG_OF;
+    CHECK(md_x86_condition(&cpu, 0x0u));
+    CHECK(!md_x86_condition(&cpu, 0x1u));
+
+    cpu.flags = MD_X86_FLAG_CF;
+    CHECK(md_x86_condition(&cpu, 0x2u));
+    CHECK(!md_x86_condition(&cpu, 0x3u));
+
+    cpu.flags = MD_X86_FLAG_ZF;
+    CHECK(md_x86_condition(&cpu, 0x4u));
+    CHECK(!md_x86_condition(&cpu, 0x5u));
+    CHECK(md_x86_condition(&cpu, 0x6u));
+    CHECK(!md_x86_condition(&cpu, 0x7u));
+
+    cpu.flags = MD_X86_FLAG_SF;
+    CHECK(md_x86_condition(&cpu, 0x8u));
+    CHECK(!md_x86_condition(&cpu, 0x9u));
+    CHECK(md_x86_condition(&cpu, 0xCu));
+    CHECK(!md_x86_condition(&cpu, 0xDu));
+    CHECK(md_x86_condition(&cpu, 0xEu));
+    CHECK(!md_x86_condition(&cpu, 0xFu));
+
+    cpu.flags = MD_X86_FLAG_PF;
+    CHECK(md_x86_condition(&cpu, 0xAu));
+    CHECK(!md_x86_condition(&cpu, 0xBu));
+
+    cpu.flags = 0u;
+    CHECK(!md_x86_condition(&cpu, 0x6u));
+    CHECK(md_x86_condition(&cpu, 0x7u));
+    CHECK(!md_x86_condition(&cpu, 0xEu));
+    CHECK(md_x86_condition(&cpu, 0xFu));
+}
+
+static void test_segment_register_ops(uint8_t *memory)
+{
+    MdRuntime runtime;
+    MdRuntime cached;
+    MdHooks hooks = {0};
+    MdBlockCache cache;
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_com(&runtime, kSegmentOps, sizeof(kSegmentOps), 0x1000u);
+    CHECK(md_interp_run(&runtime, 32u) == MD_STOP_HALT);
+    CHECK(runtime.instructions == 8u);
+    CHECK(runtime.cpu.ds == 0x1234u);
+    CHECK(runtime.cpu.es == 0x1234u);
+    CHECK(runtime.cpu.r[MD_X86_AX] == 0x1234u);
+    CHECK(runtime.cpu.r[MD_X86_SP] == 0xFFFEu);
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&cached, memory, &hooks);
+    md_runtime_load_com(&cached, kSegmentOps, sizeof(kSegmentOps), 0x1000u);
+    md_block_cache_init(&cache);
+    CHECK(md_interp_run_cached(&cached, &cache, 32u) == MD_STOP_HALT);
+    CHECK(cached.instructions == runtime.instructions);
+    CHECK(cached.cpu.ds == runtime.cpu.ds);
+    CHECK(cached.cpu.es == runtime.cpu.es);
+    CHECK(cached.cpu.r[MD_X86_AX] == runtime.cpu.r[MD_X86_AX]);
+    CHECK(cache.fallback_instructions != 0u);
+}
+
+static void test_group1_mov_imm_xor_and_jcc(uint8_t *memory)
+{
+    MdRuntime runtime;
+    MdRuntime cached;
+    MdHooks hooks = {0};
+    MdBlockCache cache;
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_com(&runtime, kGroup1Ops, sizeof(kGroup1Ops), 0x1000u);
+    CHECK(md_interp_run(&runtime, 64u) == MD_STOP_HALT);
+    CHECK(runtime.cpu.r[MD_X86_AX] == 0x12C0u);
+    CHECK(md_x86_read16(&runtime.cpu, 0x1000u, 0x0200u) == 0x1234u);
+    CHECK(md_x86_read8(&runtime.cpu, 0x1000u, 0x0202u) == 0x80u);
+    CHECK((runtime.cpu.flags & MD_X86_FLAG_ZF) != 0u);
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&cached, memory, &hooks);
+    md_runtime_load_com(&cached, kGroup1Ops, sizeof(kGroup1Ops), 0x1000u);
+    md_block_cache_init(&cache);
+    CHECK(md_interp_run_cached(&cached, &cache, 64u) == MD_STOP_HALT);
+    CHECK(cached.instructions == runtime.instructions);
+    CHECK(cached.cpu.r[MD_X86_AX] == runtime.cpu.r[MD_X86_AX]);
+    CHECK(md_x86_read16(&cached.cpu, 0x1000u, 0x0200u) == 0x1234u);
+    CHECK(md_x86_read8(&cached.cpu, 0x1000u, 0x0202u) == 0x80u);
+    CHECK(cache.fallback_instructions != 0u);
+}
+
+static void test_prefix_string_and_direction_ops(uint8_t *memory)
+{
+    MdRuntime runtime;
+    MdRuntime cached;
+    MdHooks hooks = {0};
+    MdBlockCache cache;
+    unsigned i;
+    static const uint8_t source[4] = {0x11u, 0x22u, 0x33u, 0x44u};
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_com(&runtime, kStringOps, sizeof(kStringOps), 0x1000u);
+    for (i = 0u; i < 4u; ++i) md_x86_write8(&runtime.cpu, 0x2000u, (uint16_t)(0x0100u + i), source[i]);
+    CHECK(md_interp_run(&runtime, 128u) == MD_STOP_HALT);
+    CHECK(runtime.instructions == 24u);
+    CHECK(runtime.cpu.ds == 0x2000u);
+    CHECK(runtime.cpu.es == 0x3000u);
+    CHECK(runtime.cpu.r[MD_X86_CX] == 1u);
+    CHECK(runtime.cpu.r[MD_X86_SI] == 0x0202u);
+    CHECK(runtime.cpu.r[MD_X86_DI] == 0x0206u);
+    CHECK((runtime.cpu.flags & MD_X86_FLAG_ZF) == 0u);
+    CHECK((runtime.cpu.flags & MD_X86_FLAG_DF) == 0u);
+    CHECK(md_x86_read8(&runtime.cpu, 0x3000u, 0x0200u) == 0x11u);
+    CHECK(md_x86_read8(&runtime.cpu, 0x3000u, 0x0201u) == 0x22u);
+    CHECK(md_x86_read8(&runtime.cpu, 0x3000u, 0x0202u) == 0x99u);
+    CHECK(md_x86_read8(&runtime.cpu, 0x3000u, 0x0203u) == 0x44u);
+    CHECK(md_x86_read8(&runtime.cpu, 0x3000u, 0x0204u) == 0x22u);
+    CHECK(md_x86_read16(&runtime.cpu, 0x3000u, 0x0208u) == 0xBEEFu);
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&cached, memory, &hooks);
+    md_runtime_load_com(&cached, kStringOps, sizeof(kStringOps), 0x1000u);
+    for (i = 0u; i < 4u; ++i) md_x86_write8(&cached.cpu, 0x2000u, (uint16_t)(0x0100u + i), source[i]);
+    md_block_cache_init(&cache);
+    CHECK(md_interp_run_cached(&cached, &cache, 128u) == MD_STOP_HALT);
+    CHECK(cached.instructions == runtime.instructions);
+    CHECK(cached.cpu.r[MD_X86_CX] == runtime.cpu.r[MD_X86_CX]);
+    CHECK(cached.cpu.r[MD_X86_SI] == runtime.cpu.r[MD_X86_SI]);
+    CHECK(cached.cpu.r[MD_X86_DI] == runtime.cpu.r[MD_X86_DI]);
+    CHECK(md_x86_read16(&cached.cpu, 0x3000u, 0x0208u) == 0xBEEFu);
+    CHECK(cache.fallback_instructions != 0u);
+}
+
+static void test_repne_scas(uint8_t *memory)
+{
+    MdRuntime runtime;
+    MdHooks hooks = {0};
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_com(&runtime, kScasOps, sizeof(kScasOps), 0x1000u);
+    md_x86_write8(&runtime.cpu, 0x3000u, 0x0200u, 0x11u);
+    md_x86_write8(&runtime.cpu, 0x3000u, 0x0201u, 0x22u);
+    md_x86_write8(&runtime.cpu, 0x3000u, 0x0202u, 0x99u);
+    md_x86_write8(&runtime.cpu, 0x3000u, 0x0203u, 0x44u);
+    CHECK(md_interp_run(&runtime, 32u) == MD_STOP_HALT);
+    CHECK(runtime.instructions == 8u);
+    CHECK(runtime.cpu.r[MD_X86_CX] == 1u);
+    CHECK(runtime.cpu.r[MD_X86_DI] == 0x0203u);
+    CHECK((runtime.cpu.flags & MD_X86_FLAG_ZF) != 0u);
+}
+
+static void test_loop_family(uint8_t *memory)
+{
+    MdRuntime runtime;
+    MdHooks hooks = {0};
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_com(&runtime, kLoopOps, sizeof(kLoopOps), 0x1000u);
+    CHECK(md_interp_run(&runtime, 32u) == MD_STOP_HALT);
+    CHECK(runtime.cpu.r[MD_X86_AX] == 3u);
+    CHECK(runtime.cpu.r[MD_X86_CX] == 0u);
+    CHECK(runtime.instructions == 10u);
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_com(&runtime, kLoopzOps, sizeof(kLoopzOps), 0x1000u);
+    CHECK(md_interp_run(&runtime, 16u) == MD_STOP_HALT);
+    CHECK(runtime.cpu.r[MD_X86_CX] == 0u);
+    CHECK((runtime.cpu.flags & MD_X86_FLAG_ZF) != 0u);
+    CHECK(runtime.instructions == 6u);
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_com(&runtime, kLoopnzOps, sizeof(kLoopnzOps), 0x1000u);
+    CHECK(md_interp_run(&runtime, 16u) == MD_STOP_HALT);
+    CHECK(runtime.cpu.r[MD_X86_CX] == 0u);
+    CHECK((runtime.cpu.flags & MD_X86_FLAG_ZF) == 0u);
+    CHECK(runtime.instructions == 6u);
+}
+
+static void test_shift_rotate_semantics(void)
+{
+    MdX86 cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.flags = MD_X86_FLAG_ALWAYS1;
+
+    CHECK(md_x86_shift8(&cpu, 4u, 0x81u, 1u) == 0x02u);
+    CHECK((cpu.flags & MD_X86_FLAG_CF) != 0u);
+    CHECK((cpu.flags & MD_X86_FLAG_OF) != 0u);
+
+    cpu.flags = (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF);
+    CHECK(md_x86_shift8(&cpu, 2u, 0x80u, 1u) == 0x01u); /* RCL through carry */
+    CHECK((cpu.flags & MD_X86_FLAG_CF) != 0u);
+
+    cpu.flags = MD_X86_FLAG_ALWAYS1;
+    CHECK(md_x86_shift16(&cpu, 7u, 0x8001u, 1u) == 0xC000u);
+    CHECK((cpu.flags & MD_X86_FLAG_CF) != 0u);
+    CHECK((cpu.flags & MD_X86_FLAG_OF) == 0u);
+    CHECK((cpu.flags & MD_X86_FLAG_SF) != 0u);
+}
+
+static void test_m7_control_and_flags(uint8_t *memory)
+{
+    MdRuntime runtime;
+    MdHooks hooks = {0};
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_com(&runtime, kCoreControlOps, sizeof(kCoreControlOps), 0x1000u);
+    CHECK(md_interp_run(&runtime, 64u) == MD_STOP_HALT);
+    CHECK(runtime.cpu.r[MD_X86_AX] == 0xFF80u);
+    CHECK(runtime.cpu.r[MD_X86_DX] == 0xFFFFu);
+    CHECK((runtime.cpu.flags & MD_X86_FLAG_IF) != 0u);
+    CHECK((runtime.cpu.flags & MD_X86_FLAG_SF) != 0u);
+    CHECK((runtime.cpu.flags & MD_X86_FLAG_ZF) == 0u);
+    CHECK((runtime.cpu.flags & MD_X86_FLAG_CF) == 0u); /* TEST clears CF. */
+}
+
+static void test_m7_addressing_and_far_loads(uint8_t *memory)
+{
+    MdRuntime runtime;
+    MdHooks hooks = {0};
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_com(&runtime, kAddressingOps, sizeof(kAddressingOps), 0x1000u);
+    md_x86_write16(&runtime.cpu, 0x1000u, 0x0200u, 0x3456u);
+    md_x86_write16(&runtime.cpu, 0x1000u, 0x0202u, 0x2000u);
+    md_x86_write16(&runtime.cpu, 0x1000u, 0x0204u, 0x789Au);
+    md_x86_write16(&runtime.cpu, 0x1000u, 0x0206u, 0x3000u);
+    CHECK(md_interp_run(&runtime, 64u) == MD_STOP_HALT);
+    CHECK(runtime.cpu.ds == 0x2000u);
+    CHECK(runtime.cpu.es == 0x3000u);
+    CHECK(runtime.cpu.r[MD_X86_AX] == 0x3456u);
+    CHECK(runtime.cpu.r[MD_X86_BX] == 0x789Au);
+    CHECK(runtime.cpu.r[MD_X86_SI] == 0x1234u);
+    CHECK(md_x86_read16(&runtime.cpu, 0x2000u, 0x0208u) == 0x3456u);
+}
+
+static void test_m7_group3(uint8_t *memory)
+{
+    MdRuntime runtime;
+    MdHooks hooks = {0};
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_com(&runtime, kGroup3Unsigned, sizeof(kGroup3Unsigned), 0x1000u);
+    CHECK(md_interp_run(&runtime, 32u) == MD_STOP_HALT);
+    CHECK(runtime.cpu.r[MD_X86_AX] == 0x0060u);
+    CHECK(runtime.cpu.r[MD_X86_DX] == 0u);
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_com(&runtime, kGroup3Signed, sizeof(kGroup3Signed), 0x1000u);
+    CHECK(md_interp_run(&runtime, 32u) == MD_STOP_HALT);
+    CHECK(runtime.cpu.r[MD_X86_AX] == 0x00F6u);
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_com(&runtime, kGroup3Logic, sizeof(kGroup3Logic), 0x1000u);
+    CHECK(md_interp_run(&runtime, 32u) == MD_STOP_HALT);
+    CHECK(runtime.cpu.r[MD_X86_AX] == 0x1235u);
+    CHECK((runtime.cpu.flags & MD_X86_FLAG_ZF) == 0u);
+}
+
+static void test_m7_group45_and_indirect_control(uint8_t *memory)
+{
+    MdRuntime runtime;
+    MdHooks hooks = {0};
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_com(&runtime, kGroup45Memory, sizeof(kGroup45Memory), 0x1000u);
+    CHECK(md_interp_run(&runtime, 64u) == MD_STOP_HALT);
+    CHECK(runtime.cpu.r[MD_X86_AX] == 0x00FFu);
+    CHECK(md_x86_read16(&runtime.cpu, 0x1000u, 0x0200u) == 0x00FFu);
+    CHECK(md_x86_read8(&runtime.cpu, 0x1000u, 0x0202u) == 0x7Fu);
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_com(&runtime, kNearIndirectCall, sizeof(kNearIndirectCall), 0x1000u);
+    CHECK(md_interp_run(&runtime, 32u) == MD_STOP_HALT);
+    CHECK(runtime.cpu.r[MD_X86_AX] == 1u);
+    CHECK(runtime.cpu.r[MD_X86_SP] == 0xFFFEu);
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_com(&runtime, kNearIndirectJump, sizeof(kNearIndirectJump), 0x1000u);
+    CHECK(md_interp_run(&runtime, 16u) == MD_STOP_HALT);
+    CHECK(runtime.cpu.r[MD_X86_AX] == 0u);
+}
+
+static void test_m7_far_call_iret_and_push_sp(uint8_t *memory)
+{
+    MdRuntime runtime;
+    MdHooks hooks = {0};
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_com(&runtime, kFarCall, sizeof(kFarCall), 0x1000u);
+    md_x86_write8(&runtime.cpu, 0x2000u, 0x0100u, 0x40u); /* inc ax */
+    md_x86_write8(&runtime.cpu, 0x2000u, 0x0101u, 0xCBu); /* retf */
+    CHECK(md_interp_run(&runtime, 16u) == MD_STOP_HALT);
+    CHECK(runtime.cpu.r[MD_X86_AX] == 1u);
+    CHECK(runtime.cpu.cs == 0x1000u);
+    CHECK(runtime.cpu.r[MD_X86_SP] == 0xFFFEu);
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_com(&runtime, kIretOps, sizeof(kIretOps), 0x1000u);
+    runtime.cpu.r[MD_X86_SP] = 0xFFF8u;
+    md_x86_write16(&runtime.cpu, 0x1000u, 0xFFF8u, 0x0101u);
+    md_x86_write16(&runtime.cpu, 0x1000u, 0xFFFAu, 0x1000u);
+    md_x86_write16(&runtime.cpu, 0x1000u, 0xFFFCu,
+                   (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF | MD_X86_FLAG_IF));
+    CHECK(md_interp_run(&runtime, 4u) == MD_STOP_HALT);
+    CHECK((runtime.cpu.flags & (MD_X86_FLAG_CF | MD_X86_FLAG_IF)) ==
+          (MD_X86_FLAG_CF | MD_X86_FLAG_IF));
+    CHECK(runtime.cpu.r[MD_X86_SP] == 0xFFFEu);
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_com(&runtime, kPushSpOps, sizeof(kPushSpOps), 0x1000u);
+    CHECK(md_interp_run(&runtime, 8u) == MD_STOP_HALT);
+    CHECK(runtime.cpu.r[MD_X86_AX] == 0xFFFCu); /* original 8086 PUSH SP quirk */
+    CHECK(runtime.cpu.r[MD_X86_SP] == 0xFFFEu);
+}
+
+static void test_m7_shift_and_adjust(uint8_t *memory)
+{
+    MdRuntime runtime;
+    MdHooks hooks = {0};
+
+    test_shift_rotate_semantics();
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_com(&runtime, kShiftOps, sizeof(kShiftOps), 0x1000u);
+    CHECK(md_interp_run(&runtime, 32u) == MD_STOP_HALT);
+    CHECK(runtime.cpu.r[MD_X86_AX] == 0xC000u);
+    CHECK((runtime.cpu.flags & MD_X86_FLAG_SF) != 0u);
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_com(&runtime, kAamAadOps, sizeof(kAamAadOps), 0x1000u);
+    CHECK(md_interp_run(&runtime, 16u) == MD_STOP_HALT);
+    CHECK(runtime.cpu.r[MD_X86_AX] == 0x002Au);
+}
+
+
+
+static void test_relative_jump_fetch_sequencing(uint8_t *memory)
+{
+    /* The released MS-DOS 2.0 image starts E9 78 3E, which must land at 3E7B:
+       target = IP-after-immediate (0003) + 3E78. Keep this exact case because
+       combining cpu->ip and md_fetch16() in one C expression is unsequenced. */
+    static const uint8_t kDosEntryJump[] = {0xE9u,0x78u,0x3Eu};
+    static const uint8_t kShortJump[] = {0xEBu,0x02u,0x90u,0x90u,0xF4u};
+    MdRuntime runtime;
+    MdHooks hooks = {0};
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_raw(&runtime, kDosEntryJump, sizeof(kDosEntryJump), 0x1000u, 0u);
+    CHECK(md_interp_step(&runtime) == MD_STOP_NONE);
+    CHECK(runtime.cpu.ip == 0x3E7Bu);
+    CHECK(runtime.instructions == 1u);
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_runtime_load_raw(&runtime, kShortJump, sizeof(kShortJump), 0x1000u, 0x0100u);
+    CHECK(md_interp_run(&runtime, 4u) == MD_STOP_HALT);
+    CHECK(runtime.cpu.ip == 0x0105u);
+    CHECK(runtime.instructions == 2u); /* JMP + HLT */
+}
+
+static void test_raw_loader_and_msdos2_bootstrap(uint8_t *memory)
+{
+    /* A one-instruction synthetic "kernel" that immediately RETFs back to the
+       synthetic SYSINIT return trampoline. This tests the raw loader, OEM
+       register contract, device-chain construction, and far-return framing
+       without requiring Microsoft's binary in the normal unit-test suite. */
+    static const uint8_t kReturnKernel[] = {0xCBu};
+    MdRuntime runtime;
+    MdMsdos2Boot boot;
+    MdHooks hooks = {0};
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_msdos2_boot_init(&boot);
+    hooks.interrupt = md_msdos2_boot_interrupt;
+    hooks.user = &boot;
+    md_runtime_init(&runtime, memory, &hooks);
+    md_msdos2_boot_prepare_cpu(&runtime, &boot, kReturnKernel,
+                               sizeof(kReturnKernel));
+
+    CHECK(runtime.cpu.cs == boot.dos_segment);
+    CHECK(runtime.cpu.ip == 0u);
+    CHECK(runtime.cpu.ds == boot.bios_segment);
+    CHECK(runtime.cpu.r[MD_X86_SI] == MD_MSDOS2_CON_OFFSET);
+    CHECK(runtime.cpu.r[MD_X86_DX] == boot.memory_paragraphs);
+    CHECK(md_x86_read16(&runtime.cpu, boot.bios_segment,
+                        MD_MSDOS2_DISK_OFFSET + 4u) == 0x2000u);
+    CHECK(md_x86_read16(&runtime.cpu, boot.bios_segment,
+                        MD_MSDOS2_BPB_OFFSET) == 512u);
+
+    CHECK(md_interp_run(&runtime, 8u) == MD_STOP_HALT);
+    CHECK(boot.returned_from_dosinit);
+    CHECK(runtime.instructions == 2u); /* RETF + native return INT */
+}
+
+
+static void test_msdos2_native_device_init(uint8_t *memory)
+{
+    MdRuntime runtime;
+    MdMsdos2Boot boot;
+    MdHooks hooks = {0};
+    const uint16_t req_seg = 0x1200u;
+    const uint16_t req_off = 0x0200u;
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_msdos2_boot_init(&boot);
+    hooks.interrupt = md_msdos2_boot_interrupt;
+    hooks.user = &boot;
+    md_runtime_init(&runtime, memory, &hooks);
+    md_msdos2_boot_install_devices(&runtime, &boot);
+
+    runtime.cpu.ds = boot.bios_segment;
+    runtime.cpu.r[MD_X86_SI] = MD_MSDOS2_DISK_OFFSET;
+    runtime.cpu.es = req_seg;
+    runtime.cpu.r[MD_X86_BX] = req_off;
+    md_x86_write8(&runtime.cpu, req_seg, req_off + 0u, 26u);
+    md_x86_write8(&runtime.cpu, req_seg, req_off + 2u, 0u);
+
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_STRATEGY_INT, &boot));
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_DEVICE_INT, &boot));
+    CHECK(md_x86_read16(&runtime.cpu, req_seg, req_off + 3u) == 0x0100u);
+    CHECK(md_x86_read8(&runtime.cpu, req_seg, req_off + 13u) == 1u);
+    CHECK(md_x86_read16(&runtime.cpu, req_seg, req_off + 18u) == MD_MSDOS2_BPB_TABLE_OFFSET);
+    CHECK(md_x86_read16(&runtime.cpu, req_seg, req_off + 20u) == boot.bios_segment);
+    CHECK(boot.init_calls == 1u);
+    CHECK(boot.unknown_device_calls == 0u);
+}
+
+
+typedef struct TestConsoleCapture {
+    uint8_t data[64];
+    size_t size;
+    uint8_t peek_value;
+    bool have_peek;
+    unsigned flushes;
+} TestConsoleCapture;
+
+static void test_console_write_cb(void *user, const uint8_t *data, size_t size)
+{
+    TestConsoleCapture *cap = (TestConsoleCapture *)user;
+    size_t room = sizeof(cap->data) - cap->size;
+    if (size > room) size = room;
+    memcpy(cap->data + cap->size, data, size);
+    cap->size += size;
+}
+
+static bool test_console_peek_cb(void *user, uint8_t *value)
+{
+    TestConsoleCapture *cap = (TestConsoleCapture *)user;
+    if (!cap->have_peek) return false;
+    *value = cap->peek_value;
+    return true;
+}
+
+static void test_console_flush_cb(void *user)
+{
+    TestConsoleCapture *cap = (TestConsoleCapture *)user;
+    ++cap->flushes;
+    cap->have_peek = false;
+}
+
+static void test_msdos2_console_device_contract(uint8_t *memory)
+{
+    MdRuntime runtime;
+    MdMsdos2Boot boot;
+    MdHooks hooks = {0};
+    TestConsoleCapture cap;
+    const uint16_t req_seg = 0x1200u;
+    const uint16_t req_off = 0x0200u;
+    const uint16_t data_seg = 0x1300u;
+    const uint16_t data_off = 0x0040u;
+    static const uint8_t text[] = {'D','O','S','!','\r','\n'};
+    unsigned i;
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    memset(&cap, 0, sizeof(cap));
+    md_msdos2_boot_init(&boot);
+    boot.console.write = test_console_write_cb;
+    boot.console.peek = test_console_peek_cb;
+    boot.console.flush = test_console_flush_cb;
+    boot.console.user = &cap;
+    hooks.interrupt = md_msdos2_boot_interrupt;
+    hooks.user = &boot;
+    md_runtime_init(&runtime, memory, &hooks);
+    md_msdos2_boot_install_devices(&runtime, &boot);
+
+    runtime.cpu.ds = boot.bios_segment;
+    runtime.cpu.r[MD_X86_SI] = MD_MSDOS2_CON_OFFSET;
+    runtime.cpu.es = req_seg;
+    runtime.cpu.r[MD_X86_BX] = req_off;
+
+    /* Function 5: no character pending is BUSY|DONE, not error 8103. */
+    md_x86_write8(&runtime.cpu, req_seg, req_off + 2u, 5u);
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_STRATEGY_INT, &boot));
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_DEVICE_INT, &boot));
+    CHECK(md_x86_read16(&runtime.cpu, req_seg, req_off + 3u) == 0x0300u);
+    CHECK(boot.unknown_device_calls == 0u);
+    CHECK(boot.console_poll_calls == 1u);
+
+    /* Non-destructive input returns the pending character in byte 13. */
+    cap.have_peek = true;
+    cap.peek_value = (uint8_t)'X';
+    md_x86_write8(&runtime.cpu, req_seg, req_off + 2u, 5u);
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_STRATEGY_INT, &boot));
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_DEVICE_INT, &boot));
+    CHECK(md_x86_read16(&runtime.cpu, req_seg, req_off + 3u) == 0x0100u);
+    CHECK(md_x86_read8(&runtime.cpu, req_seg, req_off + 13u) == (uint8_t)'X');
+
+    /* Function 10: console output status is immediately ready. */
+    md_x86_write8(&runtime.cpu, req_seg, req_off + 2u, 10u);
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_STRATEGY_INT, &boot));
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_DEVICE_INT, &boot));
+    CHECK(md_x86_read16(&runtime.cpu, req_seg, req_off + 3u) == 0x0100u);
+
+    /* Function 8: transfer address/count are the DOS 2 DRDWR request layout. */
+    for (i = 0u; i < sizeof(text); ++i) {
+        md_x86_write8(&runtime.cpu, data_seg, (uint16_t)(data_off + i), text[i]);
+    }
+    md_x86_write16(&runtime.cpu, req_seg, req_off + 14u, data_off);
+    md_x86_write16(&runtime.cpu, req_seg, req_off + 16u, data_seg);
+    md_x86_write16(&runtime.cpu, req_seg, req_off + 18u, (uint16_t)sizeof(text));
+    md_x86_write8(&runtime.cpu, req_seg, req_off + 2u, 8u);
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_STRATEGY_INT, &boot));
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_DEVICE_INT, &boot));
+    CHECK(md_x86_read16(&runtime.cpu, req_seg, req_off + 3u) == 0x0100u);
+    CHECK(cap.size == sizeof(text));
+    CHECK(memcmp(cap.data, text, sizeof(text)) == 0);
+    CHECK(boot.console_write_calls == 1u);
+    CHECK(boot.console_bytes_written == sizeof(text));
+
+    md_x86_write8(&runtime.cpu, req_seg, req_off + 2u, 7u);
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_STRATEGY_INT, &boot));
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_DEVICE_INT, &boot));
+    CHECK(cap.flushes == 1u);
+    CHECK(!cap.have_peek);
+    CHECK(boot.unknown_device_calls == 0u);
+}
+
 static void test_ivt(uint8_t *memory)
 {
     MdRuntime runtime;
@@ -313,6 +1087,23 @@ int main(void)
     test_hybrid_aot_cache_handoff(memory);
     test_aot_self_modifying_code(memory);
     test_budget(memory);
+    test_phase_a_flag_semantics();
+    test_all_jcc_conditions();
+    test_segment_register_ops(memory);
+    test_group1_mov_imm_xor_and_jcc(memory);
+    test_prefix_string_and_direction_ops(memory);
+    test_repne_scas(memory);
+    test_loop_family(memory);
+    test_m7_control_and_flags(memory);
+    test_m7_addressing_and_far_loads(memory);
+    test_m7_group3(memory);
+    test_m7_group45_and_indirect_control(memory);
+    test_m7_far_call_iret_and_push_sp(memory);
+    test_m7_shift_and_adjust(memory);
+    test_relative_jump_fetch_sequencing(memory);
+    test_raw_loader_and_msdos2_bootstrap(memory);
+    test_msdos2_native_device_init(memory);
+    test_msdos2_console_device_contract(memory);
     test_ivt(memory);
 
     free(memory);
@@ -320,6 +1111,6 @@ int main(void)
         fprintf(stderr, "%d test(s) failed\n", failures);
         return 1;
     }
-    puts("microDOS runtime + page cache + hybrid AOT tests passed");
+    puts("microDOS runtime + DOS 2 phase-C core tests passed");
     return 0;
 }

@@ -48,8 +48,8 @@ bool md_decode_8086(const uint8_t *image,
 const char *md_decode_flow_name(MdDecodeFlow flow);
 
 /* Coverage helpers describing the execution engines implemented by the current
-   microDOS runtime/recompiler. A prefix currently makes an instruction a
-   fallback even when its underlying opcode is otherwise implemented. */
+   microDOS runtime/recompiler. The canonical interpreter accepts 8086 segment,
+   LOCK, and REP prefixes; AOT coverage remains conservative and prefix-free. */
 bool md_decode_interp_supported(const MdDecodedInstruction *inst);
 bool md_decode_aot_supported(const MdDecodedInstruction *inst);
 

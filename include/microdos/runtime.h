@@ -59,6 +59,8 @@ struct MdRuntime {
 void md_runtime_init(MdRuntime *runtime, uint8_t *memory, const MdHooks *hooks);
 void md_runtime_reset(MdRuntime *runtime);
 void md_runtime_load_com(MdRuntime *runtime, const uint8_t *data, size_t size, uint16_t segment);
+void md_runtime_load_raw(MdRuntime *runtime, const uint8_t *data, size_t size,
+                         uint16_t segment, uint16_t offset);
 void md_runtime_request_exit(MdRuntime *runtime, uint8_t exit_code);
 void md_runtime_set_block_cache(MdRuntime *runtime, MdBlockCache *cache);
 

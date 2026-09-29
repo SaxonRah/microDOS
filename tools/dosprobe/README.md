@@ -38,3 +38,15 @@ interrupts are not yet semantically recognized by the scanner. The released DOS
 source, linker files, and later symbol/map metadata will be used to seed additional
 entry points. Therefore `reachable_bytes` should be read as "code we can establish
 from the current seeds," not "percentage of the executable that contains code."
+
+
+## Milestone 6 coverage semantics
+
+`md_decode_interp_supported()` now includes phase-A DOS semantics plus 8086 segment,
+LOCK, REPNE and REP/REPE prefixes, the A4-AF string families, CLD/STD, and E0-E3
+LOOP/JCXZ. Prefix-bearing instructions are therefore counted according to their
+underlying opcode rather than automatically becoming unsupported. AOT coverage remains
+prefix-free and conservative.
+
+On the pinned DOS 2.0 frontier this reports approximately 89.55% canonical-interpreter
+coverage for `MSDOS.SYS` and 96.43% for `COMMAND.COM`.

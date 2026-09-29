@@ -150,3 +150,142 @@ real kernel execution begins.
 Recursive-descent coverage is intentionally reported as an analysis frontier, not as
 a percentage of bytes proven to be executable code. Indirect control transfers and
 source-known alternate entries will expand that frontier over time.
+
+
+## 16. Real-DOS opcode priority beats numeric opcode completeness
+
+Milestone 5 implements the first semantic expansion directly from the pinned
+`MSDOS.SYS` / `COMMAND.COM` `dosprobe` histogram instead of filling opcode numbers in
+order. Canonical interpretation is the first landing point for each family; cache
+specialization and AOT follow only after those semantics are tested.
+
+The first tranche is deliberately coherent: segment-register transfers and stack
+ops, the eight ALU operations across register/memory and immediate forms, C6/C7
+immediate stores, and all short Jcc predicates. This raises the same initial
+recursive-descent frontier to about 77.54% interpreter support for `MSDOS.SYS` and
+88.01% for `COMMAND.COM` while leaving prefixed instructions unsupported.
+
+Logic instructions deterministically clear AF in microDOS even though real 8086 AF
+is architecturally undefined for AND/OR/XOR. Software must not depend on undefined AF;
+the deterministic choice makes differential tests reproducible.
+
+
+## 17. Prefix and string semantics stay canonical before optimization
+
+Milestone 6 adds real 8086 prefix state to the canonical interpreter. Segment overrides
+select ES/CS/SS/DS for ordinary memory operands and for the source side of MOVS/CMPS/
+LODS; the destination side of MOVS/CMPS/STOS/SCAS remains fixed to ES as on 8086. The
+last segment prefix wins. REPNE and REP/REPE are retained as instruction-local state;
+LOCK is accepted as a no-op synchronization prefix because microDOS currently executes
+a single guest CPU.
+
+REP on MOVS/STOS/LODS repeats until CX reaches zero. REP/REPE and REPNE on CMPS/SCAS
+stop according to ZF after each comparison. A repeated string operation still counts as
+one architectural guest instruction in the current instruction-budget model; interrupt
+windows inside REP are a later timing/interrupt-model concern.
+
+The decoded cache intentionally falls back to this canonical implementation for these
+new families in milestone 6. That keeps prefix parsing, direction behavior, repeat
+termination, and self-modifying writes in one correctness implementation before adding
+predecoded string super-ops or AOT emission.
+
+On the pinned MS-DOS 2.0 recursive-descent frontier this tranche brings estimated
+canonical interpreter support to 3086/3446 (89.55%) for MSDOS.SYS and 595/617
+(96.43%) for COMMAND.COM. The remaining concentration is LES/LDS, shifts/rotates,
+Group 3, Group 4/5, POP r/m, XCHG/LEA, and a small set of flag/stack/control opcodes.
+
+
+## 18. Complete the discovered canonical frontier before boot scaffolding
+
+Milestone 7 implements every opcode family still present on the pinned DOS 2.0
+recursive-descent frontier before constructing the OEM/SYSINIT boot environment.
+This includes LES/LDS, rotate/shift, Group 3, Group 4/5, POP r/m, XCHG/LEA,
+flag-stack/control instructions, TEST, CBW/CWD, IRET, direct/far control transfer,
+and the remaining small original-8086 operations needed to avoid semantic holes.
+
+`dosprobe` therefore reports 100% canonical interpreter support for both currently
+discovered frontiers: 3446/3446 reachable `MSDOS.SYS` instructions and 617/617
+reachable `COMMAND.COM` instructions. This is explicitly **frontier completeness**,
+not whole-program reachability proof. The five unresolved kernel indirect transfers
+and three COMMAND.COM indirect transfers can reveal additional code once runtime
+execution or source-assisted target recovery resolves them.
+
+New families remain canonical-interpreter-first. The decoded cache and AOT emitter
+are not bulk-expanded merely to make percentages look symmetric; they will promote
+operations only after real DOS execution identifies hot regions and correctness is
+stable.
+
+The original 8086 `PUSH SP` quirk is architectural behavior, not an optimization
+corner case. `md_x86_push_reg()` centralizes it so canonical interpretation, decoded
+cache execution, and generated AOT all push the post-decrement SP value for register
+SP while preserving ordinary PUSH behavior for the other registers.
+
+
+
+## 19. DOSINIT is entered through the real SYSINIT/OEM contract
+
+Milestone 8 stops treating kernel bring-up as an abstract future task. The host runner
+loads the released `MSDOS.SYS` as a raw image, enters offset `0000h`, and recreates the
+state that Microsoft's `SYSINIT` establishes immediately before its far call: DS:SI
+points at the OEM device list, DX is the memory limit in paragraphs, and the caller's
+far-return address remains on the original stack while DOSINIT temporarily switches to
+its own stack.
+
+The OEM devices are real guest-memory DOS 2.x device headers. Strategy and interrupt
+entry points are tiny far-callable real-mode trampolines into private native interrupt
+hooks. This preserves DOS's own `DEVIOCALL2` path and request-packet behavior instead
+of replacing device initialization with host-side special cases inside the kernel.
+
+M8 implements only DEVINIT. Character initialization completes successfully; the block
+INIT response returns one unit and a 360 KiB FAT12 BPB. All other request functions
+return an explicit unknown-command error and are counted/reported by the bring-up
+runner. The next implementation work is therefore driven by requests actually made by
+the released kernel rather than by speculative BIOS completeness.
+
+`md_runtime_load_raw()` is the permanent non-COM loader primitive introduced for this
+path. It shares the same 20-bit guest memory, code-page marking, self-modification
+tracking, hooks, and interpreter state as COM execution.
+
+## 20. Fetch side effects must never share an unsequenced C expression with IP
+
+The first M8 raw-kernel run exposed a host-language correctness bug in the canonical
+interpreter before DOSINIT itself ran. The released kernel begins `E9 78 3E`; 8086
+semantics require the relative displacement to be added to IP *after* the two-byte
+immediate has been consumed, producing target `3E7Bh`.
+
+The old E9/EB implementation combined `cpu->ip` and `md_fetch16/md_fetch8()` in one C
+expression. C does not sequence those operand evaluations, so one compiler observed
+IP before the fetch side effect and produced `3E79h`. E9, EB, and the threaded EB hot
+handler now fetch the displacement into a local first and only then add it to the
+post-fetch IP.
+
+The exact DOS entry bytes are a permanent regression test. More generally, decoder
+fetch helpers are treated as state-changing operations and must be sequenced in their
+own statements whenever the same expression also depends on IP or another value they
+can mutate.
+
+
+## 21. DOS character-device status is modeled, not approximated
+
+The first real M8 DOSINIT run initialized CON/AUX/PRN/CLOCK/DISK and then entered a
+repeat loop of CON request functions 5, 10, and 8 because the bring-up shim returned
+`8103h` (error + done + unknown command) for all non-INIT requests. That behavior was
+useful as a boundary detector but is not a valid console driver.
+
+M9 follows the DOS 2 request contract instead: non-destructive read with no character
+available returns `0300h` (busy + done), output status returns `0100h`, and character
+writes consume the request packet transfer pointer and count. This is important because
+DOS uses status bits as control flow; treating "not ready" as an error changes kernel
+behavior and can create artificial retry loops.
+
+## 22. Native DOS devices expose platform callbacks, not host stdio
+
+The DOS-facing CON implementation does not depend on stdio. `MdMsdos2Boot` carries
+write/peek/read/flush callbacks. The Windows runner currently binds write to stdout,
+while a Pico 2 backend can later bind the same interface to MicroConsole/MicroRender.
+Destructive input is not invented when no callback exists: such a request remains an
+explicit unsupported boundary until a platform input source is connected.
+
+High-frequency successful console polls/status calls are not logged individually, and
+repeated error traces are capped. Counters remain authoritative, so diagnostics stay
+useful without drowning the actual DOS output.

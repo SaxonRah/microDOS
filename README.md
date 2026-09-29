@@ -11,62 +11,39 @@ The interpreted path itself has two tiers: a fast decoded basic-block cache and 
 
 ## Current status
 
-Milestone 4 begins bring-up against the released MS-DOS 2.0 binaries while keeping
-the milestone-3 mixed execution model block-granular and self-modifying-code safe.
-The new `dosprobe` tool uses a structural 8086 decoder to walk real binaries even
-when their semantics are not implemented yet, producing an opcode/flow inventory
-that drives CPU-core work from actual DOS code rather than synthetic guesses.
+Milestone 9 is the first real DOS 2.x **runtime character-device** milestone. The
+released `MSDOS.SYS` now enters `DOSINIT`, initializes the complete synthetic OEM
+device chain, and reaches normal DOS console traffic. The M8 run showed that the
+first remaining boundary was not CPU execution at all: DOS repeatedly requested CON
+functions 5 (non-destructive input), 10 (output status), and 8 (write), while the M8
+shim incorrectly returned unknown-command error `8103h`.
 
-The execution model remains:
+M9 implements those requests using the real DOS 2 request-packet layout and status
+semantics. With no pending input, function 5 returns `0300h` (`BUSY|DONE`) rather
+than an error; output status returns `0100h`; writes consume the transfer far pointer
+and byte count from the request packet and send the bytes through a platform-neutral
+console callback. Input/output flush and write-with-verify are also handled according
+to the DOS 2 character-device contract.
 
-```text
-                         known + unchanged
-                              |
-                              v
-.COM -> dosrecomp -> generated AOT blocks
-                              |
-                unknown / changed / indirect
-                              |
-                              v
-                     decoded block cache
-                        |           |
-                  supported      unsupported
-                        |           |
-                        |           v
-                        +---- canonical opcode interpreter
-                              |
-                     reaches valid AOT target
-                              |
-                              +----------> AOT
-```
+The console callback layer is intentionally platform-neutral. The Windows bring-up
+runner binds output to stdout; Pico 2 can later bind the same DOS-facing device to
+MicroRender/MicroConsole without changing kernel-facing code. Destructive input is
+only accepted when a platform read callback is present, so unsupported input is not
+silently fabricated.
 
-Current validation covers:
-
-- mechanically recompiled `Hello from microDOS!` through `INT 21h`;
-- the same program through baseline interpretation, cached interpretation, and AOT;
-- backward-branch CFG splitting with a 65,535-iteration loop;
-- decoded-block cache hits/misses and direct self-chaining;
-- a fused `DEC r16` + `JNZ` super-op with exact two-instruction accounting;
-- cached interpreter -> canonical interpreter -> cached interpreter fallback;
-- **AOT -> cached interpreter -> AOT** block-granular handoff;
-- automatic 4 KiB executable-page invalidation after guest writes;
-- cache re-decode after patching an already-decoded instruction;
-- conservative AOT invalidation after any write to a compiled code page;
-- self-modifying AOT that patches the very next compiled instruction and correctly abandons stale generated code;
-- instruction-budget boundaries, including stopping inside a fused super-op;
-- 8-bit register aliasing and 20-bit real-mode address wrapping;
-- real IVT fallback semantics.
-
-The interpreter, cache executor, and generated C all share `include/microdos/ops.h` for arithmetic/FLAGS behavior.
+The permanent execution architecture is unchanged: generated AOT for known native
+blocks, a high-performance decoded cache for general legacy code, and one canonical
+8086 interpreter/semantics layer for correctness and fallback.
 
 ## MS-DOS 2.0 reference bring-up
 
-Fetch the exact pinned Microsoft reference tree and analyze the two first real
-targets:
+Fetch the exact pinned Microsoft reference tree, analyze it, and enter the real
+MS-DOS 2.0 kernel:
 
 ```bat
 .\md.bat deps msdos
 .\md.bat analyze dos2
+.\md.bat boot msdos2
 ```
 
 This analyzes `v2.0/bin/MSDOS.SYS` as a raw image at `0000h` and
@@ -78,6 +55,15 @@ recover lengths and direct control flow for the full 8086 map, flag possible 801
 paths, and compare reachable code against what the current interpreter and AOT
 emitter can actually execute. See `docs/MSDOS2_BRINGUP.md`.
 
+On the same pinned recursive-descent frontier, canonical interpreter coverage has
+progressed from **55.17% -> 77.54% -> 89.55% -> 100%** for `MSDOS.SYS` and from
+**66.61% -> 88.01% -> 96.43% -> 100%** for `COMMAND.COM` across the bring-up
+milestones. This means every instruction on the *currently discovered static
+frontier* has canonical semantics; it does not mean every dynamically reachable
+DOS block has been discovered yet. Indirect targets and source-assisted alternate
+entries will expand the frontier during real execution. AOT coverage intentionally
+remains conservative while semantics stabilize.
+
 ## Build
 
 Windows:
@@ -87,6 +73,7 @@ Windows:
 .\md.bat run host
 .\md.bat test
 .\md.bat bench 1000
+.\md.bat boot msdos2
 ```
 
 Recompile a `.COM` manually:
@@ -114,6 +101,33 @@ recomp: stop=exit instructions=5 exit=0
 output: Hello from microDOS!
 ```
 
+## Real DOSINIT runner
+
+`microdos_msdos2` is intentionally a bring-up executable, not a simulator shell. It
+loads `third_party/msdos/v2.0/bin/MSDOS.SYS` as a raw binary at segment `1000h`,
+constructs the DOS 2 OEM device-header chain at segment `0800h`, sets `DX=A000h`
+(640 KiB), and recreates the far-return frame that SYSINIT would have placed on the
+stack before `CALL MSDOS`.
+
+Run it through the front door:
+
+```bat
+.\md.bat boot msdos2
+```
+
+An optional second argument is the canonical-interpreter instruction budget:
+
+```bat
+.\md.bat boot msdos2 5000000
+```
+
+The runner reports entry into `DOSINIT`, device initialization and failures, final CPU
+state, interpreter faults, budget stops, and whether the kernel returned through the
+synthetic SYSINIT return address. Successful high-frequency console status/poll calls
+are intentionally not printed one-by-one; DOS character output is written directly
+through the host console callback. Repeated device errors are capped in the trace so a
+missing service cannot produce megabytes of duplicate diagnostics.
+
 ## Performance regression harness
 
 `microdos_bench` runs the same 131,072-instruction 8086 register/branch workload through baseline interpretation, cached interpretation, and AOT. Host MIPS are regression numbers only; they are not RP2350 estimates.
@@ -134,16 +148,18 @@ cache   ~415 MIPS
 aot     ~525 MIPS
 ```
 
-The validated MSVC milestone-3 result on the primary Windows development machine is:
+The latest validated MSVC milestone-6 run on the primary Windows development machine is:
 
 ```text
-interp  121.25 MIPS
-cache   255.50 MIPS
-aot     490.91 MIPS
+interp  105.19 MIPS
+cache   221.78 MIPS
+aot     445.82 MIPS
 ```
 
-That is a roughly 2.1x gain from decoded caching over the portable switch interpreter
-on the same build, before AOT is used.
+All three tiers moved down together relative to the preceding run, including AOT,
+so that cross-run change is treated as host timing/frequency variance rather than a
+prefix/string hot-path regression. The benchmark remains a regression harness, not
+a stable machine rating.
 
 The default cache is caller-owned, fixed-size, and performs no allocation while executing. Both slot count and maximum decoded operations per block are compile-time configurable.
 

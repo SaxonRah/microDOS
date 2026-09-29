@@ -366,7 +366,7 @@ static void md_exec_decoded(MdRuntime *runtime, const MdDecodedOp *op)
             if ((cpu->flags & MD_X86_FLAG_ZF) == 0u) cpu->ip = op->arg;
             break;
         case MD_DOP_PUSH_R16:
-            md_x86_push(cpu, cpu->r[op->reg]);
+            md_x86_push_reg(cpu, op->reg);
             break;
         case MD_DOP_POP_R16:
             cpu->r[op->reg] = md_x86_pop(cpu);

@@ -50,6 +50,26 @@ void md_runtime_set_block_cache(MdRuntime *runtime, MdBlockCache *cache)
     runtime->block_cache = cache;
 }
 
+void md_runtime_load_raw(MdRuntime *runtime, const uint8_t *data, size_t size,
+                         uint16_t segment, uint16_t offset)
+{
+    size_t i;
+    size_t max_size = MD_X86_ADDRESS_SPACE;
+    const uint32_t start = md_x86_linear(segment, offset);
+
+    md_runtime_reset(runtime);
+    if (size > max_size) size = max_size;
+    for (i = 0; i < size; ++i) {
+        md_x86_write8_linear(&runtime->cpu, start + (uint32_t)i, data[i]);
+    }
+
+    runtime->cpu.cs = segment;
+    runtime->cpu.ip = offset;
+    runtime->cpu.ss = segment;
+    runtime->cpu.r[MD_X86_SP] = 0xFFFEu;
+    md_runtime_mark_code_range(runtime, segment, offset, size);
+}
+
 void md_runtime_load_com(MdRuntime *runtime, const uint8_t *data, size_t size, uint16_t segment)
 {
     size_t i;
@@ -68,6 +88,8 @@ void md_runtime_load_com(MdRuntime *runtime, const uint8_t *data, size_t size, u
     for (i = 0; i < size; ++i) {
         md_x86_write8(&runtime->cpu, segment, (uint16_t)(0x0100u + i), data[i]);
     }
+
+    md_runtime_mark_code_range(runtime, segment, 0x0100u, size);
 
     runtime->cpu.cs = segment;
     runtime->cpu.ds = segment;

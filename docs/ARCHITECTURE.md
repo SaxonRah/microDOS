@@ -310,3 +310,42 @@ analysis can still enter data through incomplete indirect/source metadata.
 `COMMAND.COM` begins at guest offset `0100h`. `MSDOS.SYS` is analyzed as a raw image
 beginning at offset `0000h`. Those mappings belong to binary analysis; the runtime
 boot contract for `MSDOS.SYS` additionally requires the OEM/SYSINIT environment.
+
+## Milestone 6: canonical prefix and string execution
+
+The canonical interpreter now treats 8086 prefixes as instruction-local state instead
+of separate guest instructions. Segment overrides are applied when effective addresses
+are formed, so BP-based operands still choose SS by default but any explicit ES/CS/SS/DS
+prefix replaces that default. For MOVS/CMPS/LODS only the source segment is overridable;
+string destinations remain ES as required by the 8086 architecture.
+
+REP/REPE/REPNE are executed canonically before any cache/AOT specialization. MOVS,
+STOS and LODS repeat to CX=0. CMPS and SCAS additionally stop according to ZF and the
+selected repeat condition. DF determines signed index movement for every string width.
+The current instruction budget counts the complete repeated string operation as one
+architectural guest instruction; cycle/timing and interrupt windows inside REP remain a
+future optional timing-model concern.
+
+The decoded block cache intentionally treats these new instructions as canonical
+fallbacks for now. This keeps the optimized execution tier from duplicating prefix and
+repeat semantics before the real DOS bring-up demonstrates where specialization matters.
+
+## Milestone 7: complete canonical DOS 2 frontier
+
+Milestone 7 closes every semantic hole on the initially discovered MS-DOS 2.0
+recursive-descent frontier. The canonical interpreter now executes LES/LDS,
+D0-D3 rotate/shift, F6/F7 Group 3, FE/FF Group 4/5, POP r/m16, XCHG, LEA,
+TEST, CBW/CWD, PUSHF/POPF/SAHF/LAHF, direct and indirect near/far control
+transfers, IRET, flag control, decimal/ASCII adjust instructions, AAM/AAD/XLAT,
+and byte/word port I/O.
+
+This changes the meaning of the next bring-up failure. A fault while entering real
+MSDOS.SYS is no longer expected merely because one of the statically reached DOS
+instructions lacks canonical semantics. The next likely failures are environment or
+reachability failures: an indirect target not present in the static frontier, an
+OEM/SYSINIT register/device contract mismatch, an interrupt/device service boundary,
+or a genuine semantic bug.
+
+The decoded cache and AOT emitter intentionally do not claim the same coverage yet.
+They continue to fall back to the canonical interpreter. Real boot traces will decide
+which DOS blocks deserve predecoded operations or native C emission next.

@@ -9,6 +9,7 @@ rem   .\md.bat test
 rem   .\md.bat bench [rounds]
 rem   .\md.bat recomp input.com name [code-end]
 rem   .\md.bat analyze [dos2^|msdos^|command]
+rem   .\md.bat boot msdos2 [budget]
 rem   .\md.bat clean
 rem ===========================================================================
 setlocal EnableExtensions
@@ -25,6 +26,7 @@ if /i "%CMD%"=="test"   goto test
 if /i "%CMD%"=="bench"  goto bench
 if /i "%CMD%"=="recomp" goto recomp
 if /i "%CMD%"=="analyze" goto analyze
+if /i "%CMD%"=="boot"   goto boot
 if /i "%CMD%"=="clean"  goto clean
 if /i "%CMD%"=="help"   goto help
 if /i "%CMD%"=="-h"     goto help
@@ -114,6 +116,25 @@ call :build_host_if_needed || exit /b 1
 call "%MD_ROOT%\scripts\md_analyze.bat" "%ANALYZE_TARGET%"
 exit /b %ERRORLEVEL%
 
+:boot
+if /i not "%~1"=="msdos2" (
+    echo Usage:
+    echo   .\md.bat boot msdos2 [budget]
+    exit /b 1
+)
+call :build_host_if_needed || exit /b 1
+if not exist "%MD_ROOT%\third_party\msdos\v2.0\bin\MSDOS.SYS" (
+    echo ERROR: MS-DOS 2.0 reference image is missing.
+    echo Run: .\md.bat deps msdos
+    exit /b 1
+)
+set "BOOT_BUDGET=%~2"
+if "%BOOT_BUDGET%"=="" set "BOOT_BUDGET=2000000"
+set "BOOT_EXE=%MD_ROOT%\build-host\microdos_msdos2.exe"
+if exist "%MD_ROOT%\build-host\Release\microdos_msdos2.exe" set "BOOT_EXE=%MD_ROOT%\build-host\Release\microdos_msdos2.exe"
+"%BOOT_EXE%" "%MD_ROOT%\third_party\msdos\v2.0\bin\MSDOS.SYS" %BOOT_BUDGET%
+exit /b %ERRORLEVEL%
+
 :recomp_usage
 echo Usage:
 echo   .\md.bat recomp input.com name [code-end]
@@ -146,11 +167,13 @@ echo   .\md.bat test
 echo   .\md.bat bench [rounds]
 echo   .\md.bat recomp input.com name [code-end]
 echo   .\md.bat analyze [dos2^|msdos^|command]
+echo   .\md.bat boot msdos2 [budget]
 echo   .\md.bat clean
 echo.
 echo MS-DOS 2.0 bring-up:
 echo   .\md.bat deps msdos
 echo   .\md.bat analyze dos2
+echo   .\md.bat boot msdos2
 echo.
 echo dosrecomp example:
 echo   .\md.bat recomp tests\programs\hello.com hello 0x10c

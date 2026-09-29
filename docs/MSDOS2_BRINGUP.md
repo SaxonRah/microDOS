@@ -76,77 +76,128 @@ build-analysis/msdos-sys.json
 build-analysis/command-com.json
 ```
 
-## Initial binary-first findings
+## Binary-first findings through milestone 7
 
-A reference scan of the pinned release, using entry `0000h` for `MSDOS.SYS` and
-`0100h` for `COMMAND.COM`, establishes substantial direct-control-flow regions
-without pretending indirect targets are known:
+The pinned release still exposes the same initial recursive-descent frontier:
 
 ```text
-MSDOS.SYS    16690-byte image
-  about 3446 recursively reached instructions
-  about 8331 reached bytes
-  about 55% currently executable by the canonical interpreter
-  about 44% currently AOT-supported
-  398 conditional branches
-  266 direct calls
-  96 direct jumps
-  118 returns
-  5 unresolved indirect control transfers
+MSDOS.SYS
+  3446 reached instructions / 8331 reached bytes
+  398 conditional branches, 266 direct calls, 96 direct jumps, 118 returns
+  2 unresolved indirect calls, 3 unresolved indirect jumps
 
-COMMAND.COM  15480-byte image
-  about 617 recursively reached instructions
-  about 1461 reached bytes
-  about 67% currently executable by the canonical interpreter
-  about 59% currently AOT-supported
-  75 conditional branches
-  26 direct calls
-  27 direct jumps
-  11 returns
-  3 unresolved indirect control transfers
+COMMAND.COM
+  617 reached instructions / 1461 reached bytes
+  75 conditional branches, 26 direct calls, 27 direct jumps, 11 returns
+  1 unresolved indirect call, 2 unresolved indirect jumps
 ```
 
-These numbers are analysis-frontier numbers, not a statement that the remaining
-bytes are data. Additional source-assisted seeds and indirect-target recovery will
-expand them.
-
-The first high-value missing opcode families seen in reachable code are:
+Canonical interpreter coverage across the bring-up tranches is now:
 
 ```text
-80/81/83   ALU r/m, immediate
-8C/8E      MOV segment register
-C6/C7      MOV r/m, immediate
-70-7F      complete conditional-jump family
-30-33      XOR r/m,reg
-06/07/...  segment PUSH/POP
-A4-AF      string operations
-F2/F3      REP prefixes
-C4/C5      LES/LDS
-D0-D3      shift/rotate
-E0-E3      LOOP/JCXZ
-F6/F7      TEST/NOT/NEG/MUL/IMUL/DIV/IDIV group
-FE/FF      INC/DEC and indirect CALL/JMP/PUSH groups
+                 initial     milestone 5     milestone 6     milestone 7
+MSDOS.SYS         55.17%        77.54%          89.55%          100.00%
+COMMAND.COM       66.61%        88.01%          96.43%          100.00%
 ```
 
-That list should drive runtime implementation order. It is more useful than adding
-opcodes according to numeric order.
+Milestone 7 closes the discovered semantic gap with LES/LDS, D0-D3 shifts and
+rotates, Group 3, FE/FF Group 4/5, POP r/m16, XCHG/LEA, TEST, CBW/CWD,
+PUSHF/POPF/SAHF/LAHF, direct and indirect near/far control flow, IRET, flag
+control, decimal/ASCII adjust instructions, AAM/AAD/XLAT, and port I/O.
 
-## Bring-up sequence from here
+100% here means every instruction **on this currently known static frontier** can be
+executed by the canonical interpreter. It does not claim that all code in the image
+is now discovered. Runtime indirect targets, interrupt-installed entry points, and
+source-known alternate entries will expand the reachable set during actual DOSINIT
+bring-up.
 
-1. Implement the high-frequency real-DOS opcode tranche in the canonical
-   interpreter, with tests for flags and addressing.
-2. Add prefix state and string operations, including REP/REPE/REPNE and direction
-   flag behavior.
-3. Move the shared structural decoder underneath `dosrecomp` and the decoded block
-   cache so all engines consume one instruction-boundary implementation.
-4. Generalize `dosrecomp` from COM-only loading to raw images with explicit image
-   base and entry, allowing `MSDOS.SYS` to be generated without COM assumptions.
-5. Build a host-side minimal OEM/SYSINIT environment matching the documented DOS
-   initialization contract and enter the real `DOSINIT` path.
-6. Bring enough character/block device behavior online to reach the point where DOS
-   installs INT 21h and can EXEC the released `COMMAND.COM`.
-7. Replace host devices one boundary at a time with Pico 2 backends.
+## Milestone 8: enter the real kernel
 
-The success milestone is not merely printing a DOS-looking prompt. It is the
-released `MSDOS.SYS` installing its own services and starting the released
-`COMMAND.COM` through the hybrid execution engine.
+Milestone 8 adds a raw-image loader plus `microdos_msdos2`, which reproduces the
+contract visible in Microsoft's `SYSINIT.ASM` and `MSINIT.ASM`:
+
+- SYSINIT performs a far call to offset `0000h` in the final DOS segment.
+- `DS:SI` points to the first OEM device header (CON).
+- `DX` contains the physical-memory limit in paragraphs.
+- DOSINIT saves the caller's `SS:SP`, switches to its own initialization stack, and
+  restores the original stack before its final far return.
+- DOSINIT initializes CON, follows the character-device chain until CLOCK, then walks
+  block devices and consumes the unit count and BPB pointer returned by their INIT
+  request.
+
+microDOS therefore installs this guest-visible chain:
+
+```text
+CON -> AUX -> PRN -> CLOCK -> DISK -> FFFF:FFFF
+```
+
+Each header points to tiny real-mode strategy/interrupt trampolines. Those trampolines
+use private `INT F0h/F1h` hooks to cross into the native host layer and then `RETF`
+back to DOS exactly like a far-called DOS device driver. `INT F2h` is reserved for
+the synthetic SYSINIT return trampoline.
+
+The block INIT reply exposes one FAT12 drive with this BPB:
+
+```text
+bytes/sector       512
+sectors/cluster      2
+reserved sectors     1
+FATs                 2
+root entries        112
+total sectors       720
+media               FDh
+sectors/FAT           2
+```
+
+This is only the initialization contract. Read/write/media/clock/console requests are
+not silently accepted in M8; they are surfaced as the next bring-up boundary.
+
+Run:
+
+```powershell
+.\md.bat boot msdos2
+```
+
+The success criterion is now behavioral: execute the released kernel through its real
+`DOSINIT` path and either return to the synthetic SYSINIT caller or report the first
+precise missing runtime/OEM contract.
+
+During construction of this runner, the exact released entry sequence `E9 78 3E`
+exposed an unsequenced C expression in the canonical E9/EB implementation. The fix
+sequences displacement fetch before adding it to IP, and `0000:E9 78 3E -> 3E7B` is
+now a permanent regression test. This is a useful example of why bring-up executes the
+released binary instead of relying only on static opcode coverage.
+
+## Milestone 9: real DOS console services
+
+The first M8 execution reached normal device I/O after all five INIT requests. DOS then
+repeated CON function 5, 10, and 8 calls because M8 returned `8103h` for every non-INIT
+request. Microsoft's DOS 2 character-driver contract requires different results:
+
+```text
+CON function 5, no key pending   -> 0300h BUSY|DONE
+CON function 10, output status   -> 0100h DONE
+CON function 8/9, write          -> transfer far pointer + count, then 0100h DONE
+```
+
+M9 implements those operations through platform callbacks. The Windows runner binds
+console write to stdout; future Pico code can route the same callback to the catBUS
+console/display path. Function 4 destructive read remains explicit: it succeeds only
+when a platform read callback is installed. This preserves the bring-up rule that
+missing services are surfaced rather than fabricated.
+
+The runner also suppresses repeated identical error-volume after the first diagnostic
+window, while preserving counters and final CPU state.
+
+## Bring-up sequence after M9
+
+1. Run the released `MSDOS.SYS` under the M9 canonical runner and capture the next
+   real stop/boundary after console I/O succeeds.
+2. Implement only the device/interrupt behavior the real boot path requests.
+3. Record dynamically reached indirect targets and feed them back into `dosprobe`.
+4. Once DOSINIT returns cleanly, model enough of SYSINIT to perform its post-kernel
+   setup and transition toward `COMMAND.COM`.
+5. After the boot path is behaviorally stable, profile it and promote hot decoded
+   blocks/opcodes into cache-specialized and AOT execution.
+6. Replace host shims one boundary at a time with Pico 2 / MicroRender / MicroWave /
+   MicroConsole backends.
