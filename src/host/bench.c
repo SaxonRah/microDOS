@@ -63,12 +63,13 @@ static int bench_cache(unsigned long rounds, uint8_t *memory)
     }
     end = clock();
     seconds = elapsed_seconds(begin, end);
-    printf("cache  rounds=%lu guest_instructions=%llu seconds=%.6f MIPS=%.2f hits=%llu misses=%llu decodes=%llu fallback=%llu\n",
+    printf("cache  rounds=%lu guest_instructions=%llu seconds=%.6f MIPS=%.2f hits=%llu misses=%llu decodes=%llu invalidations=%llu fallback=%llu\n",
            rounds, (unsigned long long)total, seconds,
            seconds > 0.0 ? ((double)total / seconds) / 1e6 : 0.0,
            (unsigned long long)cache.hits,
            (unsigned long long)cache.misses,
            (unsigned long long)cache.decodes,
+           (unsigned long long)cache.invalidations,
            (unsigned long long)cache.fallback_instructions);
     return 0;
 }

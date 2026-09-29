@@ -104,3 +104,49 @@ Hot self-loops chain directly without hashing the guest `CS:IP` again on every i
 `MdRuntime::code_epoch` is advanced whenever a new COM image is loaded and can be advanced explicitly with `md_runtime_invalidate_code()`. Cached blocks record the epoch in which they were decoded, so stale entries become instant misses without clearing the whole table.
 
 This is deliberately coarse. Automatic page-granular executable-write tracking is still required before cached interpretation is safe for arbitrary self-modifying programs. Until that exists, software that modifies executable bytes without notifying the runtime must use the canonical interpreter or explicitly invalidate the cache.
+
+## 12. Executable writes are tracked at 4 KiB page granularity
+
+Milestone 3 replaces manual invalidation as the normal self-modifying-code mechanism. `MdRuntime` owns 256 executable-page flags and 256 generation counters, covering the complete 1 MiB real-mode physical address space with 4 KiB pages.
+
+A decoded block snapshots the generation of the source page(s) it covers. A guest memory write increments a generation only when the destination page has previously been marked executable. Ordinary data, stack, framebuffer, and DOS-memory writes therefore do not churn the code cache unless those pages also contain executed code.
+
+The page size is intentionally coarse. A 4 KiB page costs only about 1.25 KiB of runtime tracking metadata for the complete address space, which is a better RP2350 tradeoff than an 8+ KiB fine-grained table. Correctness does not depend on the granularity; smaller pages can be evaluated later from real workloads.
+
+## 13. AOT invalidation is conservative before it becomes clever
+
+Decoded blocks have precise page generations. Generated AOT currently uses a coarser image-wide rule: `dosrecomp` marks the static compiled code range executable and snapshots `code_write_epoch`. If any compiled code page is written, that generated invocation stops entering AOT and continues in the cached interpreter.
+
+This is intentionally conservative. It guarantees that self-modifying code, overlays, patchers, and code/data aliasing cannot execute stale native translations. Future per-AOT-block page-version tables may recover native execution for untouched compiled pages, but only after profiling shows the extra metadata and dispatch checks are worthwhile.
+
+Memory-writing instructions are also execution boundaries for stale-code safety. Cached blocks terminate after a write-capable instruction, and generated straight-line `PUSH`/direct-memory stores verify the write epoch before executing another compiled instruction.
+
+## 14. AOT fallback is block-granular
+
+Generated code no longer has to interpret exactly one unknown instruction and immediately retry the AOT dispatcher. When a runtime-owned `MdBlockCache` is attached, generated fallback calls `md_interp_run_cached_until()` and remains in the cached interpreter across an arbitrary unknown region.
+
+The cache returns `MD_STOP_NONE` without consuming the current instruction when guest `CS:IP` reaches a known, still-valid AOT block. Generated dispatch then resumes native execution. If the AOT image has been invalidated by a code write, the resume predicate refuses all native targets and the cache owns execution until the program stops.
+
+
+## 15. Real DOS bring-up is binary-first and source-assisted
+
+Milestone 4 pins Microsoft/MS-DOS commit
+`2d04cacc5322951f187bb17e017c12920ac8ebe2` and treats the released
+`v2.0/bin/MSDOS.SYS` and `v2.0/bin/COMMAND.COM` as executable truth. The released
+assembly, linker files, and documentation are metadata for understanding names,
+layout, initialization contracts, and indirect targets.
+
+A separate structural decoder exists because semantic support and instruction-boundary
+knowledge are different problems. `dosprobe` must be able to walk an instruction that
+the runtime cannot execute yet; otherwise the first missing opcode would hide every
+reachable block behind it and give a misleading implementation priority list.
+
+`COMMAND.COM` is analyzed with image base/entry `0100h`. `MSDOS.SYS` is a raw image
+with image base/entry `0000h`; its released first instruction jumps to the linked
+`DOSINIT` region. This does **not** mean the kernel can be invoked like a COM program.
+The OEM/SYSINIT register/device-chain contract must be constructed explicitly before
+real kernel execution begins.
+
+Recursive-descent coverage is intentionally reported as an analysis frontier, not as
+a percentage of bytes proven to be executable code. Indirect control transfers and
+source-known alternate entries will expand that frontier over time.

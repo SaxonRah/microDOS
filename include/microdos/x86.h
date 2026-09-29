@@ -35,6 +35,14 @@ enum {
 #define MD_X86_ADDRESS_MASK 0x000FFFFFu
 #define MD_X86_ADDRESS_SPACE (1u << 20)
 
+/* 4 KiB executable-page tracking keeps the metadata small enough for RP2350
+   internal SRAM while still invalidating only the region touched by self-
+   modifying code. There are exactly 256 pages in the 8086 20-bit space. */
+#define MD_X86_CODE_PAGE_SHIFT 12u
+#define MD_X86_CODE_PAGE_SIZE (1u << MD_X86_CODE_PAGE_SHIFT)
+#define MD_X86_CODE_PAGE_MASK (MD_X86_CODE_PAGE_SIZE - 1u)
+#define MD_X86_CODE_PAGE_COUNT (MD_X86_ADDRESS_SPACE / MD_X86_CODE_PAGE_SIZE)
+
 typedef struct MdX86 {
     uint16_t r[8];
     uint16_t es;
@@ -44,11 +52,44 @@ typedef struct MdX86 {
     uint16_t ip;
     uint16_t flags;
     uint8_t *memory;
+
+    /* Optional runtime-owned code tracking. Standalone MdX86 users may leave
+       these NULL; ordinary reads/writes then remain simple memory accesses. */
+    uint32_t *code_page_generation;
+    uint8_t *code_page_executable;
+    uint32_t *code_write_epoch;
 } MdX86;
 
 static inline uint32_t md_x86_linear(uint16_t segment, uint16_t offset)
 {
     return ((((uint32_t)segment) << 4) + (uint32_t)offset) & MD_X86_ADDRESS_MASK;
+}
+
+static inline unsigned md_x86_code_page(uint32_t address)
+{
+    return (unsigned)((address & MD_X86_ADDRESS_MASK) >> MD_X86_CODE_PAGE_SHIFT);
+}
+
+static inline void md_x86_note_code_write(MdX86 *cpu, uint32_t address)
+{
+    const unsigned page = md_x86_code_page(address);
+    uint32_t next;
+
+    if (cpu->code_page_generation == NULL ||
+        cpu->code_page_executable == NULL ||
+        cpu->code_page_executable[page] == 0u) {
+        return;
+    }
+
+    next = cpu->code_page_generation[page] + 1u;
+    if (next == 0u) next = 1u;
+    cpu->code_page_generation[page] = next;
+
+    if (cpu->code_write_epoch != NULL) {
+        next = *cpu->code_write_epoch + 1u;
+        if (next == 0u) next = 1u;
+        *cpu->code_write_epoch = next;
+    }
 }
 
 static inline uint8_t md_x86_read8_linear(const MdX86 *cpu, uint32_t address)
@@ -65,15 +106,22 @@ static inline uint16_t md_x86_read16_linear(const MdX86 *cpu, uint32_t address)
 
 static inline void md_x86_write8_linear(MdX86 *cpu, uint32_t address, uint8_t value)
 {
-    cpu->memory[address & MD_X86_ADDRESS_MASK] = value;
+    const uint32_t a0 = address & MD_X86_ADDRESS_MASK;
+    cpu->memory[a0] = value;
+    md_x86_note_code_write(cpu, a0);
 }
 
 static inline void md_x86_write16_linear(MdX86 *cpu, uint32_t address, uint16_t value)
 {
     const uint32_t a0 = address & MD_X86_ADDRESS_MASK;
     const uint32_t a1 = (a0 + 1u) & MD_X86_ADDRESS_MASK;
+    const unsigned p0 = md_x86_code_page(a0);
+    const unsigned p1 = md_x86_code_page(a1);
+
     cpu->memory[a0] = (uint8_t)value;
     cpu->memory[a1] = (uint8_t)(value >> 8);
+    md_x86_note_code_write(cpu, a0);
+    if (p1 != p0) md_x86_note_code_write(cpu, a1);
 }
 
 static inline uint8_t md_x86_read8(const MdX86 *cpu, uint16_t segment, uint16_t offset)

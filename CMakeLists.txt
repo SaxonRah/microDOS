@@ -20,15 +20,29 @@ if((CMAKE_C_COMPILER_ID MATCHES "GNU|Clang") AND NOT MD_FORCE_SWITCH_DISPATCH)
     target_compile_definitions(microdos_runtime PRIVATE MD_THREADED_DISPATCH=1)
 endif()
 
+add_library(microdos_decode STATIC
+    src/decode/x86_decode.c
+)
+add_library(microdos::decode ALIAS microdos_decode)
+target_include_directories(microdos_decode PUBLIC "${CMAKE_CURRENT_LIST_DIR}/include")
+
 add_executable(dosrecomp tools/dosrecomp/main.c)
+add_executable(dosprobe tools/dosprobe/main.c)
+target_link_libraries(dosprobe PRIVATE microdos::decode)
+target_include_directories(dosprobe PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
 
 if(MSVC)
     target_compile_options(microdos_runtime PRIVATE /W4 /permissive- $<$<CONFIG:Release>:/O2>)
     target_compile_options(dosrecomp PRIVATE /W4 /permissive- $<$<CONFIG:Release>:/O2>)
+    target_compile_options(dosprobe PRIVATE /W4 /permissive- $<$<CONFIG:Release>:/O2>)
+    target_compile_options(microdos_decode PRIVATE /W4 /permissive- $<$<CONFIG:Release>:/O2>)
     target_compile_definitions(dosrecomp PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_definitions(dosprobe PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(microdos_runtime PRIVATE -Wall -Wextra -Wpedantic $<$<CONFIG:Release>:-O3>)
     target_compile_options(dosrecomp PRIVATE -Wall -Wextra -Wpedantic $<$<CONFIG:Release>:-O3>)
+    target_compile_options(dosprobe PRIVATE -Wall -Wextra -Wpedantic $<$<CONFIG:Release>:-O3>)
+    target_compile_options(microdos_decode PRIVATE -Wall -Wextra -Wpedantic $<$<CONFIG:Release>:-O3>)
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(microdos_runtime PRIVATE -Wno-pedantic)
     endif()
@@ -59,6 +73,7 @@ endfunction()
 md_recompile_com(hello md_recomp_hello tests/programs/hello.com 0x10c)
 md_recompile_com(loop md_recomp_loop tests/programs/loop.com 0x107)
 md_recompile_com(hybrid md_recomp_hybrid tests/programs/hybrid.com 0x109)
+md_recompile_com(selfmod md_recomp_selfmod tests/programs/selfmod.com 0x107)
 
 if(MD_BUILD_HOST)
     add_executable(microdos_host src/host/main.c src/host/host_dos.c "${MD_RECOMP_hello_C}" "${MD_RECOMP_hello_H}")
@@ -77,8 +92,10 @@ if(MD_BUILD_TESTS)
         tests/test_runtime.c src/host/host_dos.c
         "${MD_RECOMP_hello_C}" "${MD_RECOMP_hello_H}"
         "${MD_RECOMP_loop_C}" "${MD_RECOMP_loop_H}"
-        "${MD_RECOMP_hybrid_C}" "${MD_RECOMP_hybrid_H}")
+        "${MD_RECOMP_hybrid_C}" "${MD_RECOMP_hybrid_H}"
+        "${MD_RECOMP_selfmod_C}" "${MD_RECOMP_selfmod_H}")
     target_link_libraries(microdos_tests PRIVATE microdos::runtime)
     target_include_directories(microdos_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/host" "${MD_GENERATED_DIR}")
     add_test(NAME microdos_runtime COMMAND microdos_tests)
+    add_test(NAME dosprobe_selftest COMMAND dosprobe --selftest)
 endif()

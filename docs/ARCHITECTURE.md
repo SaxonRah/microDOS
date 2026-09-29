@@ -230,3 +230,83 @@ platform/pico2
 ```
 
 The CPU/recompiler core remains platform-neutral so the same execution state can be differential-tested on desktop and RP2350.
+
+## Milestone 3: page-versioned mixed execution
+
+The mixed-mode dispatcher now treats generated AOT and cached interpretation as peers rather than retrying native dispatch after every unknown instruction.
+
+```text
+AOT block
+   |
+   +-- known target + unchanged code --> AOT block
+   |
+   +-- unknown target ----------------> cached interpreter
+   |                                      |
+   |                                      +-- supported block --> cached block
+   |                                      +-- unknown op ------> opcode step
+   |                                      |
+   |                               reaches valid AOT target
+   |                                      |
+   +<-------------------------------------+
+```
+
+`md_interp_run_cached_until()` accepts a stop predicate. `dosrecomp` emits a predicate containing the statically compiled block entries. The cached executor returns with `MD_STOP_NONE` before consuming an instruction at a valid AOT entry, allowing native execution to resume without changing architectural state.
+
+### Executable-page tracking
+
+`MdRuntime` owns one executable flag and one 32-bit generation counter for each 4 KiB page of the 20-bit address space. `MdX86` points at these arrays so ordinary inline memory-write helpers can invalidate executable pages without a generic memory callback.
+
+Decoded blocks record the generation of their source page(s). A direct-mapped cache hit is valid only when:
+
+```text
+block CS:IP matches
+AND whole-image epoch matches
+AND every source page generation matches
+```
+
+A changed page converts the would-be hit into a decode miss. Unrelated pages remain cached.
+
+### AOT self-modification rule
+
+Generated code marks the compiled static code range executable and snapshots `code_write_epoch`. A write to any page in that range increments the epoch. The generated dispatcher then refuses further AOT entries and gives execution to the cache.
+
+This image-wide AOT invalidation is intentionally stronger than necessary but is easy to prove correct. Per-block native page versions are a later optimization.
+
+A memory-writing instruction can invalidate a later instruction in the same already-decoded/generated basic block. Therefore cached decode ends a block after a write-capable operation, and generated straight-line write operations check the AOT epoch before continuing.
+
+## Real-binary intake and structural decoding
+
+Milestone 4 separates **instruction structure** from **instruction semantics**.
+`microdos::decode` knows how long an 8086 instruction is, which prefix bytes belong
+to it, whether it owns a ModR/M byte, and what kind of direct/indirect control flow
+it creates. It does not modify `MdX86`.
+
+```text
+              released DOS binary
+                      |
+                      v
+              microdos::decode
+               /             \
+              /               \
+         dosprobe           future users
+           |             /       |        \
+    CFG inventory   dosrecomp  block cache interpreter
+           |
+    missing semantic families
+           |
+           v
+    implementation priority
+```
+
+This lets `dosprobe` continue across instructions that the runtime cannot yet execute.
+Without that separation, the first unimplemented opcode would hide every directly
+reachable block behind it and make real-DOS coverage measurements misleading.
+
+The structural decoder intentionally reports 80186+ encodings when encountered but
+marks them as non-8086. Such a report is evidence to inspect the path; it is not by
+itself proof that the released DOS binary contains 80186 code, because recursive
+analysis can still enter data through incomplete indirect/source metadata.
+
+`COMMAND.COM` begins at guest offset `0100h`. `MSDOS.SYS` is analyzed as a raw image
+beginning at offset `0000h`. Those mappings belong to binary analysis; the runtime
+boot contract for `MSDOS.SYS` additionally requires the OEM/SYSINIT environment.

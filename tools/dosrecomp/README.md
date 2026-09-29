@@ -36,3 +36,11 @@ dosrecomp --input file.com --output-c out.c --output-h out.h --symbol md_recomp_
 ## Next
 
 The next compiler/runtime milestone is a shared instruction-description decoder with complete 8086 ModR/M and prefix handling. Both `dosrecomp` and the decoded-block interpreter cache should consume that description instead of growing two decoders.
+
+## Mixed execution after milestone 3
+
+Generated code now includes a compact resume predicate listing valid compiled block entries. If execution reaches unknown code, an indirect target, or code invalidated by a guest write, AOT enters the runtime-owned decoded block cache with `md_interp_run_cached_until()`.
+
+The cached path may execute any number of blocks and canonical interpreter fallbacks before returning. It hands control back only when `CS:IP` reaches a still-valid compiled entry. If guest code has modified a compiled code page, the generated image-wide write epoch is stale and AOT remains disabled for the rest of that invocation.
+
+This keeps correctness simple for overlays and self-modifying code while preserving a fast path back into native code for ordinary unresolved control flow.

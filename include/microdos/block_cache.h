@@ -1,6 +1,7 @@
 #ifndef MICRODOS_BLOCK_CACHE_H
 #define MICRODOS_BLOCK_CACHE_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "microdos/runtime.h"
 
@@ -66,22 +67,29 @@ typedef struct MdDecodedOp {
 
 typedef struct MdDecodedBlock {
     uint32_t epoch;
+    uint32_t page_generation[2];
     uint16_t cs;
     uint16_t ip;
+    uint8_t code_page[2];
+    uint8_t page_count;
     uint8_t count;
     uint8_t fallback;
     uint8_t guest_count;
+    uint8_t may_write;
     uint8_t reserved;
     MdDecodedOp ops[MD_BLOCK_MAX_OPS];
 } MdDecodedBlock;
 
-typedef struct MdBlockCache {
+struct MdBlockCache {
     MdDecodedBlock slots[MD_BLOCK_CACHE_SLOTS];
     uint64_t hits;
     uint64_t misses;
     uint64_t decodes;
+    uint64_t invalidations;
     uint64_t fallback_instructions;
-} MdBlockCache;
+};
+
+typedef bool (*MdCacheStopPredicate)(const MdRuntime *runtime, void *user);
 
 void md_block_cache_init(MdBlockCache *cache);
 void md_block_cache_clear_stats(MdBlockCache *cache);
@@ -93,6 +101,14 @@ void md_block_cache_clear_stats(MdBlockCache *cache);
  */
 MdStopReason md_interp_run_cached(MdRuntime *runtime, MdBlockCache *cache,
                                   uint64_t instruction_budget);
+
+/* Hybrid/AOT entry point. Returns MD_STOP_NONE, without executing the current
+   instruction, as soon as stop_predicate says the current CS:IP belongs to a
+   caller-owned execution path. Otherwise behaves like md_interp_run_cached(). */
+MdStopReason md_interp_run_cached_until(MdRuntime *runtime, MdBlockCache *cache,
+                                        uint64_t instruction_budget,
+                                        MdCacheStopPredicate stop_predicate,
+                                        void *stop_user);
 
 #ifdef __cplusplus
 }

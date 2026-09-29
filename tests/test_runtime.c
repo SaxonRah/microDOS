@@ -3,6 +3,7 @@
 #include "hello_recomp.h"
 #include "hybrid_recomp.h"
 #include "loop_recomp.h"
+#include "selfmod_recomp.h"
 #include "host_dos.h"
 
 #include <stdio.h>
@@ -24,6 +25,7 @@ static const uint8_t kHello[] = {
 };
 static const uint8_t kLoop[] = {0xB9,0xFF,0xFF,0x49,0x75,0xFD,0xF4};
 static const uint8_t kHybrid[] = {0xB8,0x34,0x12,0x74,0x03,0x89,0xC3,0x90,0xF4};
+static const uint8_t kPatchAx[] = {0xB8,0x11,0x11,0xF4};
 
 static void test_address_wrap(uint8_t *memory)
 {
@@ -98,7 +100,7 @@ static MdStopReason run_hello_cache(uint8_t *memory, char *out, size_t cap,
 }
 
 static MdStopReason run_hello_aot(uint8_t *memory, char *out, size_t cap,
-                                  uint64_t *instructions)
+                                  uint64_t *instructions, MdBlockCache *cache)
 {
     MdRuntime runtime;
     MdHostDos host;
@@ -109,6 +111,8 @@ static MdStopReason run_hello_aot(uint8_t *memory, char *out, size_t cap,
     md_host_dos_init(&host, out, cap);
     hooks = make_host_hooks(&host);
     md_runtime_init(&runtime, memory, &hooks);
+    md_block_cache_init(cache);
+    md_runtime_set_block_cache(&runtime, cache);
     stop = md_recomp_hello(&runtime, 0x1000u, 1000u);
     *instructions = runtime.instructions;
     CHECK(runtime.exit_code == 0u);
@@ -124,10 +128,11 @@ static void test_interp_cache_aot(uint8_t *memory)
     uint64_t cache_n = 0u;
     uint64_t aot_n = 0u;
     MdBlockCache cache;
+    MdBlockCache aot_cache;
 
     CHECK(run_hello_interp(memory, interp_out, sizeof(interp_out), &interp_n) == MD_STOP_EXIT);
     CHECK(run_hello_cache(memory, cache_out, sizeof(cache_out), &cache_n, &cache) == MD_STOP_EXIT);
-    CHECK(run_hello_aot(memory, aot_out, sizeof(aot_out), &aot_n) == MD_STOP_EXIT);
+    CHECK(run_hello_aot(memory, aot_out, sizeof(aot_out), &aot_n, &aot_cache) == MD_STOP_EXIT);
     CHECK(strcmp(interp_out, "Hello from microDOS!\r\n") == 0);
     CHECK(strcmp(interp_out, cache_out) == 0);
     CHECK(strcmp(interp_out, aot_out) == 0);
@@ -135,6 +140,7 @@ static void test_interp_cache_aot(uint8_t *memory)
     CHECK(cache_n == 5u);
     CHECK(aot_n == 5u);
     CHECK(cache.fallback_instructions == 0u);
+    CHECK(aot_cache.fallback_instructions == 0u);
 }
 
 static void test_loop_cache(uint8_t *memory)
@@ -144,6 +150,7 @@ static void test_loop_cache(uint8_t *memory)
     MdRuntime aot;
     MdHooks hooks = {0};
     MdBlockCache cache;
+    MdBlockCache aot_cache;
     uint64_t expected;
 
     memset(memory, 0, MD_X86_ADDRESS_SPACE);
@@ -165,6 +172,8 @@ static void test_loop_cache(uint8_t *memory)
 
     memset(memory, 0, MD_X86_ADDRESS_SPACE);
     md_runtime_init(&aot, memory, &hooks);
+    md_block_cache_init(&aot_cache);
+    md_runtime_set_block_cache(&aot, &aot_cache);
     CHECK(md_recomp_loop(&aot, 0x1000u, 200000u) == MD_STOP_HALT);
     CHECK(aot.cpu.r[MD_X86_CX] == 0u);
     CHECK(aot.instructions == expected);
@@ -187,23 +196,24 @@ static void test_cached_fallback(uint8_t *memory)
     CHECK(cache.fallback_instructions == 1u);
 }
 
-static void test_manual_code_invalidation(uint8_t *memory)
+static void test_page_code_invalidation(uint8_t *memory)
 {
     MdRuntime runtime;
     MdHooks hooks = {0};
     MdBlockCache cache;
-    uint32_t old_epoch;
+    uint64_t old_decodes;
+    uint64_t old_invalidations;
 
     memset(memory, 0, MD_X86_ADDRESS_SPACE);
     md_runtime_init(&runtime, memory, &hooks);
-    md_runtime_load_com(&runtime, kLoop, sizeof(kLoop), 0x1000u);
+    md_runtime_load_com(&runtime, kPatchAx, sizeof(kPatchAx), 0x1000u);
     md_block_cache_init(&cache);
-    CHECK(md_interp_run_cached(&runtime, &cache, 200000u) == MD_STOP_HALT);
+    CHECK(md_interp_run_cached(&runtime, &cache, 16u) == MD_STOP_HALT);
+    CHECK(runtime.cpu.r[MD_X86_AX] == 0x1111u);
 
-    old_epoch = runtime.code_epoch;
-    md_x86_write8(&runtime.cpu, 0x1000u, 0x0100u, 0xF4u);
-    md_runtime_invalidate_code(&runtime);
-    CHECK(runtime.code_epoch != old_epoch);
+    old_decodes = cache.decodes;
+    old_invalidations = cache.invalidations;
+    md_x86_write16(&runtime.cpu, 0x1000u, 0x0101u, 0x2222u);
 
     runtime.stop_reason = MD_STOP_NONE;
     runtime.instructions = 0u;
@@ -213,20 +223,46 @@ static void test_manual_code_invalidation(uint8_t *memory)
     runtime.cpu.ss = 0x1000u;
     runtime.cpu.ip = 0x0100u;
     runtime.cpu.r[MD_X86_SP] = 0xFFFEu;
-    CHECK(md_interp_run_cached(&runtime, &cache, 1u) == MD_STOP_HALT);
-    CHECK(runtime.instructions == 1u);
+    CHECK(md_interp_run_cached(&runtime, &cache, 16u) == MD_STOP_HALT);
+    CHECK(runtime.cpu.r[MD_X86_AX] == 0x2222u);
+    CHECK(cache.decodes > old_decodes);
+    CHECK(cache.invalidations > old_invalidations);
 }
 
-static void test_hybrid_aot(uint8_t *memory)
+static void test_hybrid_aot_cache_handoff(uint8_t *memory)
 {
     MdRuntime runtime;
     MdHooks hooks = {0};
+    MdBlockCache cache;
+
     memset(memory, 0, MD_X86_ADDRESS_SPACE);
     md_runtime_init(&runtime, memory, &hooks);
+    md_block_cache_init(&cache);
+    md_runtime_set_block_cache(&runtime, &cache);
     CHECK(md_recomp_hybrid(&runtime, 0x1000u, 100u) == MD_STOP_HALT);
     CHECK(runtime.cpu.r[MD_X86_AX] == 0x1234u);
     CHECK(runtime.cpu.r[MD_X86_BX] == 0x1234u);
     CHECK(runtime.instructions == 5u);
+    CHECK(cache.fallback_instructions == 1u);
+    CHECK(cache.decodes >= 1u);
+}
+
+static void test_aot_self_modifying_code(uint8_t *memory)
+{
+    MdRuntime runtime;
+    MdHooks hooks = {0};
+    MdBlockCache cache;
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&runtime, memory, &hooks);
+    md_block_cache_init(&cache);
+    md_runtime_set_block_cache(&runtime, &cache);
+
+    CHECK(md_recomp_selfmod(&runtime, 0x1000u, 100u) == MD_STOP_HALT);
+    CHECK(runtime.instructions == 3u);
+    CHECK(md_x86_read8(&runtime.cpu, 0x1000u, 0x0105u) == 0xF4u);
+    CHECK(runtime.cpu.ip == 0x0106u);
+    CHECK(cache.decodes >= 1u);
 }
 
 static void test_budget(uint8_t *memory)
@@ -273,8 +309,9 @@ int main(void)
     test_interp_cache_aot(memory);
     test_loop_cache(memory);
     test_cached_fallback(memory);
-    test_manual_code_invalidation(memory);
-    test_hybrid_aot(memory);
+    test_page_code_invalidation(memory);
+    test_hybrid_aot_cache_handoff(memory);
+    test_aot_self_modifying_code(memory);
     test_budget(memory);
     test_ivt(memory);
 
@@ -283,6 +320,6 @@ int main(void)
         fprintf(stderr, "%d test(s) failed\n", failures);
         return 1;
     }
-    puts("microDOS runtime + cached interpreter + dosrecomp tests passed");
+    puts("microDOS runtime + page cache + hybrid AOT tests passed");
     return 0;
 }

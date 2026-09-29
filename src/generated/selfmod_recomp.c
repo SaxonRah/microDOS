@@ -2,35 +2,33 @@
 #include "microdos/block_cache.h"
 #include "microdos/ops.h"
 #include "microdos/runtime.h"
-#include "loop_recomp.h"
+#include "selfmod_recomp.h"
 
 static const uint8_t md_image[7] = {
-    0xB9u, 0xFFu, 0xFFu, 0x49u, 0x75u, 0xFDu, 0xF4u
+    0xB0u, 0xF4u, 0xA2u, 0x05u, 0x01u, 0x90u, 0xF4u
 };
 
-typedef struct MdAotResume_md_recomp_loop {
+typedef struct MdAotResume_md_recomp_selfmod {
     uint16_t segment;
     uint32_t write_epoch;
-} MdAotResume_md_recomp_loop;
+} MdAotResume_md_recomp_selfmod;
 
-static bool md_aot_resume_md_recomp_loop(const MdRuntime *runtime, void *user)
+static bool md_aot_resume_md_recomp_selfmod(const MdRuntime *runtime, void *user)
 {
-    const MdAotResume_md_recomp_loop *resume = (const MdAotResume_md_recomp_loop *)user;
+    const MdAotResume_md_recomp_selfmod *resume = (const MdAotResume_md_recomp_selfmod *)user;
     if (runtime->code_write_epoch != resume->write_epoch ||
         runtime->cpu.cs != resume->segment) return false;
     switch (runtime->cpu.ip) {
         case 0x0100u: return true;
-        case 0x0103u: return true;
-        case 0x0106u: return true;
         default: return false;
     }
 }
 
-MdStopReason md_recomp_loop(MdRuntime *runtime, uint16_t segment, uint64_t instruction_budget)
+MdStopReason md_recomp_selfmod(MdRuntime *runtime, uint16_t segment, uint64_t instruction_budget)
 {
     MdX86 *cpu = &runtime->cpu;
     MdBlockCache *cache = runtime->block_cache;
-    MdAotResume_md_recomp_loop resume;
+    MdAotResume_md_recomp_selfmod resume;
     uint32_t aot_write_epoch;
     uint64_t remaining = instruction_budget;
 
@@ -56,8 +54,6 @@ md_dispatch:
     if (cpu->cs != segment) goto md_fallback;
     switch (cpu->ip) {
         case 0x0100u: goto md_block_0100;
-        case 0x0103u: goto md_block_0103;
-        case 0x0106u: goto md_block_0106;
         default: goto md_fallback;
     }
 
@@ -66,7 +62,7 @@ md_fallback:
     if (cache != NULL) {
         const uint64_t before = runtime->instructions;
         MdStopReason cached_stop = md_interp_run_cached_until(
-            runtime, cache, remaining, md_aot_resume_md_recomp_loop, &resume);
+            runtime, cache, remaining, md_aot_resume_md_recomp_selfmod, &resume);
         const uint64_t consumed = runtime->instructions - before;
         if (consumed > remaining) { runtime->stop_reason = MD_STOP_FAULT; return MD_STOP_FAULT; }
         remaining -= consumed;
@@ -80,21 +76,15 @@ md_fallback:
     goto md_dispatch;
 
 md_block_0100:
-    /* 0100: mov r16,imm16 */
-    MD_AOT_TICK(0x0103u);
-    cpu->r[1u] = 0xFFFFu;
-    goto md_dispatch;
-
-md_block_0103:
-    /* 0103: dec r16 */
-    MD_AOT_TICK(0x0104u);
-    { const uint16_t cf = cpu->flags & MD_X86_FLAG_CF; cpu->r[1u] = md_x86_sub16(cpu, cpu->r[1u], 1u); cpu->flags = (uint16_t)((cpu->flags & ~MD_X86_FLAG_CF) | cf); }
-    /* 0104: jnz rel8 */
+    /* 0100: mov r8,imm8 */
+    MD_AOT_TICK(0x0102u);
+    md_x86_set_reg8(cpu, 0u, 0xF4u);
+    /* 0102: mov [moffs],al */
+    MD_AOT_TICK(0x0105u);
+    md_x86_write8(cpu, cpu->ds, 0x0105u, md_x86_get_reg8(cpu, 0u));
+    if (runtime->code_write_epoch != aot_write_epoch) goto md_fallback;
+    /* 0105: nop */
     MD_AOT_TICK(0x0106u);
-    if ((cpu->flags & MD_X86_FLAG_ZF) == 0u) cpu->ip = 0x0103u;
-    goto md_dispatch;
-
-md_block_0106:
     /* 0106: hlt */
     MD_AOT_TICK(0x0107u);
     runtime->stop_reason = MD_STOP_HALT;

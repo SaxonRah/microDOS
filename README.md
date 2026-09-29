@@ -7,21 +7,37 @@ The project has two permanent execution paths sharing one architectural state an
 1. **AOT recompilation** — known DOS binaries are analyzed by `dosrecomp`, translated into portable C, and compiled natively for the target in the spirit of N64Recomp-style static recompilation.
 2. **High-performance 8086 interpretation** — unknown, indirect, dynamically generated, self-modifying, or not-yet-recompiled code runs through the interpreter and can return to compiled blocks.
 
-The interpreter is not a disposable fallback. microDOS now has both the original opcode interpreter and a caller-owned decoded basic-block cache. The cache removes repeated instruction decoding, supports compact super-ops, directly self-chains tight loops, and falls back to the canonical interpreter for instructions it cannot predecode.
+The interpreted path itself has two tiers: a fast decoded basic-block cache and the canonical opcode interpreter used for unsupported instructions and exact boundary cases.
 
 ## Current status
 
-The recompiler and the first cached-interpreter layer are both operational.
+Milestone 4 begins bring-up against the released MS-DOS 2.0 binaries while keeping
+the milestone-3 mixed execution model block-granular and self-modifying-code safe.
+The new `dosprobe` tool uses a structural 8086 decoder to walk real binaries even
+when their semantics are not implemented yet, producing an opcode/flow inventory
+that drives CPU-core work from actual DOS code rather than synthetic guesses.
+
+The execution model remains:
 
 ```text
-                     +--> AOT block -----------------------+
-.COM -> dosrecomp ---+                                     |
-                     +--> fallback --> opcode interpreter -+--> MdRuntime
-                                                           |
-unknown guest code --> decoded block cache ----------------+
-                         |       ^
-                         +-------+
-                        hot chain
+                         known + unchanged
+                              |
+                              v
+.COM -> dosrecomp -> generated AOT blocks
+                              |
+                unknown / changed / indirect
+                              |
+                              v
+                     decoded block cache
+                        |           |
+                  supported      unsupported
+                        |           |
+                        |           v
+                        +---- canonical opcode interpreter
+                              |
+                     reaches valid AOT target
+                              |
+                              +----------> AOT
 ```
 
 Current validation covers:
@@ -32,13 +48,35 @@ Current validation covers:
 - decoded-block cache hits/misses and direct self-chaining;
 - a fused `DEC r16` + `JNZ` super-op with exact two-instruction accounting;
 - cached interpreter -> canonical interpreter -> cached interpreter fallback;
-- AOT -> interpreter -> AOT handoff on deliberately unsupported AOT code;
+- **AOT -> cached interpreter -> AOT** block-granular handoff;
+- automatic 4 KiB executable-page invalidation after guest writes;
+- cache re-decode after patching an already-decoded instruction;
+- conservative AOT invalidation after any write to a compiled code page;
+- self-modifying AOT that patches the very next compiled instruction and correctly abandons stale generated code;
 - instruction-budget boundaries, including stopping inside a fused super-op;
-- coarse code-generation invalidation;
 - 8-bit register aliasing and 20-bit real-mode address wrapping;
 - real IVT fallback semantics.
 
 The interpreter, cache executor, and generated C all share `include/microdos/ops.h` for arithmetic/FLAGS behavior.
+
+## MS-DOS 2.0 reference bring-up
+
+Fetch the exact pinned Microsoft reference tree and analyze the two first real
+targets:
+
+```bat
+.\md.bat deps msdos
+.\md.bat analyze dos2
+```
+
+This analyzes `v2.0/bin/MSDOS.SYS` as a raw image at `0000h` and
+`v2.0/bin/COMMAND.COM` as a COM image at `0100h`. JSON reports are written under
+`build-analysis/`. The upstream checkout is local and ignored by Git.
+
+The structural decoder is intentionally separate from instruction semantics: it can
+recover lengths and direct control flow for the full 8086 map, flag possible 80186+
+paths, and compare reachable code against what the current interpreter and AOT
+emitter can actually execute. See `docs/MSDOS2_BRINGUP.md`.
 
 ## Build
 
@@ -67,7 +105,7 @@ ctest --test-dir build --output-on-failure
 ./build/microdos_bench 1000
 ```
 
-Expected host output now includes all three execution modes:
+Expected host output includes all three execution modes:
 
 ```text
 interp: stop=exit instructions=5 exit=0
@@ -80,31 +118,55 @@ output: Hello from microDOS!
 
 `microdos_bench` runs the same 131,072-instruction 8086 register/branch workload through baseline interpretation, cached interpretation, and AOT. Host MIPS are regression numbers only; they are not RP2350 estimates.
 
-A representative GCC Release run for this milestone:
+The cache now has a dedicated hot executor for single-op `DEC/JNZ` blocks, avoiding the generic decoded-op switch on that common loop shape. A representative GCC Release run for milestone 3 is roughly:
 
 ```text
-interp  ~245 MIPS
-cache   ~346 MIPS
-aot     ~499 MIPS
+interp  ~250 MIPS
+cache   ~400 MIPS
+aot     ~520 MIPS
 ```
 
-With the normal interpreter deliberately forced to portable switch dispatch, representative results were:
+With the baseline interpreter deliberately forced to portable switch dispatch:
 
 ```text
-interp  ~186 MIPS
-cache   ~389 MIPS
-aot     ~503 MIPS
+interp  ~190 MIPS
+cache   ~415 MIPS
+aot     ~525 MIPS
 ```
 
-That second comparison is useful for the Windows/MSVC build: the decoded cache does not depend on GNU computed-goto support and is intended to become the fast portable interpreted path.
+The validated MSVC milestone-3 result on the primary Windows development machine is:
 
-The default cache is about 17.5 KiB (`128` direct-mapped blocks, up to `16` decoded ops per block), is caller-owned, and performs no allocation during execution. Both dimensions are compile-time configurable.
+```text
+interp  121.25 MIPS
+cache   255.50 MIPS
+aot     490.91 MIPS
+```
 
-## Code invalidation
+That is a roughly 2.1x gain from decoded caching over the portable switch interpreter
+on the same build, before AOT is used.
 
-`MdRuntime::code_epoch` provides coarse cache invalidation. Loading a new `.COM` automatically advances the epoch. `md_runtime_invalidate_code()` is available when code memory is changed explicitly.
+The default cache is caller-owned, fixed-size, and performs no allocation while executing. Both slot count and maximum decoded operations per block are compile-time configurable.
 
-Automatic page-granular invalidation for arbitrary self-modifying guest writes is the next cache milestone. Until then, the baseline interpreter remains the correctness path for workloads that modify executable memory without notifying the runtime.
+## Self-modifying code and invalidation
+
+The 1 MiB guest address space is divided into 4 KiB code-tracking pages. Decoding a block marks the source pages executable and snapshots their generation counters. Guest writes through the normal 8086 memory helpers increment a page generation only when the destination page contains executable code.
+
+```text
+guest write
+    |
+    +--> ordinary data page ----> no cache work
+    |
+    +--> executable page
+             |
+             +--> page generation++
+             +--> code-write epoch++
+```
+
+Decoded blocks validate only the one or two pages containing their source bytes, so unrelated code remains cached.
+
+Generated AOT is deliberately more conservative: `dosrecomp` marks its static code range executable and snapshots the global code-write epoch. If guest code writes to any compiled code page, the generated dispatcher stops using that AOT image and remains in cached interpretation. This guarantees correctness before we attempt finer per-AOT-block versioning.
+
+Memory-writing decoded blocks end at the write boundary so a self-modification cannot leave stale decoded instructions later in the same cached block. Generated straight-line stores and pushes similarly check the code-write epoch immediately before executing another compiled instruction.
 
 ## Direction
 
@@ -112,13 +174,17 @@ Automatic page-granular invalidation for arbitrary self-modifying guest writes i
 8086 binary
    |
    +--> dosrecomp analyzer --> portable C --> native ARM/RISC-V
+   |                               ^
+   |                               |
+   |                        valid AOT target
+   |                               |
+   +--> decoded-block cache -------+
+   |       +--> super-ops
+   |       +--> hot chaining
+   |       +--> page validation
+   |       +--> opcode fallback
    |
-   +--> opcode interpreter
-   |
-   +--> decoded-block cache
-          +--> super-ops
-          +--> direct hot-block chaining
-          +--> opcode fallback
+   +--> canonical opcode interpreter
 
 all paths
    |
@@ -134,4 +200,4 @@ shared MdRuntime / MdX86 / instruction semantics
 
 The original MS-DOS source is source-level metadata and documentation; the binary remains the behavioral authority for recompilation.
 
-See `docs/ARCHITECTURE.md`, `DECISIONS.md`, and `tools/dosrecomp/README.md`.
+See `docs/ARCHITECTURE.md`, `docs/MSDOS2_BRINGUP.md`, `DECISIONS.md`, `tools/dosrecomp/README.md`, and `tools/dosprobe/README.md`.

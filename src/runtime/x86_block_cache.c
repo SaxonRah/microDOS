@@ -198,6 +198,66 @@ static int md_decode_one(const MdX86 *cpu, uint16_t cs, uint16_t ip,
     }
 }
 
+
+static int md_kind_may_write(MdDecodedKind kind)
+{
+    switch (kind) {
+        case MD_DOP_PUSH_R16:
+        case MD_DOP_MOV_MOFFS_AL:
+        case MD_DOP_MOV_MOFFS_AX:
+        case MD_DOP_INT:
+        case MD_DOP_CALL:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static void md_snapshot_block_pages(MdRuntime *runtime, MdDecodedBlock *block,
+                                    uint16_t cs, uint16_t ip, unsigned byte_count)
+{
+    unsigned i;
+
+    block->page_count = 0u;
+    if (byte_count == 0u) byte_count = 1u;
+
+    for (i = 0u; i < byte_count; ++i) {
+        const uint32_t linear = md_x86_linear(cs, (uint16_t)(ip + (uint16_t)i));
+        const uint8_t page = (uint8_t)md_x86_code_page(linear);
+        unsigned j;
+        int seen = 0;
+
+        runtime->code_page_executable[page] = 1u;
+
+        for (j = 0u; j < block->page_count; ++j) {
+            if (block->code_page[j] == page) {
+                seen = 1;
+                break;
+            }
+        }
+
+        if (!seen && block->page_count < 2u) {
+            const unsigned dst = block->page_count++;
+            block->code_page[dst] = page;
+            block->page_generation[dst] = runtime->code_page_generation[page];
+        }
+    }
+}
+
+static int md_block_pages_valid(const MdRuntime *runtime, const MdDecodedBlock *block)
+{
+    unsigned i;
+
+    if (block->epoch != runtime->code_epoch) return 0;
+    for (i = 0u; i < block->page_count; ++i) {
+        const unsigned page = block->code_page[i];
+        if (runtime->code_page_generation[page] != block->page_generation[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static MdDecodedBlock *md_decode_block(MdRuntime *runtime, MdBlockCache *cache,
                                         uint16_t cs, uint16_t ip)
 {
@@ -206,6 +266,7 @@ static MdDecodedBlock *md_decode_block(MdRuntime *runtime, MdBlockCache *cache,
     uint16_t cursor = ip;
     unsigned count = 0u;
     unsigned guest_count = 0u;
+    unsigned byte_count = 0u;
 
     memset(block, 0, sizeof(*block));
     block->epoch = runtime->code_epoch;
@@ -222,17 +283,22 @@ static MdDecodedBlock *md_decode_block(MdRuntime *runtime, MdBlockCache *cache,
 
         block->ops[count++] = op;
         guest_count += op.guest_count;
+        if (md_kind_may_write((MdDecodedKind)op.kind)) block->may_write = 1u;
         if (!supported) {
             block->fallback = 1u;
+            byte_count += 1u;
             break;
         }
 
+        byte_count += (unsigned)(uint16_t)(op.next_ip - cursor);
         cursor = op.next_ip;
-        if (md_is_terminator((MdDecodedKind)op.kind)) break;
+        if (md_is_terminator((MdDecodedKind)op.kind) ||
+            md_kind_may_write((MdDecodedKind)op.kind)) break;
     }
 
     block->count = (uint8_t)count;
     block->guest_count = (uint8_t)guest_count;
+    md_snapshot_block_pages(runtime, block, cs, ip, byte_count);
     ++cache->decodes;
     return block;
 }
@@ -244,10 +310,14 @@ static MdDecodedBlock *md_lookup_block(MdRuntime *runtime, MdBlockCache *cache)
     const unsigned slot = md_cache_index(cs, ip);
     MdDecodedBlock *block = &cache->slots[slot];
 
-    if (block->epoch == runtime->code_epoch && block->cs == cs && block->ip == ip &&
-        block->count != 0u) {
-        ++cache->hits;
-        return block;
+    if (block->cs == cs && block->ip == ip && block->count != 0u) {
+        if (md_block_pages_valid(runtime, block)) {
+            ++cache->hits;
+            return block;
+        }
+        if (block->epoch == runtime->code_epoch) {
+            ++cache->invalidations;
+        }
     }
 
     ++cache->misses;
@@ -264,6 +334,7 @@ void md_block_cache_clear_stats(MdBlockCache *cache)
     cache->hits = 0u;
     cache->misses = 0u;
     cache->decodes = 0u;
+    cache->invalidations = 0u;
     cache->fallback_instructions = 0u;
 }
 
@@ -362,14 +433,30 @@ static void md_exec_decoded(MdRuntime *runtime, const MdDecodedOp *op)
     }
 }
 
-MdStopReason md_interp_run_cached(MdRuntime *runtime, MdBlockCache *cache,
-                                  uint64_t instruction_budget)
+static void md_exec_hot_dec_jnz(MdRuntime *runtime, const MdDecodedOp *op)
+{
+    MdX86 *cpu = &runtime->cpu;
+    const uint16_t old_cf = cpu->flags & MD_X86_FLAG_CF;
+
+    cpu->r[op->reg] = md_x86_sub16(cpu, cpu->r[op->reg], 1u);
+    cpu->flags = (uint16_t)((cpu->flags & ~MD_X86_FLAG_CF) | old_cf);
+    cpu->ip = ((cpu->flags & MD_X86_FLAG_ZF) == 0u) ? op->arg : op->next_ip;
+}
+
+MdStopReason md_interp_run_cached_until(MdRuntime *runtime, MdBlockCache *cache,
+                                        uint64_t instruction_budget,
+                                        MdCacheStopPredicate stop_predicate,
+                                        void *stop_user)
 {
     uint64_t remaining = instruction_budget;
     MdDecodedBlock *block = NULL;
 
     while (runtime->stop_reason == MD_STOP_NONE) {
         unsigned i;
+
+        if (stop_predicate != NULL && stop_predicate(runtime, stop_user)) {
+            return MD_STOP_NONE;
+        }
 
         if (remaining == 0u) {
             runtime->stop_reason = MD_STOP_BUDGET;
@@ -386,7 +473,15 @@ MdStopReason md_interp_run_cached(MdRuntime *runtime, MdBlockCache *cache,
             continue;
         }
 
-        if (remaining >= block->guest_count) {
+        /* MSVC cannot use GCC's computed-goto interpreter. Keep the hottest
+           cached loop terminator out of the generic decoded-op switch too. */
+        if (block->count == 1u &&
+            block->ops[0].kind == MD_DOP_DEC_JNZ &&
+            remaining >= 2u) {
+            remaining -= 2u;
+            runtime->instructions += 2u;
+            md_exec_hot_dec_jnz(runtime, &block->ops[0]);
+        } else if (remaining >= block->guest_count) {
             remaining -= block->guest_count;
             runtime->instructions += block->guest_count;
             for (i = 0u; i < block->count; ++i) {
@@ -418,15 +513,26 @@ MdStopReason md_interp_run_cached(MdRuntime *runtime, MdBlockCache *cache,
         if (runtime->stop_reason != MD_STOP_NONE) break;
 
         /* Direct self-chain: tight loops never return to the hash lookup after
-           their first iteration. This matters on small in-order cores such as
-           Cortex-M33 just as much as it does on desktop. */
+           their first iteration. The page generation check is unnecessary here:
+           this block did not perform a code write unless its source page was
+           invalidated, in which case the next write epoch/page check occurs as
+           soon as control leaves and re-enters the cache. */
         if (block != NULL && runtime->cpu.cs == block->cs && runtime->cpu.ip == block->ip) {
-            ++cache->hits;
-            continue;
+            if (!block->may_write || md_block_pages_valid(runtime, block)) {
+                ++cache->hits;
+                continue;
+            }
+            ++cache->invalidations;
         }
 
         block = NULL;
     }
 
     return runtime->stop_reason;
+}
+
+MdStopReason md_interp_run_cached(MdRuntime *runtime, MdBlockCache *cache,
+                                  uint64_t instruction_budget)
+{
+    return md_interp_run_cached_until(runtime, cache, instruction_budget, NULL, NULL);
 }

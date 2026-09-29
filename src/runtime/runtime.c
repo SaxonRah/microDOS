@@ -2,16 +2,34 @@
 
 #include <string.h>
 
+static uint32_t md_next_epoch(uint32_t value)
+{
+    ++value;
+    return value != 0u ? value : 1u;
+}
+
+static void md_runtime_bind_tracking(MdRuntime *runtime)
+{
+    runtime->cpu.code_page_generation = runtime->code_page_generation;
+    runtime->cpu.code_page_executable = runtime->code_page_executable;
+    runtime->cpu.code_write_epoch = &runtime->code_write_epoch;
+}
+
 void md_runtime_reset(MdRuntime *runtime)
 {
     uint8_t *memory = runtime->cpu.memory;
     MdHooks hooks = runtime->hooks;
-    uint32_t code_epoch = runtime->code_epoch;
+    MdBlockCache *block_cache = runtime->block_cache;
+    const uint32_t next_code_epoch = md_next_epoch(runtime->code_epoch);
+
     memset(runtime, 0, sizeof(*runtime));
     runtime->cpu.memory = memory;
     runtime->cpu.flags = MD_X86_FLAG_ALWAYS1;
     runtime->hooks = hooks;
-    runtime->code_epoch = code_epoch != 0u ? code_epoch : 1u;
+    runtime->block_cache = block_cache;
+    runtime->code_epoch = next_code_epoch;
+    runtime->code_write_epoch = 1u;
+    md_runtime_bind_tracking(runtime);
 }
 
 void md_runtime_init(MdRuntime *runtime, uint8_t *memory, const MdHooks *hooks)
@@ -20,9 +38,16 @@ void md_runtime_init(MdRuntime *runtime, uint8_t *memory, const MdHooks *hooks)
     runtime->cpu.memory = memory;
     runtime->cpu.flags = MD_X86_FLAG_ALWAYS1;
     runtime->code_epoch = 1u;
+    runtime->code_write_epoch = 1u;
     if (hooks != NULL) {
         runtime->hooks = *hooks;
     }
+    md_runtime_bind_tracking(runtime);
+}
+
+void md_runtime_set_block_cache(MdRuntime *runtime, MdBlockCache *cache)
+{
+    runtime->block_cache = cache;
 }
 
 void md_runtime_load_com(MdRuntime *runtime, const uint8_t *data, size_t size, uint16_t segment)
@@ -50,13 +75,29 @@ void md_runtime_load_com(MdRuntime *runtime, const uint8_t *data, size_t size, u
     runtime->cpu.ss = segment;
     runtime->cpu.ip = 0x0100u;
     runtime->cpu.r[MD_X86_SP] = 0xFFFEu;
-    md_runtime_invalidate_code(runtime);
 }
 
 void md_runtime_invalidate_code(MdRuntime *runtime)
 {
-    ++runtime->code_epoch;
-    if (runtime->code_epoch == 0u) runtime->code_epoch = 1u;
+    runtime->code_epoch = md_next_epoch(runtime->code_epoch);
+    runtime->code_write_epoch = md_next_epoch(runtime->code_write_epoch);
+}
+
+void md_runtime_mark_code_range(MdRuntime *runtime, uint16_t segment,
+                                uint16_t offset, size_t size)
+{
+    uint32_t address = md_x86_linear(segment, offset);
+
+    while (size != 0u) {
+        const unsigned page = md_x86_code_page(address);
+        const size_t in_page = (size_t)(address & MD_X86_CODE_PAGE_MASK);
+        size_t chunk = (size_t)MD_X86_CODE_PAGE_SIZE - in_page;
+        if (chunk > size) chunk = size;
+
+        runtime->code_page_executable[page] = 1u;
+        address = (address + (uint32_t)chunk) & MD_X86_ADDRESS_MASK;
+        size -= chunk;
+    }
 }
 
 void md_runtime_request_exit(MdRuntime *runtime, uint8_t exit_code)

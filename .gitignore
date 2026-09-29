@@ -11,3 +11,6 @@ build-*/
 *.ilk
 *.uf2
 *.elf
+
+/third_party/msdos/
+/build-analysis/

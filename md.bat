@@ -2,11 +2,13 @@
 rem ===========================================================================
 rem microDOS - single entry point for host/runtime/recompiler development.
 rem
+rem   .\md.bat deps msdos
 rem   .\md.bat build host
 rem   .\md.bat run host
 rem   .\md.bat test
 rem   .\md.bat bench [rounds]
 rem   .\md.bat recomp input.com name [code-end]
+rem   .\md.bat analyze [dos2^|msdos^|command]
 rem   .\md.bat clean
 rem ===========================================================================
 setlocal EnableExtensions
@@ -16,17 +18,29 @@ set "CMD=%~1"
 if "%CMD%"=="" set "CMD=help"
 shift /1
 
+if /i "%CMD%"=="deps"   goto deps
 if /i "%CMD%"=="build"  goto build
 if /i "%CMD%"=="run"    goto run
 if /i "%CMD%"=="test"   goto test
 if /i "%CMD%"=="bench"  goto bench
 if /i "%CMD%"=="recomp" goto recomp
+if /i "%CMD%"=="analyze" goto analyze
 if /i "%CMD%"=="clean"  goto clean
 if /i "%CMD%"=="help"   goto help
 if /i "%CMD%"=="-h"     goto help
 if /i "%CMD%"=="--help" goto help
 
 echo ERROR: unknown command "%CMD%".
+exit /b 1
+
+
+:deps
+if /i "%~1"=="msdos" (
+    call "%MD_ROOT%\scripts\md_msdos_deps.bat"
+    exit /b %ERRORLEVEL%
+)
+echo Usage:
+echo   .\md.bat deps msdos
 exit /b 1
 
 :build
@@ -92,9 +106,18 @@ if "%CODE_END%"=="" (
 )
 exit /b %ERRORLEVEL%
 
+
+:analyze
+set "ANALYZE_TARGET=%~1"
+if "%ANALYZE_TARGET%"=="" set "ANALYZE_TARGET=dos2"
+call :build_host_if_needed || exit /b 1
+call "%MD_ROOT%\scripts\md_analyze.bat" "%ANALYZE_TARGET%"
+exit /b %ERRORLEVEL%
+
 :recomp_usage
 echo Usage:
 echo   .\md.bat recomp input.com name [code-end]
+echo   .\md.bat analyze [dos2^|msdos^|command]
 echo Example:
 echo   .\md.bat recomp tests\programs\hello.com hello 0x10c
 exit /b 1
@@ -109,18 +132,25 @@ exit /b 0
 :clean
 if exist "%MD_ROOT%\build-host" rmdir /s /q "%MD_ROOT%\build-host"
 if exist "%MD_ROOT%\build-recomp" rmdir /s /q "%MD_ROOT%\build-recomp"
+if exist "%MD_ROOT%\build-analysis" rmdir /s /q "%MD_ROOT%\build-analysis"
 echo clean.
 exit /b 0
 
 :help
 echo microDOS build, run, and recompilation driver.
 echo.
+echo   .\md.bat deps msdos
 echo   .\md.bat build host
 echo   .\md.bat run host
 echo   .\md.bat test
 echo   .\md.bat bench [rounds]
 echo   .\md.bat recomp input.com name [code-end]
+echo   .\md.bat analyze [dos2^|msdos^|command]
 echo   .\md.bat clean
+echo.
+echo MS-DOS 2.0 bring-up:
+echo   .\md.bat deps msdos
+echo   .\md.bat analyze dos2
 echo.
 echo dosrecomp example:
 echo   .\md.bat recomp tests\programs\hello.com hello 0x10c

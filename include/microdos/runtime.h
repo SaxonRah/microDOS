@@ -21,6 +21,8 @@ typedef enum MdStopReason {
 
 struct MdRuntime;
 typedef struct MdRuntime MdRuntime;
+struct MdBlockCache;
+typedef struct MdBlockCache MdBlockCache;
 
 typedef bool (*MdInterruptHook)(MdRuntime *runtime, uint8_t vector, void *user);
 typedef uint8_t (*MdPortIn8Hook)(MdRuntime *runtime, uint16_t port, void *user);
@@ -41,15 +43,34 @@ struct MdRuntime {
     uint32_t fault_linear;
     uint8_t fault_opcode;
     uint8_t exit_code;
+
+    /* code_epoch invalidates an entire external cache after image/reset events.
+       Page generations handle normal self-modifying-code invalidation. */
     uint32_t code_epoch;
+    uint32_t code_write_epoch;
+    uint32_t code_page_generation[MD_X86_CODE_PAGE_COUNT];
+    uint8_t code_page_executable[MD_X86_CODE_PAGE_COUNT];
+
+    /* Optional caller-owned decoded cache. Generated AOT uses this when it must
+       leave compiled code and execute an unknown/modified region. */
+    MdBlockCache *block_cache;
 };
 
 void md_runtime_init(MdRuntime *runtime, uint8_t *memory, const MdHooks *hooks);
 void md_runtime_reset(MdRuntime *runtime);
 void md_runtime_load_com(MdRuntime *runtime, const uint8_t *data, size_t size, uint16_t segment);
 void md_runtime_request_exit(MdRuntime *runtime, uint8_t exit_code);
-/* Coarse code-cache invalidation. Page-granular tracking will replace this later. */
+void md_runtime_set_block_cache(MdRuntime *runtime, MdBlockCache *cache);
+
+/* Coarse invalidation remains available for image replacement and platform code
+   that cannot identify the touched page. Normal guest writes invalidate only
+   executable pages through the MdX86 write helpers. */
 void md_runtime_invalidate_code(MdRuntime *runtime);
+
+/* Mark bytes as executable so later guest writes to their 4 KiB pages invalidate
+   decoded blocks and, conservatively, any generated AOT using the image. */
+void md_runtime_mark_code_range(MdRuntime *runtime, uint16_t segment,
+                                uint16_t offset, size_t size);
 
 /* Returns true when a host/native hook handled the interrupt. If it did not,
    the function performs real-mode 8086 interrupt-vector dispatch through the IVT. */
