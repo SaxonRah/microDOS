@@ -244,6 +244,14 @@ is preserved between runs; use `md.bat image dos2` to reset it.
 ```
 
 
+### M12.3 standard handles (fix for the M12 `$` flood)
+
+The M12.2 capture showed COMMAND.COM's `STRING_OUT` count was correct and the
+kernel console loop was entered with 16 x 128 = 2048 bytes. DOS 2 handle writes
+are record I/O and only `$Open` sets the record size to 1; the continuation now
+performs SYSINIT's real `OPEN \DEV\CON` + `XDUP` sequence before EXEC. See
+`DECISIONS.md` #29. The runner summary reports this as `[system] stdio=...`.
+
 ### M12.2 upstream string-output diagnostic
 
 The first interactive M12 run reached the released `COMMAND.COM` and printed its

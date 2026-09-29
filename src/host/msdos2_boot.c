@@ -1,5 +1,6 @@
 #include "msdos2_boot.h"
 
+#include <assert.h>
 #include <string.h>
 
 /* DOS 2.x device header layout from DEVSYM.ASM. */
@@ -135,10 +136,70 @@ static void md_install_postinit_program(MdRuntime *runtime, const MdMsdos2Boot *
     const uint16_t s = boot->bios_segment;
     uint16_t p = MD_MSDOS2_POSTINIT_OFFSET;
     static const char kPath[] = "A:\\COMMAND.COM";
+    static const char kConDev[] = "\\DEV\\CON";
+    static const char kAuxDev[] = "\\DEV\\AUX";
+    static const char kPrnDev[] = "\\DEV\\PRN";
+    uint16_t jc_open_con;
+    uint16_t jc_dup1;
+    uint16_t jc_dup2;
+    uint16_t stdio_fail;
     unsigned i;
 
 #define EMIT8(v) md_x86_write8(cpu, s, p++, (uint8_t)(v))
 #define EMIT16(v) do { const uint16_t md_v_ = (uint16_t)(v); EMIT8(md_v_ & 0xffu); EMIT8(md_v_ >> 8); } while (0)
+#define PATCH_JC(at, target) \
+    md_x86_write8(cpu, s, (at), (uint8_t)((target) - (uint16_t)((at) + 1u)))
+
+    /* M12.3: recreate SYSINIT's standard-handle setup (SYSINIT.ASM, just
+       before GOSET). DOSINIT only leaves JFN 0/1/2 pointing at a bootstrap
+       SFT entry 0 that is good enough for DOS's internal console messages
+       but was never created by $Open, so its sf_FCB.fcb_RECSIZ is not 1.
+       Handle I/O is record I/O in DOS 2 ($Write -> random block write), so
+       an unopened entry turns a 16-byte AH=40h write into 16*128 bytes.
+       SYSINIT therefore closes the bootstrap handles, OPENs \DEV\CON (which
+       sets RECSIZ=1, "byte io only") and XDUPs it to STDOUT/STDERR. */
+    EMIT8(0x0Eu);                    /* PUSH CS */
+    EMIT8(0x1Fu);                    /* POP DS */
+    EMIT8(0x33u); EMIT8(0xDBu);      /* XOR BX,BX */
+    EMIT8(0xB4u); EMIT8(0x3Eu);      /* MOV AH,CLOSE */
+    EMIT8(0xCDu); EMIT8(0x21u);      /* close standard input */
+    EMIT8(0xBBu); EMIT16(2u);        /* MOV BX,2 */
+    EMIT8(0xB9u); EMIT16(MD_MSDOS2_SYSINIT_FILES); /* MOV CX,[FILES] */
+    /* RCCLLOOP: close everybody but standard output. */
+    EMIT8(0xB4u); EMIT8(0x3Eu);      /* MOV AH,CLOSE */
+    EMIT8(0xCDu); EMIT8(0x21u);      /* INT 21h (errors ignored, as SYSINIT) */
+    EMIT8(0x43u);                    /* INC BX */
+    EMIT8(0xE2u); EMIT8(0xF9u);      /* LOOP RCCLLOOP */
+
+    EMIT8(0xBAu); EMIT16(MD_MSDOS2_CONDEV_OFFSET); /* MOV DX,CONDEV */
+    EMIT8(0xB8u); EMIT16(0x3D02u);   /* MOV AX,3D02h  OPEN read/write */
+    EMIT8(0xF9u);                    /* STC */
+    EMIT8(0xCDu); EMIT8(0x21u);      /* INT 21h */
+    EMIT8(0x72u); jc_open_con = p; EMIT8(0x00u); /* JC stdio_fail */
+    EMIT8(0x50u);                    /* PUSH AX */
+    EMIT8(0xBBu); EMIT16(1u);        /* MOV BX,1 */
+    EMIT8(0xB4u); EMIT8(0x3Eu);      /* MOV AH,CLOSE */
+    EMIT8(0xCDu); EMIT8(0x21u);      /* close standard output */
+    EMIT8(0x58u);                    /* POP AX */
+    EMIT8(0x8Bu); EMIT8(0xD8u);      /* MOV BX,AX  new CON handle */
+    EMIT8(0xB4u); EMIT8(0x45u);      /* MOV AH,XDUP */
+    EMIT8(0xCDu); EMIT8(0x21u);      /* dup to 1, STDOUT */
+    EMIT8(0x72u); jc_dup1 = p; EMIT8(0x00u); /* JC stdio_fail */
+    EMIT8(0xB4u); EMIT8(0x45u);      /* MOV AH,XDUP */
+    EMIT8(0xCDu); EMIT8(0x21u);      /* dup to 2, STDERR */
+    EMIT8(0x72u); jc_dup2 = p; EMIT8(0x00u); /* JC stdio_fail */
+
+    /* GOAUX2: AUX (read/write) and PRN (write only). SYSINIT's OPEN_DEV
+       falls back to NUL on failure; these are optional for COMMAND.COM, so
+       failure is simply ignored here. */
+    EMIT8(0xBAu); EMIT16(MD_MSDOS2_AUXDEV_OFFSET); /* MOV DX,AUXDEV */
+    EMIT8(0xB8u); EMIT16(0x3D02u);   /* MOV AX,3D02h */
+    EMIT8(0xF9u);                    /* STC */
+    EMIT8(0xCDu); EMIT8(0x21u);
+    EMIT8(0xBAu); EMIT16(MD_MSDOS2_PRNDEV_OFFSET); /* MOV DX,PRNDEV */
+    EMIT8(0xB8u); EMIT16(0x3D01u);   /* MOV AX,3D01h */
+    EMIT8(0xF9u);                    /* STC */
+    EMIT8(0xCDu); EMIT8(0x21u);
 
     /* Match the EXEC path in Microsoft's SYSINIT.ASM: DS=ES=SYSINIT,
        DS:DX -> COMMAND.COM, ES:BX -> Exec0, AX=4B00h. */
@@ -156,12 +217,30 @@ static void md_install_postinit_program(MdRuntime *runtime, const MdMsdos2Boot *
     EMIT8(0xCDu); EMIT8(MD_MSDOS2_NATIVE_POSTINIT_FAIL_INT);
     EMIT8(0xF4u);
 
+    stdio_fail = p;
+    EMIT8(0xCDu); EMIT8(MD_MSDOS2_NATIVE_POSTINIT_STDIO_FAIL_INT);
+    EMIT8(0xF4u);
+
+    PATCH_JC(jc_open_con, stdio_fail);
+    PATCH_JC(jc_dup1, stdio_fail);
+    PATCH_JC(jc_dup2, stdio_fail);
+
+    /* The program must not run into the path string that follows it. */
+    assert(p <= MD_MSDOS2_POSTINIT_PATH_OFFSET);
+    assert((uint16_t)(stdio_fail - (jc_open_con + 1u)) < 0x80u);
+
+#undef PATCH_JC
 #undef EMIT16
 #undef EMIT8
 
     for (i = 0u; i < sizeof(kPath); ++i) {
         md_x86_write8(cpu, s, (uint16_t)(MD_MSDOS2_POSTINIT_PATH_OFFSET + i),
                       (uint8_t)kPath[i]);
+    }
+    for (i = 0u; i < sizeof(kConDev); ++i) {
+        md_x86_write8(cpu, s, (uint16_t)(MD_MSDOS2_CONDEV_OFFSET + i), (uint8_t)kConDev[i]);
+        md_x86_write8(cpu, s, (uint16_t)(MD_MSDOS2_AUXDEV_OFFSET + i), (uint8_t)kAuxDev[i]);
+        md_x86_write8(cpu, s, (uint16_t)(MD_MSDOS2_PRNDEV_OFFSET + i), (uint8_t)kPrnDev[i]);
     }
 
     /* DOS 2 Exec0: environment segment, command-tail FAR ptr, FCB1 FAR ptr,
@@ -666,6 +745,18 @@ bool md_msdos2_boot_interrupt(MdRuntime *runtime, uint8_t vector, void *user)
         boot->postinit_completed = true;
         boot->postinit_succeeded = true;
         boot->postinit_error = 0u;
+        runtime->stop_reason = MD_STOP_HALT;
+        return true;
+    }
+
+    if (vector == MD_MSDOS2_NATIVE_POSTINIT_STDIO_FAIL_INT) {
+        /* OPEN \DEV\CON or an XDUP failed: COMMAND.COM would otherwise run
+           on the bootstrap SFT entry and every handle write would be
+           multiplied by the default 128-byte record size. */
+        boot->postinit_completed = true;
+        boot->postinit_succeeded = false;
+        boot->postinit_stdio_failed = true;
+        boot->postinit_error = cpu->r[MD_X86_AX];
         runtime->stop_reason = MD_STOP_HALT;
         return true;
     }

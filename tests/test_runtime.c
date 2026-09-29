@@ -1274,6 +1274,20 @@ static void test_msdos2_disk_device_contract(uint8_t *memory)
     CHECK(boot.unknown_device_calls == 0u);
 }
 
+static bool test_far_streq(const MdX86 *cpu, uint16_t seg, uint16_t off, const char *text)
+{
+    for (;;) {
+        const uint8_t b = md_x86_read8(cpu, seg, off++);
+        if (b != (uint8_t)*text) {
+            return false;
+        }
+        if (b == 0u) {
+            return true;
+        }
+        ++text;
+    }
+}
+
 static void test_msdos2_postinit_continuation(uint8_t *memory)
 {
     MdRuntime runtime;
@@ -1299,9 +1313,12 @@ static void test_msdos2_postinit_continuation(uint8_t *memory)
 
     CHECK(md_x86_read8(&runtime.cpu, boot.bios_segment, MD_MSDOS2_POSTINIT_OFFSET + 0u) == 0x0Eu);
     CHECK(md_x86_read8(&runtime.cpu, boot.bios_segment, MD_MSDOS2_POSTINIT_OFFSET + 1u) == 0x1Fu);
-    CHECK(md_x86_read8(&runtime.cpu, boot.bios_segment, MD_MSDOS2_POSTINIT_OFFSET + 2u) == 0x0Eu);
-    CHECK(md_x86_read8(&runtime.cpu, boot.bios_segment, MD_MSDOS2_POSTINIT_OFFSET + 3u) == 0x07u);
+    CHECK(md_x86_read8(&runtime.cpu, boot.bios_segment, MD_MSDOS2_POSTINIT_OFFSET + 2u) == 0x33u);
+    CHECK(md_x86_read8(&runtime.cpu, boot.bios_segment, MD_MSDOS2_POSTINIT_OFFSET + 3u) == 0xDBu);
     CHECK(md_x86_read8(&runtime.cpu, boot.bios_segment, MD_MSDOS2_POSTINIT_PATH_OFFSET) == (uint8_t)'A');
+    CHECK(test_far_streq(&runtime.cpu, boot.bios_segment, MD_MSDOS2_CONDEV_OFFSET, "\\DEV\\CON"));
+    CHECK(test_far_streq(&runtime.cpu, boot.bios_segment, MD_MSDOS2_AUXDEV_OFFSET, "\\DEV\\AUX"));
+    CHECK(test_far_streq(&runtime.cpu, boot.bios_segment, MD_MSDOS2_PRNDEV_OFFSET, "\\DEV\\PRN"));
 
     CHECK(md_x86_read16(&runtime.cpu, boot.bios_segment, MD_MSDOS2_EXEC_BLOCK_OFFSET + 0u) == 0u);
     CHECK(md_x86_read16(&runtime.cpu, boot.bios_segment, MD_MSDOS2_EXEC_BLOCK_OFFSET + 2u) == MD_MSDOS2_COMMAND_TAIL_OFFSET);
@@ -1316,9 +1333,17 @@ static void test_msdos2_postinit_continuation(uint8_t *memory)
     CHECK(md_x86_read8(&runtime.cpu, boot.bios_segment, MD_MSDOS2_COMMAND_TAIL_OFFSET + 3u) == 0x0Du);
 }
 
+/* M12.3: the postinit program must reproduce SYSINIT's standard-handle
+   setup before EXEC. The fake DOS below records every INT 21h function so
+   the exact order can be checked. */
 typedef struct TestPostinitEnv {
     MdMsdos2Boot boot;
     unsigned execs;
+    uint8_t calls[32];
+    uint16_t call_bx[32];
+    unsigned call_count;
+    unsigned next_dup;
+    bool fail_open_con;
 } TestPostinitEnv;
 
 static bool test_postinit_interrupt_hook(MdRuntime *runtime, uint8_t vector, void *user)
@@ -1329,8 +1354,46 @@ static bool test_postinit_interrupt_hook(MdRuntime *runtime, uint8_t vector, voi
     if (vector == 0x21u) {
         const uint8_t ah = md_x86_get_reg8(cpu, 4u);
         const uint8_t al = md_x86_get_reg8(cpu, 0u);
+        const uint16_t seg = env->boot.bios_segment;
+        if (env->call_count < 32u) {
+            env->calls[env->call_count] = ah;
+            env->call_bx[env->call_count] = cpu->r[MD_X86_BX];
+            ++env->call_count;
+        }
+        if (ah == 0x3Eu) {                       /* CLOSE */
+            cpu->flags &= (uint16_t)~MD_X86_FLAG_CF;
+            return true;
+        }
+        if (ah == 0x3Du) {                       /* OPEN */
+            CHECK(cpu->ds == seg);
+            if (cpu->r[MD_X86_DX] == MD_MSDOS2_CONDEV_OFFSET) {
+                CHECK(al == 2u);
+                CHECK(test_far_streq(cpu, seg, MD_MSDOS2_CONDEV_OFFSET, "\\DEV\\CON"));
+                if (env->fail_open_con) {
+                    cpu->flags |= MD_X86_FLAG_CF;
+                    cpu->r[MD_X86_AX] = 2u;      /* file not found */
+                    return true;
+                }
+                cpu->r[MD_X86_AX] = 0u;          /* lowest free handle */
+                env->next_dup = 1u;
+            } else if (cpu->r[MD_X86_DX] == MD_MSDOS2_AUXDEV_OFFSET) {
+                CHECK(al == 2u);
+                cpu->r[MD_X86_AX] = 3u;
+            } else {
+                CHECK(cpu->r[MD_X86_DX] == MD_MSDOS2_PRNDEV_OFFSET);
+                CHECK(al == 1u);
+                cpu->r[MD_X86_AX] = 4u;
+            }
+            cpu->flags &= (uint16_t)~MD_X86_FLAG_CF;
+            return true;
+        }
+        if (ah == 0x45u) {                       /* XDUP */
+            CHECK(cpu->r[MD_X86_BX] == 0u);
+            cpu->r[MD_X86_AX] = (uint16_t)env->next_dup++;
+            cpu->flags &= (uint16_t)~MD_X86_FLAG_CF;
+            return true;
+        }
         if (ah == 0x4Bu && al == 0u) {
-            const uint16_t seg = env->boot.bios_segment;
             CHECK(cpu->ds == seg);
             CHECK(cpu->es == seg);
             CHECK(cpu->r[MD_X86_DX] == MD_MSDOS2_POSTINIT_PATH_OFFSET);
@@ -1390,14 +1453,65 @@ static void test_msdos2_postinit_program_execution(uint8_t *memory)
     runtime.cpu.flags = MD_X86_FLAG_ALWAYS1;
 
     CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_RETURN_INT, &env.boot));
-    reason = md_interp_run(&runtime, 100u);
+    reason = md_interp_run(&runtime, 1000u);
     CHECK(reason == MD_STOP_HALT);
     CHECK(env.execs == 1u);
+    CHECK(!env.boot.postinit_stdio_failed);
+
+    /* SYSINIT order: CLOSE 0, CLOSE 2..9, OPEN CON, CLOSE 1, XDUP, XDUP,
+       OPEN AUX, OPEN PRN, EXEC. */
+    {
+        static const uint8_t kExpect[] = {
+            0x3Eu,
+            0x3Eu, 0x3Eu, 0x3Eu, 0x3Eu, 0x3Eu, 0x3Eu, 0x3Eu, 0x3Eu,
+            0x3Du, 0x3Eu, 0x45u, 0x45u, 0x3Du, 0x3Du, 0x4Bu
+        };
+        unsigned i;
+        CHECK(env.call_count == sizeof(kExpect));
+        for (i = 0u; i < sizeof(kExpect) && i < env.call_count; ++i) {
+            CHECK(env.calls[i] == kExpect[i]);
+        }
+        CHECK(env.call_bx[0] == 0u);             /* close stdin */
+        for (i = 1u; i <= MD_MSDOS2_SYSINIT_FILES; ++i) {
+            CHECK(env.call_bx[i] == (uint16_t)(i + 1u)); /* close 2..9 */
+        }
+        CHECK(env.call_bx[10] == 1u);            /* close stdout after OPEN */
+    }
     CHECK(runtime.cpu.cs == 0x3000u);
     CHECK(runtime.cpu.ds == 0x3000u);
     CHECK(runtime.cpu.es == 0x3000u);
     CHECK(runtime.cpu.ss == 0x3000u);
     CHECK(runtime.cpu.ip == (uint16_t)(MD_MSDOS2_COMMAND_ENTRY_OFFSET + 1u));
+}
+
+static void test_msdos2_postinit_stdio_failure(uint8_t *memory)
+{
+    MdRuntime runtime;
+    TestPostinitEnv env;
+    MdHooks hooks = {0};
+    MdStopReason reason;
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    memset(&env, 0, sizeof(env));
+    md_msdos2_boot_init(&env.boot);
+    env.boot.continue_after_dosinit = true;
+    env.fail_open_con = true;
+    hooks.interrupt = test_postinit_interrupt_hook;
+    hooks.user = &env;
+    md_runtime_init(&runtime, memory, &hooks);
+    md_msdos2_boot_install_devices(&runtime, &env.boot);
+    runtime.cpu.ss = env.boot.stack_segment;
+    runtime.cpu.r[MD_X86_SP] = 0xFFFEu;
+    runtime.cpu.flags = MD_X86_FLAG_ALWAYS1;
+
+    CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_RETURN_INT, &env.boot));
+    reason = md_interp_run(&runtime, 1000u);
+    CHECK(reason == MD_STOP_HALT);
+    CHECK(env.execs == 0u);                      /* never EXEC on bootstrap SFT */
+    CHECK(env.boot.postinit_completed);
+    CHECK(!env.boot.postinit_succeeded);
+    CHECK(env.boot.postinit_stdio_failed);
+    CHECK(env.boot.postinit_error == 2u);
 }
 
 
@@ -1456,6 +1570,7 @@ int main(void)
     test_msdos2_disk_device_contract(memory);
     test_msdos2_postinit_continuation(memory);
     test_msdos2_postinit_program_execution(memory);
+    test_msdos2_postinit_stdio_failure(memory);
     test_ivt(memory);
 
     free(memory);

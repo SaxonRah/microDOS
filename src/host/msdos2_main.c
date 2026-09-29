@@ -938,6 +938,10 @@ int main(int argc, char **argv)
                boot.postinit_completed ? "yes" : "no",
                boot.postinit_succeeded ? "yes" : "no",
                (unsigned)boot.postinit_error);
+        printf("[system] stdio=%s\n",
+               boot.postinit_stdio_failed ? "FAILED (OPEN \\DEV\\CON / XDUP)"
+               : boot.command_entered     ? "CON opened + XDUP to 1,2 (SYSINIT contract)"
+                                          : "not reached");
         printf("[system] command_entered=%s segment=%04X image_match=%s psp_valid=%s\n",
                boot.command_entered ? "yes" : "no",
                boot.command_segment,

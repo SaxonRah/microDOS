@@ -366,3 +366,28 @@ sequence. The trace records whether `$` was already inside the caller's CX or wa
 first byte beyond it, and checks the REP scan's actual post-CX/DI against the expected
 8086 result. This distinguishes a COMMAND-side scan/count error from a DOS write-loop
 overrun without changing guest behavior.
+
+## 29. Standard handles come from SYSINIT's real OPEN/XDUP contract
+
+The M12.2 capture proved COMMAND.COM's `STRING_OUT` scan was exact (16 bytes,
+terminator excluded) yet the kernel's cooked console loop `WRCONLP`
+(`MSDOS.SYS 1000:18D8`) was entered with CX=0800h: the 17th byte (`$`) was
+output with the loop counter at 07F0h = 0800h - 16.
+
+Root cause: in DOS 2, handle I/O is FCB record I/O. `$Write` calls
+`$FCB_RANDOM_WRITE_BLOCK` with CX as a *record count* on the FCB embedded in the
+SFT entry, and `SETUP` multiplies by `fcb_RECSIZ`, substituting 128 when it is
+zero. Only `$Open` sets `sf_FCB.fcb_RECSIZ = 1` ("byte io only"). DOSINIT merely
+points JFN 0/1/2 at a bootstrap SFT entry 0 so internal console messages work;
+Microsoft's SYSINIT then closes those handles, OPENs `\DEV\CON`, and XDUPs it to
+STDOUT/STDERR before EXEC. The M11 continuation skipped that step, so every
+COMMAND.COM handle write was multiplied by 128.
+
+The guest-side continuation now performs SYSINIT's exact sequence: CLOSE 0,
+CLOSE 2..FILES+1, OPEN `\DEV\CON` (read/write), CLOSE 1, XDUP, XDUP, OPEN
+`\DEV\AUX`, OPEN `\DEV\PRN`, then EXEC. A failed CON OPEN or XDUP stops through a
+dedicated native vector (`F5h`) rather than executing COMMAND.COM on the
+bootstrap SFT entry. AUX/PRN failures are ignored (SYSINIT falls back to NUL).
+
+General rule: when the host stands in for a Microsoft init component, it
+reproduces that component's DOS calls, not just its final register state.

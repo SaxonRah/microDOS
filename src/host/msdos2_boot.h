@@ -32,6 +32,12 @@
 #define MD_MSDOS2_COMMAND_TAIL_OFFSET 0x0660u
 #define MD_MSDOS2_FCB1_OFFSET 0x0700u
 #define MD_MSDOS2_FCB2_OFFSET 0x0720u
+/* M12.3: SYSINIT standard-handle device names ("\DEV\CON" etc.). */
+#define MD_MSDOS2_CONDEV_OFFSET 0x0740u
+#define MD_MSDOS2_AUXDEV_OFFSET 0x0750u
+#define MD_MSDOS2_PRNDEV_OFFSET 0x0760u
+/* SYSINIT.ASM FILES default; used for the close-everything loop. */
+#define MD_MSDOS2_SYSINIT_FILES 8u
 #define MD_MSDOS2_COMMAND_ENTRY_OFFSET 0x0100u
 
 #define MD_MSDOS2_NATIVE_STRATEGY_INT 0xF0u
@@ -39,6 +45,7 @@
 #define MD_MSDOS2_NATIVE_RETURN_INT 0xF2u
 #define MD_MSDOS2_NATIVE_POSTINIT_OK_INT 0xF3u
 #define MD_MSDOS2_NATIVE_POSTINIT_FAIL_INT 0xF4u
+#define MD_MSDOS2_NATIVE_POSTINIT_STDIO_FAIL_INT 0xF5u
 
 typedef void (*MdMsdos2ConsoleWriteHook)(void *user, const uint8_t *data, size_t size);
 typedef bool (*MdMsdos2ConsolePeekHook)(void *user, uint8_t *value);
@@ -83,6 +90,7 @@ typedef struct MdMsdos2Boot {
     bool postinit_completed;
     bool postinit_succeeded;
     uint16_t postinit_error;
+    bool postinit_stdio_failed;
 
     bool command_entered;
     bool command_image_match;
