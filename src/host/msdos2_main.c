@@ -2,6 +2,7 @@
 #include "microdos/runtime.h"
 #include "msdos2_boot.h"
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -436,8 +437,74 @@ static void md_trace_dump(const MdTraceRing *ring, const MdRuntime *runtime,
 typedef struct MdHostDisk {
     uint8_t *data;
     size_t size;
+    /* M12.5: every sector DOS writes goes straight to the image file, so a
+       killed or crashed host loses nothing DOS already wrote. `dirty` now
+       only means "a write-through failed; save the whole image at exit". */
+    FILE *file;
     bool dirty;
+    uint32_t write_through_errors;
 } MdHostDisk;
+
+/* M12.5 host break: Ctrl+Break (Windows) or SIGINT (POSIX) requests a
+   graceful stop instead of killing the process. On Windows, Ctrl+C is not a
+   host signal at all while DOS runs: it is delivered to DOS as byte 03h. */
+static volatile sig_atomic_t g_md_host_break = 0;
+
+#if defined(_WIN32)
+static HANDLE g_md_console_in = INVALID_HANDLE_VALUE;
+static DWORD g_md_console_mode = 0;
+static bool g_md_console_mode_saved = false;
+
+static void md_host_console_restore(void)
+{
+    if (g_md_console_mode_saved) {
+        (void)SetConsoleMode(g_md_console_in, g_md_console_mode);
+        g_md_console_mode_saved = false;
+    }
+}
+
+static BOOL WINAPI md_host_ctrl_handler(DWORD type)
+{
+    switch (type) {
+        case CTRL_C_EVENT:
+        case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT:
+            g_md_host_break = 1;
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+
+static void md_host_break_install(void)
+{
+    g_md_console_in = GetStdHandle(STD_INPUT_HANDLE);
+    if (g_md_console_in != INVALID_HANDLE_VALUE &&
+        GetConsoleMode(g_md_console_in, &g_md_console_mode)) {
+        g_md_console_mode_saved = true;
+        /* Without processed input, Ctrl+C reaches _getch() as 03h. */
+        (void)SetConsoleMode(g_md_console_in,
+                             g_md_console_mode & ~(DWORD)ENABLE_PROCESSED_INPUT);
+        (void)atexit(md_host_console_restore);
+    }
+    (void)SetConsoleCtrlHandler(md_host_ctrl_handler, TRUE);
+}
+#else
+static void md_host_sigint(int sig)
+{
+    (void)sig;
+    g_md_host_break = 1;
+}
+
+static void md_host_console_restore(void)
+{
+}
+
+static void md_host_break_install(void)
+{
+    (void)signal(SIGINT, md_host_sigint);
+}
+#endif
 
 typedef struct MdHostConsole {
     FILE *out;
@@ -622,7 +689,15 @@ static bool md_host_disk_write(void *user, uint32_t sector, const uint8_t *data,
     if (size != 512u || offset > disk->size || disk->size - offset < size) return false;
     md_host_idle_reset();
     memcpy(disk->data + offset, data, size);
-    disk->dirty = true;
+    if (disk->file == NULL ||
+        fseek(disk->file, (long)offset, SEEK_SET) != 0 ||
+        fwrite(data, 1u, size, disk->file) != size ||
+        fflush(disk->file) != 0) {
+        /* Keep going from the in-memory copy; the whole image is saved at
+           exit as a fallback. */
+        ++disk->write_through_errors;
+        disk->dirty = true;
+    }
     return true;
 }
 
@@ -771,6 +846,11 @@ int main(int argc, char **argv)
             free(image);
             return 2;
         }
+        disk.file = fopen(disk_path, "r+b");
+        if (disk.file == NULL) {
+            fprintf(stderr, "microDOS: warning: %s is not writable; DOS writes are saved only at exit\n",
+                    disk_path);
+        }
         if (command_path != NULL) {
             command = md_read_file(command_path, &command_size);
             if (command == NULL) {
@@ -817,13 +897,19 @@ int main(int argc, char **argv)
     md_runtime_set_block_cache(&runtime, &cache);
     md_msdos2_boot_prepare_cpu(&runtime, &boot, image, image_size);
 
+    md_host_break_install();
+
     printf("microDOS MS-DOS 2.0 %s\n", system_mode ? "system bring-up" : "kernel bring-up");
     printf("  image:   %s (%zu bytes)\n", path, image_size);
     printf("  kernel:  %04X:0000 -> DOSINIT %04X:%04X\n",
            boot.dos_segment, boot.dos_segment, MD_DOSINIT_OFFSET);
     printf("  devices: %04X:%04X CON -> AUX -> PRN -> CLOCK -> DISK\n",
            boot.bios_segment, MD_MSDOS2_CON_OFFSET);
-    if (system_mode) printf("  disk:    %s (%zu bytes)\n", disk_path, disk.size);
+    if (system_mode) {
+        printf("  disk:    %s (%zu bytes, %s)\n", disk_path, disk.size,
+               disk.file != NULL ? "write-through" : "saved at exit");
+        puts("  keys:    Ctrl+C -> DOS ^C, Ctrl+] -> exit, Ctrl+Break -> emergency exit");
+    }
     printf("  memory:  %u paragraphs (%u KiB)\n",
            boot.memory_paragraphs, (unsigned)(boot.memory_paragraphs / 64u));
     if (budget == UINT64_MAX) {
@@ -954,6 +1040,11 @@ int main(int argc, char **argv)
                 puts("\n[host] Ctrl+] requested; stopping microDOS");
                 runtime.stop_reason = MD_STOP_HALT;
             }
+            if (g_md_host_break && runtime.stop_reason == MD_STOP_NONE) {
+                puts("\n[host] break requested; stopping microDOS");
+                console.quit_requested = true;
+                runtime.stop_reason = MD_STOP_HALT;
+            }
             if (reason != MD_STOP_NONE || runtime.stop_reason != MD_STOP_NONE) break;
         }
     }
@@ -1022,6 +1113,17 @@ int main(int argc, char **argv)
                (unsigned)runtime.fault_linear, runtime.fault_opcode);
     }
     md_dump_cpu(&runtime);
+
+    if (system_mode) {
+        printf("[disk] write-through=%s errors=%u\n",
+               disk.file != NULL ? "on" : "off",
+               (unsigned)disk.write_through_errors);
+        if (disk.file != NULL) {
+            (void)fclose(disk.file);
+            disk.file = NULL;
+        }
+    }
+    md_host_console_restore();
 
     if (system_mode && disk.dirty) {
         if (!md_write_file(disk_path, disk.data, disk.size)) {

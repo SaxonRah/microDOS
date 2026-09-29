@@ -153,7 +153,7 @@ try {
             Write-Host ''
             Write-Host '[capture] Interactive DOS run starting.'
             Write-Host '[capture] Keyboard remains attached to the real console.'
-            Write-Host '[capture] Use Ctrl+] to leave microDOS when string tracing is disabled.'
+            Write-Host '[capture] Ctrl+] exits microDOS. Ctrl+C goes to DOS as ^C. Disk writes are saved immediately.'
 
             if ($TraceDisk) {
                 $env:MICRODOS_TRACE_DISK = '1'

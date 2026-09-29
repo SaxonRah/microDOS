@@ -414,3 +414,24 @@ interpreter, and the CON/CLOCK/DISK device boundary together. Host-side
 counters (bytes written, sectors written) remain the oracle for the device
 layer; DOS2TEST is the oracle for guest-visible behavior. It leaves the
 persistent image as it found it, so it can be re-run on the same disk.
+
+## 32. The disk image is written through, sector by sector
+
+The FAT12 image is persistent guest state (#26), so its durability must not
+depend on how the host process ends. The first interactive COPY CON session
+lost its file because the image was saved only after a clean Ctrl+] exit and
+the user left with Ctrl+C, which Windows turned into process termination.
+
+Each DOS sector write now updates the in-memory image and the image file
+immediately (fseek/fwrite/fflush). The whole-image save at exit remains only
+as a fallback when a write-through fails. This matches a real floppy: once the
+block driver returns DONE, the sector is on the medium.
+
+## 33. Ctrl+C is guest input, not a host signal
+
+On a PC, Ctrl+C is a DOS keystroke (03h, handled by DOS's ^C checks and
+INT 23h). The Windows runner therefore clears ENABLE_PROCESSED_INPUT for the
+session so Ctrl+C reaches `_getch()` as 03h, and restores the console mode at
+exit. Host-level interruption is Ctrl+] (normal) or Ctrl+Break / window close
+(emergency); both set a flag the main loop polls, so every stop path runs the
+same shutdown code. POSIX builds treat SIGINT the same way.

@@ -244,6 +244,17 @@ is preserved between runs; use `md.bat image dos2` to reset it.
 ```
 
 
+### M12.5 disk writes survive any exit; Ctrl+C belongs to DOS
+
+Every sector DOS writes is now written straight through to
+`build-disk\msdos2.img`, so files survive even if the host process is killed.
+(Previously the image was saved only on a clean Ctrl+] exit, and a Ctrl+C in
+the console killed the process and discarded the session's writes.)
+
+While DOS runs, Ctrl+C is delivered to DOS as `^C`, as on a real PC.
+Ctrl+] is the normal way out; Ctrl+Break (or closing the window) is an
+emergency exit that still stops cleanly.
+
 ### M12.4 usable interactive shell and DOS2TEST
 
 `md.bat run dos2` now runs with an unlimited budget by default (a budget of 0
