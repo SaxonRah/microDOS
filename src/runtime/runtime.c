@@ -6,10 +6,12 @@ void md_runtime_reset(MdRuntime *runtime)
 {
     uint8_t *memory = runtime->cpu.memory;
     MdHooks hooks = runtime->hooks;
+    uint32_t code_epoch = runtime->code_epoch;
     memset(runtime, 0, sizeof(*runtime));
     runtime->cpu.memory = memory;
     runtime->cpu.flags = MD_X86_FLAG_ALWAYS1;
     runtime->hooks = hooks;
+    runtime->code_epoch = code_epoch != 0u ? code_epoch : 1u;
 }
 
 void md_runtime_init(MdRuntime *runtime, uint8_t *memory, const MdHooks *hooks)
@@ -17,6 +19,7 @@ void md_runtime_init(MdRuntime *runtime, uint8_t *memory, const MdHooks *hooks)
     memset(runtime, 0, sizeof(*runtime));
     runtime->cpu.memory = memory;
     runtime->cpu.flags = MD_X86_FLAG_ALWAYS1;
+    runtime->code_epoch = 1u;
     if (hooks != NULL) {
         runtime->hooks = *hooks;
     }
@@ -47,6 +50,13 @@ void md_runtime_load_com(MdRuntime *runtime, const uint8_t *data, size_t size, u
     runtime->cpu.ss = segment;
     runtime->cpu.ip = 0x0100u;
     runtime->cpu.r[MD_X86_SP] = 0xFFFEu;
+    md_runtime_invalidate_code(runtime);
+}
+
+void md_runtime_invalidate_code(MdRuntime *runtime)
+{
+    ++runtime->code_epoch;
+    if (runtime->code_epoch == 0u) runtime->code_epoch = 1u;
 }
 
 void md_runtime_request_exit(MdRuntime *runtime, uint8_t exit_code)

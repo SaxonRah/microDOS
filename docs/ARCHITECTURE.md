@@ -3,44 +3,42 @@
 ## Execution model
 
 ```text
-                         executable image
-                               |
-                        dosrecomp analysis
-                               |
-                 +-------------+-------------+
-                 |                           |
-            known AOT block            unresolved code
-                 |                           |
-                 v                           v
-          generated native C          8086 interpreter
-                 |                           |
-                 +-------------+-------------+
-                               |
-                         guest CS:IP
-                               |
-                           MdRuntime
-                               |
-             +-----------------+----------------+
-             |                 |                |
-          memory           interrupts           I/O
-             |                 |                |
-         20-bit RAM       DOS / BIOS / IVT    devices
+                              guest CS:IP
+                                  |
+                   +--------------+--------------+
+                   |                             |
+             known AOT block              interpreted region
+                   |                             |
+                   |                   +---------+---------+
+                   |                   |                   |
+                   |              decoded cache       opcode decoder
+                   |                   |                   |
+                   |                   +---------+---------+
+                   |                             |
+                   +--------------+--------------+
+                                  |
+                              MdRuntime
+                                  |
+                 +----------------+----------------+
+                 |                |                |
+              memory          interrupts           I/O
+                 |                |                |
+             20-bit RAM      DOS / BIOS / IVT    devices
 ```
 
-Generated code and interpreted code use the same `MdRuntime` and `MdX86`. A known guest offset enters a generated C block. An unknown offset executes through the interpreter; when the interpreter reaches a known offset again, execution returns to AOT.
-
-The current mixed-mode fallback checks dispatch after each interpreted instruction. This is intentionally the correctness-first implementation. The high-performance version will execute cached decoded blocks and return to the common dispatcher only at block boundaries.
+Generated code, cached interpretation, and canonical opcode interpretation all use the same `MdRuntime` / `MdX86`. Execution mode changes control-flow representation; it does not change the architectural machine state.
 
 ## CPU state and shared semantics
 
 `MdX86` stores AX/CX/DX/BX/SP/BP/SI/DI, ES/CS/SS/DS, IP, FLAGS, and the guest-memory base. Register order follows 8086 opcode encoding.
 
-`include/microdos/ops.h` is shared by the interpreter and generated C for arithmetic and FLAGS behavior. Recompilation changes control-flow representation, not instruction semantics.
+`include/microdos/ops.h` is shared by every execution path for arithmetic and FLAGS behavior:
 
 ```text
-interpreter opcode ----+
-                       +--> shared op helper --> MdX86
-AOT generated C -------+
+opcode interpreter ----+
+                       |
+decoded block cache ---+--> shared op helper --> MdX86
+generated AOT C -------+
 ```
 
 Future ADC/SBB, shifts/rotates, logic, multiply/divide, BCD, and string primitives should follow the same rule.
@@ -55,7 +53,9 @@ physical = ((segment << 4) + offset) & 0xFFFFF
 
 Host builds use a normal 1 MiB allocation. Pico Plus 2 is intended to back this directly with PSRAM so ordinary guest memory accesses remain pointer-based.
 
-Decoded-block invalidation for self-modifying code will be page-granular. Pages become tracked only when executable code is decoded/AOT-associated; ordinary data pages should avoid expensive cache-maintenance work.
+`MdRuntime` also carries a `code_epoch`. Loading a new COM image advances the epoch. Cached decoded blocks record that epoch, so old blocks become misses without a table clear. `md_runtime_invalidate_code()` provides a coarse explicit invalidation hook.
+
+Automatic self-modifying-code support will move from this global generation to executable-page generations. Pages should become tracked only when decoded/AOT code references them so normal data writes remain cheap.
 
 ## Interrupts
 
@@ -70,7 +70,67 @@ IP = word [vector*4]
 CS = word [vector*4+2]
 ```
 
-AOT code advances guest IP before calling the shared interrupt routine, matching the interpreter's architectural return address.
+AOT and cached execution advance guest IP before calling the shared interrupt routine, matching the canonical interpreter's return address.
+
+## Canonical opcode interpreter
+
+`md_interp_run()` is the authoritative dynamic decoder. GCC/Clang builds can use direct-threaded dispatch for hot opcode classes; MSVC uses the portable switch path. `md_interp_step()` executes exactly one guest instruction and is used at mixed-mode boundaries.
+
+This layer remains important even after the block cache is complete because it is the simplest correctness fallback for an instruction form that a higher tier has not learned yet.
+
+## Decoded block cache
+
+`MdBlockCache` is a caller-owned, fixed-size direct-mapped cache. The default configuration is:
+
+```text
+128 block slots
+16 decoded ops per block
+~17.5 KiB total storage
+```
+
+There is no allocation in the run loop. A cache lookup is keyed by full guest `CS:IP` plus `MdRuntime::code_epoch`; using full `CS:IP` rather than only the 20-bit linear address preserves near-control-flow semantics under real-mode aliasing.
+
+A miss decodes one basic block. Decoding stops at:
+
+- conditional or unconditional control flow;
+- CALL/RET;
+- INT;
+- HLT;
+- an unsupported opcode;
+- the configured maximum decoded-op count.
+
+An unsupported opcode becomes a one-instruction fallback block:
+
+```text
+cached block
+    |
+unsupported opcode
+    |
+md_interp_step()
+    |
+new CS:IP
+    |
+cache lookup
+```
+
+### Super-ops
+
+Decoded interpretation is allowed to fuse instruction patterns when architectural behavior remains exact. The first super-op is:
+
+```asm
+dec r16
+jnz target
+```
+
+The cache stores this as one decoded operation but records a guest count of two. This removes one dispatch from a very common loop idiom.
+
+Instruction budgets remain exact. If a budget ends after the `DEC` but before the `JNZ`, the cached executor temporarily uses `md_interp_step()` so the externally visible stop point is still between the original instructions.
+
+### Direct self-chaining
+
+If executing a cached block leaves `CS:IP` equal to that same block's entry address, the executor immediately repeats the decoded block without another hash lookup. This is the first direct-block chaining optimization and is particularly useful for tight DOS loops on an in-order microcontroller core.
+
+General inter-block links are intentionally deferred until they can be profiled against real DOS workloads. An attempted more-general edge link in development slowed the tight-loop fast path, so it was not retained.
 
 ## dosrecomp CFG
 
@@ -123,42 +183,40 @@ md_fallback:
     goto md_dispatch;
 ```
 
-Known branches currently return through the dispatcher. Once executable-page generations exist, safe hot edges can chain directly without a central switch.
+The next mixed-mode optimization is to let generated AOT code hand an unknown region to the decoded cache until the guest reaches a known AOT address again, instead of retrying after every fallback instruction.
 
 ## Hybrid proof
 
-`tests/programs/hybrid.com` intentionally contains an instruction supported by the interpreter but not by the first AOT decoder:
+`tests/programs/hybrid.com` intentionally contains `MOV BX,AX` (`89 C3`), supported by the canonical interpreter but left out of the first static AOT decoder and the first cache predecoder.
+
+The tests now prove both forms of mixed execution:
 
 ```text
-AOT 0100  mov ax,1234h
-AOT 0103  jz 0108h       ; not taken
-             |
-             v
-fallback 0105
-interp    mov bx,ax      ; 89 C3
-interp    nop
-             |
-             v
-AOT 0108  hlt
+AOT -> canonical interpreter -> AOT
+cache -> canonical interpreter -> cache
 ```
 
-The test verifies `BX == 1234h` and exactly five guest instructions executed. This is the first real proof that the two paths form one execution engine rather than two separate demos.
+Both preserve `AX == BX == 1234h` and execute exactly five guest instructions.
 
-## Interpreter performance plan
+## Performance tiers
 
-The normal interpreter remains `md_interp_run()`. GCC/Clang uses direct-threaded dispatch for hot opcodes; MSVC keeps switch dispatch for portability. `md_interp_step()` is not the performance path.
+Representative Release measurements on the development container for the 131,072-instruction loop:
 
-Next layers:
+```text
+GCC threaded baseline       ~245 MIPS
+cached decoded interpreter  ~346 MIPS
+generated AOT               ~499 MIPS
+```
 
-1. complete 8086/8088 instruction and prefix coverage;
-2. factor decode into a shared instruction-description layer;
-3. hot ModR/M forms in threaded handlers;
-4. decoded basic-block cache keyed by guest address + executable-page generation;
-5. interpreted block return to the common AOT dispatcher;
-6. safe direct block chaining;
-7. block counters for AOT candidate discovery.
+When the baseline interpreter is deliberately forced to switch dispatch:
 
-The current validation machine measured roughly 257 MIPS for threaded interpretation and 506 MIPS for generated AOT on the same branch-heavy guest loop. These are host regression measurements, not RP2350 predictions. Switch-dispatch interpretation measured roughly 192 MIPS in the same run.
+```text
+switch baseline             ~186 MIPS
+cached decoded interpreter  ~389 MIPS
+generated AOT               ~503 MIPS
+```
+
+These are host regression figures, not RP2350 predictions. They demonstrate the intended tiering: cached interpretation can materially outperform repeated opcode decode while remaining fully portable C, and AOT still has additional headroom.
 
 ## Hardware boundary
 
@@ -171,4 +229,4 @@ platform/pico2
        +--> MicroConsole/catBUS --> controls, SD, USB
 ```
 
-The CPU/recompiler core remains platform-neutral so the same execution state can be tested on desktop and RP2350.
+The CPU/recompiler core remains platform-neutral so the same execution state can be differential-tested on desktop and RP2350.

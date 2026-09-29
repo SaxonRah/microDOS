@@ -41,12 +41,15 @@ struct MdRuntime {
     uint32_t fault_linear;
     uint8_t fault_opcode;
     uint8_t exit_code;
+    uint32_t code_epoch;
 };
 
 void md_runtime_init(MdRuntime *runtime, uint8_t *memory, const MdHooks *hooks);
 void md_runtime_reset(MdRuntime *runtime);
 void md_runtime_load_com(MdRuntime *runtime, const uint8_t *data, size_t size, uint16_t segment);
 void md_runtime_request_exit(MdRuntime *runtime, uint8_t exit_code);
+/* Coarse code-cache invalidation. Page-granular tracking will replace this later. */
+void md_runtime_invalidate_code(MdRuntime *runtime);
 
 /* Returns true when a host/native hook handled the interrupt. If it did not,
    the function performs real-mode 8086 interrupt-vector dispatch through the IVT. */

@@ -9,7 +9,11 @@ option(MD_BUILD_HOST "Build the desktop validation runner" ON)
 option(MD_BUILD_TESTS "Build runtime tests" ON)
 option(MD_FORCE_SWITCH_DISPATCH "Disable GNU/Clang direct-threaded interpreter dispatch" OFF)
 
-add_library(microdos_runtime STATIC src/runtime/runtime.c src/runtime/x86_interp.c)
+add_library(microdos_runtime STATIC
+    src/runtime/runtime.c
+    src/runtime/x86_interp.c
+    src/runtime/x86_block_cache.c
+)
 add_library(microdos::runtime ALIAS microdos_runtime)
 target_include_directories(microdos_runtime PUBLIC "${CMAKE_CURRENT_LIST_DIR}/include" PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/runtime")
 if((CMAKE_C_COMPILER_ID MATCHES "GNU|Clang") AND NOT MD_FORCE_SWITCH_DISPATCH)
@@ -21,6 +25,7 @@ add_executable(dosrecomp tools/dosrecomp/main.c)
 if(MSVC)
     target_compile_options(microdos_runtime PRIVATE /W4 /permissive- $<$<CONFIG:Release>:/O2>)
     target_compile_options(dosrecomp PRIVATE /W4 /permissive- $<$<CONFIG:Release>:/O2>)
+    target_compile_definitions(dosrecomp PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(microdos_runtime PRIVATE -Wall -Wextra -Wpedantic $<$<CONFIG:Release>:-O3>)
     target_compile_options(dosrecomp PRIVATE -Wall -Wextra -Wpedantic $<$<CONFIG:Release>:-O3>)

@@ -82,3 +82,25 @@ The CPU/recompiler runtime stays platform-neutral. Pico integration will connect
 - MicroConsole/catBUS for controls, SD, and hardware integration.
 
 This keeps the execution core testable on the desktop without hardware.
+
+## 10. Decoded interpretation is a separate optimized tier
+
+Milestone 2 adds `MdBlockCache` rather than replacing the canonical opcode interpreter. The three layers have distinct jobs:
+
+```text
+AOT             fastest known code
+block cache     fastest general interpreted code
+opcode interp   canonical decoder / unsupported fallback
+```
+
+The cache is caller-owned and fixed-size. It performs no allocation while executing and is small enough to live in RP2350 internal SRAM. A direct-mapped table is intentional for the first implementation: lookup is cheap, replacement is deterministic, and correctness never depends on retaining a block.
+
+Decoded blocks may use semantically exact super-ops. The first is `DEC r16` + `JNZ rel8`, a common loop shape. It counts as two guest instructions even though the cached executor handles it as one decoded operation. If an instruction budget ends between the two guest instructions, execution falls back to the canonical single-step interpreter for the boundary case.
+
+Hot self-loops chain directly without hashing the guest `CS:IP` again on every iteration. More general edge chaining should be added only when it improves real workloads without slowing this hot path.
+
+## 11. Code-cache correctness uses generations
+
+`MdRuntime::code_epoch` is advanced whenever a new COM image is loaded and can be advanced explicitly with `md_runtime_invalidate_code()`. Cached blocks record the epoch in which they were decoded, so stale entries become instant misses without clearing the whole table.
+
+This is deliberately coarse. Automatic page-granular executable-write tracking is still required before cached interpretation is safe for arbitrary self-modifying programs. Until that exists, software that modifies executable bytes without notifying the runtime must use the canonical interpreter or explicitly invalidate the cache.
