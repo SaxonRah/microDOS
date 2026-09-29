@@ -9,6 +9,8 @@
 
 #if defined(_WIN32)
 #include <conio.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #else
 #include <sys/select.h>
 #include <unistd.h>
@@ -442,7 +444,36 @@ typedef struct MdHostConsole {
     bool have_pending;
     uint8_t pending;
     bool quit_requested;
+    /* M12.4 idle yield: consecutive "no key" polls with no console output,
+       console input, or disk traffic in between. */
+    uint32_t idle_polls;
+    uint32_t idle_sleeps;
 } MdHostConsole;
+
+/* An idle DOS prompt spins on CON non-destructive read (func 5). After this
+   many consecutive empty polls with no other activity, the host sleeps ~1 ms
+   per poll. DOS's own ^C checks during output never get this far because
+   every write resets the counter. */
+#define MD_IDLE_POLL_THRESHOLD 256u
+
+static MdHostConsole *g_md_idle_console = NULL;
+
+static void md_host_idle_reset(void)
+{
+    if (g_md_idle_console != NULL) g_md_idle_console->idle_polls = 0u;
+}
+
+static void md_host_idle_sleep(void)
+{
+#if defined(_WIN32)
+    Sleep(1);
+#else
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 1000;
+    (void)select(0, NULL, NULL, NULL, &tv);
+#endif
+}
 
 static uint8_t *md_read_file(const char *path, size_t *size_out)
 {
@@ -527,6 +558,7 @@ static void md_host_console_write(void *user, const uint8_t *data, size_t size)
 {
     MdHostConsole *console = (MdHostConsole *)user;
     if (size == 0u) return;
+    console->idle_polls = 0u;
     (void)fwrite(data, 1u, size, console->out);
     (void)fflush(console->out);
 }
@@ -535,9 +567,16 @@ static bool md_host_console_peek(void *user, uint8_t *value)
 {
     MdHostConsole *console = (MdHostConsole *)user;
     if (!console->have_pending) {
-        if (!md_host_console_fetch(console, false, &console->pending)) return false;
+        if (!md_host_console_fetch(console, false, &console->pending)) {
+            if (++console->idle_polls >= MD_IDLE_POLL_THRESHOLD) {
+                ++console->idle_sleeps;
+                md_host_idle_sleep();
+            }
+            return false;
+        }
         console->have_pending = true;
     }
+    console->idle_polls = 0u;
     *value = console->pending;
     return true;
 }
@@ -545,6 +584,7 @@ static bool md_host_console_peek(void *user, uint8_t *value)
 static bool md_host_console_read(void *user, uint8_t *value)
 {
     MdHostConsole *console = (MdHostConsole *)user;
+    console->idle_polls = 0u;
     if (console->have_pending) {
         *value = console->pending;
         console->have_pending = false;
@@ -570,6 +610,7 @@ static bool md_host_disk_read(void *user, uint32_t sector, uint8_t *data, size_t
     MdHostDisk *disk = (MdHostDisk *)user;
     const size_t offset = (size_t)sector * size;
     if (size != 512u || offset > disk->size || disk->size - offset < size) return false;
+    md_host_idle_reset();
     memcpy(data, disk->data + offset, size);
     return true;
 }
@@ -579,6 +620,7 @@ static bool md_host_disk_write(void *user, uint32_t sector, const uint8_t *data,
     MdHostDisk *disk = (MdHostDisk *)user;
     const size_t offset = (size_t)sector * size;
     if (size != 512u || offset > disk->size || disk->size - offset < size) return false;
+    md_host_idle_reset();
     memcpy(disk->data + offset, data, size);
     disk->dirty = true;
     return true;
@@ -689,11 +731,14 @@ int main(int argc, char **argv)
     uint32_t command_scan_sequence = 0u;
     uint32_t user_write_sequence = 0u;
     const bool trace_first_dollar = md_env_enabled("MICRODOS_TRACE_FIRST_DOLLAR");
+    const bool trace_disk = md_env_enabled("MICRODOS_TRACE_DISK");
     bool trace_stop = false;
 
     if (argc > 2) {
+        /* M12.4: 0 means unlimited. Interactive DOS sessions idle at the
+           prompt indefinitely; Ctrl+] is the normal way out. */
         budget = (uint64_t)strtoull(argv[2], NULL, 0);
-        if (budget == 0u) budget = 1u;
+        if (budget == 0u) budget = UINT64_MAX;
     }
     if (argc > 3) {
         disk_path = argv[3];
@@ -748,6 +793,7 @@ int main(int argc, char **argv)
     md_msdos2_boot_init(&boot);
     md_host_clock_init(&boot);
     console.out = stdout;
+    g_md_idle_console = &console;
     boot.console.write = md_host_console_write;
     boot.console.peek = md_host_console_peek;
     boot.console.read = md_host_console_read;
@@ -780,7 +826,14 @@ int main(int argc, char **argv)
     if (system_mode) printf("  disk:    %s (%zu bytes)\n", disk_path, disk.size);
     printf("  memory:  %u paragraphs (%u KiB)\n",
            boot.memory_paragraphs, (unsigned)(boot.memory_paragraphs / 64u));
-    printf("  budget:  %llu guest instructions\n", (unsigned long long)budget);
+    if (budget == UINT64_MAX) {
+        puts("  budget:  unlimited (Ctrl+] exits)");
+    } else {
+        printf("  budget:  %llu guest instructions\n", (unsigned long long)budget);
+    }
+    if (system_mode && trace_disk) {
+        puts("  trace:   disk requests after COMMAND.COM (MICRODOS_TRACE_DISK)");
+    }
     if (system_mode && trace_first_dollar) {
         puts("  trace:   stop/dump on first post-COMMAND '$' CON byte");
     }
@@ -855,7 +908,15 @@ int main(int argc, char **argv)
                            boot.last_request_function,
                            boot.request_segment, boot.request_offset, status);
                 } else if (system_mode && boot.last_device_offset == MD_MSDOS2_DISK_OFFSET &&
-                           (status & 0x8000u) == 0u && disk_traces < 24u) {
+                           (status & 0x8000u) == 0u &&
+                           /* M12.4: MEDIA CHECK/BUILD BPB are counted, never
+                              printed; transfers are printed during boot only
+                              (they would interleave with DOS output), or
+                              always with MICRODOS_TRACE_DISK=1. */
+                           boot.last_request_function != 1u &&
+                           boot.last_request_function != 2u &&
+                           (!boot.command_entered || trace_disk) &&
+                           (disk_traces < 24u || trace_disk)) {
                     if (boot.last_request_function == 4u || boot.last_request_function == 8u ||
                         boot.last_request_function == 9u) {
                         const uint16_t count = md_x86_read16(&runtime.cpu, boot.request_segment,
@@ -915,6 +976,13 @@ int main(int argc, char **argv)
            (unsigned)boot.console_write_calls,
            (unsigned)boot.console_bytes_written,
            (unsigned)boot.console_dollar_writes);
+    if (console.idle_sleeps != 0u) {
+        printf("[host] idle sleeps=%u (CON polled with no input)\n",
+               (unsigned)console.idle_sleeps);
+    }
+    if (runtime.stop_reason == MD_STOP_BUDGET && console.idle_polls >= MD_IDLE_POLL_THRESHOLD) {
+        puts("[boot] budget ran out while DOS was idle waiting for console input");
+    }
     printf("[boot] dosinit_entered=%s dosinit_returned=%s\n",
            boot.entered_dosinit ? "yes" : "no",
            boot.returned_from_dosinit ? "yes" : "no");

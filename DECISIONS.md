@@ -391,3 +391,26 @@ bootstrap SFT entry. AUX/PRN failures are ignored (SYSINIT falls back to NUL).
 
 General rule: when the host stands in for a Microsoft init component, it
 reproduces that component's DOS calls, not just its final register state.
+
+## 30. Interactive runs are unbounded; idle is a host concern
+
+A finite instruction budget is right for regression runs and wrong for a
+shell: DOS legitimately spends unbounded time polling CON at a prompt. Budget 0
+now means unlimited and is the `run dos2` default. `boot msdos2` and tests keep
+finite budgets.
+
+Idle detection lives in the host console callbacks, not in the DOS device
+layer: after 256 consecutive empty CON polls with no console output, console
+input, or disk transfer in between, each further empty poll sleeps ~1 ms.
+DOS's own ^C checks during output never reach the threshold because every
+write resets the counter. The Pico backend can map the same point to a
+low-power wait without changing the DOS request-packet code.
+
+## 31. DOS conformance is tested from inside DOS
+
+`DOS2TEST.COM` runs at the real `A>` prompt and checks INT 21h results
+itself, so it exercises the released kernel, COMMAND.COM's EXEC path, the
+interpreter, and the CON/CLOCK/DISK device boundary together. Host-side
+counters (bytes written, sectors written) remain the oracle for the device
+layer; DOS2TEST is the oracle for guest-visible behavior. It leaves the
+persistent image as it found it, so it can be re-run on the same disk.

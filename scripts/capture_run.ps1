@@ -3,7 +3,8 @@ param(
     [ValidateSet('dos2', 'host')]
     [string]$Target = 'dos2',
 
-    [int]$Budget = 5000000,
+    # 0 = unlimited (interactive default). Use a finite budget for scripted runs.
+    [long]$Budget = 0,
 
     [switch]$ResetDisk,
     [switch]$SkipClean,
@@ -11,6 +12,10 @@ param(
     [switch]$SkipTests,
     [switch]$SkipRun,
     [switch]$NoStringTrace,
+    # M12.4: the M12.2 '$' diagnostic is now opt-in. -NoStringTrace is still
+    # accepted for old command lines and is the default behavior.
+    [switch]$StringTrace,
+    [switch]$TraceDisk,
 
     [string]$LogDirectory = 'logs',
     [string]$LogName,
@@ -100,9 +105,14 @@ try {
     Write-Host "[capture] repo:        $repoRoot"
     Write-Host "[capture] target:      $Target"
     if ($Target -eq 'dos2') {
-        Write-Host "[capture] budget:      $Budget"
+        if ($Budget -gt 0) {
+            Write-Host "[capture] budget:      $Budget"
+        } else {
+            Write-Host "[capture] budget:      unlimited"
+        }
         Write-Host "[capture] reset disk:  $([bool]$ResetDisk)"
-        Write-Host "[capture] string trace:$(-not [bool]$NoStringTrace)"
+        Write-Host "[capture] string trace:$([bool]$StringTrace -and -not [bool]$NoStringTrace)"
+        Write-Host "[capture] disk trace:  $([bool]$TraceDisk)"
     }
     Write-Host "[capture] log:         $logPath"
 
@@ -145,17 +155,20 @@ try {
             Write-Host '[capture] Keyboard remains attached to the real console.'
             Write-Host '[capture] Use Ctrl+] to leave microDOS when string tracing is disabled.'
 
-            if ($NoStringTrace) {
+            if ($TraceDisk) {
+                $env:MICRODOS_TRACE_DISK = '1'
+            } else {
+                Remove-Item Env:MICRODOS_TRACE_DISK -ErrorAction SilentlyContinue
+            }
+
+            if ($NoStringTrace -or -not $StringTrace) {
                 Remove-Item Env:MICRODOS_TRACE_FIRST_DOLLAR -ErrorAction SilentlyContinue
             } else {
                 $env:MICRODOS_TRACE_FIRST_DOLLAR = '1'
                 Write-Host "[capture] M12.2 diagnostic: first post-COMMAND '$' write will dump COMMAND AH=40/STRING_OUT origin plus the guest trace and stop."
             }
 
-            $args = @('run', 'dos2')
-            if ($Budget -gt 0) {
-                $args += [string]$Budget
-            }
+            $args = @('run', 'dos2', [string]$Budget)
 
             Invoke-MdStep -Name 'RUN DOS2' -Arguments $args -AllowFailure
             $runExitCode = $script:LastMdExitCode

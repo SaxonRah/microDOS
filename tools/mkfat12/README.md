@@ -21,7 +21,17 @@ FDh media byte
 ```
 
 The image contains the pinned released `COMMAND.COM` as `COMMAND.COM` beginning at
-cluster 2.
+cluster 2. Additional files can be placed after it:
+
+```
+mkfat12 --command COMMAND.COM --add tests\dos2\DOS2TEST.COM DOS2TEST.COM --output msdos2.img
+```
+
+`md.bat image dos2` adds `tests\dos2\DOS2TEST.COM` when it exists.
+
+Every directory entry is stamped 1983-03-08 12:00 so the image stays
+deterministic. (DOS 2 `DIR` omits the date and time columns entirely when the
+date word is zero.)
 
 Normally invoke it through:
 

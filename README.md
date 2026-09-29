@@ -244,6 +244,30 @@ is preserved between runs; use `md.bat image dos2` to reset it.
 ```
 
 
+### M12.4 usable interactive shell and DOS2TEST
+
+`md.bat run dos2` now runs with an unlimited budget by default (a budget of 0
+means unlimited; Ctrl+] exits). While DOS sits at a prompt polling CON, the
+host sleeps about 1 ms per poll after 256 consecutive empty polls, so an idle
+prompt no longer pins a host core. MEDIA CHECK and BUILD BPB requests are
+counted but never printed, and disk transfers are only printed during boot,
+so DOS output is no longer interleaved with `[disk]` lines
+(`capture.bat -TraceDisk` or `MICRODOS_TRACE_DISK=1` restores them). The
+M12.2 `$` diagnostic is now opt-in (`capture.bat -StringTrace`).
+
+The FAT12 image now carries `DOS2TEST.COM`, a self-checking program covering
+about 50 INT 21h services, including handle and FCB file I/O, directories,
+memory allocation, and EXEC. Reset the disk once to get it, then run it at
+the prompt:
+
+```
+.\md.bat image dos2
+.\capture.bat
+A>DOS2TEST
+```
+
+See `tests/dos2/README.md`.
+
 ### M12.3 standard handles (fix for the M12 `$` flood)
 
 The M12.2 capture showed COMMAND.COM's `STRING_OUT` count was correct and the

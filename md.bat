@@ -5,7 +5,7 @@ rem
 rem   .\md.bat deps msdos
 rem   .\md.bat build host
 rem   .\md.bat run host
-rem   .\md.bat run dos2 [budget]    (interactive; Ctrl+] exits)
+rem   .\md.bat run dos2 [budget]    (interactive; Ctrl+] exits; 0/omitted = unlimited)
 rem   .\md.bat test
 rem   .\md.bat bench [rounds]
 rem   .\md.bat recomp input.com name [code-end]
@@ -62,7 +62,7 @@ if /i "%~1"=="host" goto run_host
 if /i "%~1"=="dos2" goto run_dos2
 echo Usage:
 echo   .\md.bat run host
-echo   .\md.bat run dos2 [budget]    ^(interactive; Ctrl+] exits^)
+echo   .\md.bat run dos2 [budget]    ^(interactive; Ctrl+] exits; 0/omitted = unlimited^)
 exit /b 1
 
 :run_host
@@ -76,7 +76,7 @@ exit /b %ERRORLEVEL%
 
 :run_dos2
 set "RUN_BUDGET=%~2"
-if "%RUN_BUDGET%"=="" set "RUN_BUDGET=5000000"
+if "%RUN_BUDGET%"=="" set "RUN_BUDGET=0"
 call :ensure_dos2_image || exit /b 1
 set "RUN_EXE=%MD_ROOT%\build-host\microdos_msdos2.exe"
 if exist "%MD_ROOT%\build-host\Release\microdos_msdos2.exe" set "RUN_EXE=%MD_ROOT%\build-host\Release\microdos_msdos2.exe"
@@ -160,7 +160,9 @@ if not exist "%MD_ROOT%\third_party\msdos\v2.0\bin\COMMAND.COM" (
 if not exist "%MD_ROOT%\build-disk" mkdir "%MD_ROOT%\build-disk" || exit /b 1
 set "MKFAT_EXE=%MD_ROOT%\build-host\mkfat12.exe"
 if exist "%MD_ROOT%\build-host\Release\mkfat12.exe" set "MKFAT_EXE=%MD_ROOT%\build-host\Release\mkfat12.exe"
-"%MKFAT_EXE%" --command "%MD_ROOT%\third_party\msdos\v2.0\bin\COMMAND.COM" --output "%MD_ROOT%\build-disk\msdos2.img"
+set "MKFAT_EXTRA="
+if exist "%MD_ROOT%\tests\dos2\DOS2TEST.COM" set MKFAT_EXTRA=--add "%MD_ROOT%\tests\dos2\DOS2TEST.COM" DOS2TEST.COM
+"%MKFAT_EXE%" --command "%MD_ROOT%\third_party\msdos\v2.0\bin\COMMAND.COM" %MKFAT_EXTRA% --output "%MD_ROOT%\build-disk\msdos2.img"
 exit /b %ERRORLEVEL%
 
 
@@ -217,7 +219,7 @@ echo.
 echo   .\md.bat deps msdos
 echo   .\md.bat build host
 echo   .\md.bat run host
-echo   .\md.bat run dos2 [budget]    ^(interactive; Ctrl+] exits^)
+echo   .\md.bat run dos2 [budget]    ^(interactive; Ctrl+] exits; 0/omitted = unlimited^)
 echo   .\md.bat test
 echo   .\md.bat bench [rounds]
 echo   .\md.bat recomp input.com name [code-end]
