@@ -16,141 +16,138 @@ static inline unsigned md_x86_even_parity8(uint8_t value)
     return (0x9669u >> value) & 1u;
 }
 
+/* SZP on the raw word; only used by eager (materialised) paths. */
 static inline void md_x86_set_szp8(MdX86 *cpu, uint8_t value)
 {
-    cpu->flags &= (uint16_t)~(MD_X86_FLAG_SF | MD_X86_FLAG_ZF | MD_X86_FLAG_PF);
-    if (value == 0u) cpu->flags |= MD_X86_FLAG_ZF;
-    if ((value & 0x80u) != 0u) cpu->flags |= MD_X86_FLAG_SF;
-    if (md_x86_even_parity8(value)) cpu->flags |= MD_X86_FLAG_PF;
+    cpu->flags_raw &= (uint16_t)~(MD_X86_FLAG_SF | MD_X86_FLAG_ZF | MD_X86_FLAG_PF);
+    if (value == 0u) cpu->flags_raw |= MD_X86_FLAG_ZF;
+    if ((value & 0x80u) != 0u) cpu->flags_raw |= MD_X86_FLAG_SF;
+    if (md_x86_even_parity8(value)) cpu->flags_raw |= MD_X86_FLAG_PF;
 }
 
 static inline void md_x86_set_szp16(MdX86 *cpu, uint16_t value)
 {
-    cpu->flags &= (uint16_t)~(MD_X86_FLAG_SF | MD_X86_FLAG_ZF | MD_X86_FLAG_PF);
-    if (value == 0u) cpu->flags |= MD_X86_FLAG_ZF;
-    if ((value & 0x8000u) != 0u) cpu->flags |= MD_X86_FLAG_SF;
-    if (md_x86_even_parity8((uint8_t)value)) cpu->flags |= MD_X86_FLAG_PF;
+    cpu->flags_raw &= (uint16_t)~(MD_X86_FLAG_SF | MD_X86_FLAG_ZF | MD_X86_FLAG_PF);
+    if (value == 0u) cpu->flags_raw |= MD_X86_FLAG_ZF;
+    if ((value & 0x8000u) != 0u) cpu->flags_raw |= MD_X86_FLAG_SF;
+    if (md_x86_even_parity8((uint8_t)value)) cpu->flags_raw |= MD_X86_FLAG_PF;
 }
 
+/* M18: the hot ALU operations only record their inputs and result; flags
+   are derived on demand (x86.h). Results are unchanged. */
 static inline uint8_t md_x86_add8(MdX86 *cpu, uint8_t a, uint8_t b)
 {
-    const uint16_t wide = (uint16_t)a + (uint16_t)b;
-    const uint8_t result = (uint8_t)wide;
-    cpu->flags &= (uint16_t)~(MD_X86_FLAG_CF | MD_X86_FLAG_AF | MD_X86_FLAG_OF);
-    if ((wide & 0x100u) != 0u) cpu->flags |= MD_X86_FLAG_CF;
-    if (((a ^ b ^ result) & 0x10u) != 0u) cpu->flags |= MD_X86_FLAG_AF;
-    if (((~(a ^ b) & (a ^ result)) & 0x80u) != 0u) cpu->flags |= MD_X86_FLAG_OF;
-    md_x86_set_szp8(cpu, result);
+    const uint8_t result = (uint8_t)(a + b);
+    md_x86_lazy(cpu, MD_LAZY_ADD8, a, b, result);
     return result;
 }
 
 static inline uint16_t md_x86_add16(MdX86 *cpu, uint16_t a, uint16_t b)
 {
-    const uint32_t wide = (uint32_t)a + (uint32_t)b;
-    const uint16_t result = (uint16_t)wide;
-    cpu->flags &= (uint16_t)~(MD_X86_FLAG_CF | MD_X86_FLAG_AF | MD_X86_FLAG_OF);
-    if ((wide & 0x10000u) != 0u) cpu->flags |= MD_X86_FLAG_CF;
-    if (((a ^ b ^ result) & 0x10u) != 0u) cpu->flags |= MD_X86_FLAG_AF;
-    if (((~(a ^ b) & (a ^ result)) & 0x8000u) != 0u) cpu->flags |= MD_X86_FLAG_OF;
-    md_x86_set_szp16(cpu, result);
+    const uint16_t result = (uint16_t)(a + b);
+    md_x86_lazy(cpu, MD_LAZY_ADD16, a, b, result);
     return result;
 }
 
 static inline uint8_t md_x86_adc8(MdX86 *cpu, uint8_t a, uint8_t b)
 {
-    const unsigned carry = (cpu->flags & MD_X86_FLAG_CF) != 0u;
-    const uint16_t wide = (uint16_t)((uint16_t)a + (uint16_t)b + (uint16_t)carry);
-    const int16_t signed_wide = (int16_t)(int8_t)a + (int16_t)(int8_t)b + (int16_t)carry;
-    const uint8_t result = (uint8_t)wide;
-    cpu->flags &= (uint16_t)~(MD_X86_FLAG_CF | MD_X86_FLAG_AF | MD_X86_FLAG_OF);
-    if (wide > 0xFFu) cpu->flags |= MD_X86_FLAG_CF;
-    if (((a & 0x0Fu) + (b & 0x0Fu) + carry) > 0x0Fu) cpu->flags |= MD_X86_FLAG_AF;
-    if (signed_wide < -128 || signed_wide > 127) cpu->flags |= MD_X86_FLAG_OF;
-    md_x86_set_szp8(cpu, result);
+    const unsigned carry = (unsigned)md_x86_cf(cpu);
+    const uint8_t result = (uint8_t)(a + b + carry);
+    cpu->lazy_carry = (uint8_t)carry;
+    md_x86_lazy(cpu, MD_LAZY_ADC8, a, b, result);
     return result;
 }
 
 static inline uint16_t md_x86_adc16(MdX86 *cpu, uint16_t a, uint16_t b)
 {
-    const unsigned carry = (cpu->flags & MD_X86_FLAG_CF) != 0u;
-    const uint32_t wide = (uint32_t)a + (uint32_t)b + carry;
-    const int32_t signed_wide = (int32_t)(int16_t)a + (int32_t)(int16_t)b + (int32_t)carry;
-    const uint16_t result = (uint16_t)wide;
-    cpu->flags &= (uint16_t)~(MD_X86_FLAG_CF | MD_X86_FLAG_AF | MD_X86_FLAG_OF);
-    if (wide > 0xFFFFu) cpu->flags |= MD_X86_FLAG_CF;
-    if (((a & 0x0Fu) + (b & 0x0Fu) + carry) > 0x0Fu) cpu->flags |= MD_X86_FLAG_AF;
-    if (signed_wide < -32768 || signed_wide > 32767) cpu->flags |= MD_X86_FLAG_OF;
-    md_x86_set_szp16(cpu, result);
+    const unsigned carry = (unsigned)md_x86_cf(cpu);
+    const uint16_t result = (uint16_t)(a + b + carry);
+    cpu->lazy_carry = (uint8_t)carry;
+    md_x86_lazy(cpu, MD_LAZY_ADC16, a, b, result);
     return result;
 }
 
 static inline uint8_t md_x86_sub8(MdX86 *cpu, uint8_t a, uint8_t b)
 {
     const uint8_t result = (uint8_t)(a - b);
-    cpu->flags &= (uint16_t)~(MD_X86_FLAG_CF | MD_X86_FLAG_AF | MD_X86_FLAG_OF);
-    if (a < b) cpu->flags |= MD_X86_FLAG_CF;
-    if (((a ^ b ^ result) & 0x10u) != 0u) cpu->flags |= MD_X86_FLAG_AF;
-    if ((((a ^ b) & (a ^ result)) & 0x80u) != 0u) cpu->flags |= MD_X86_FLAG_OF;
-    md_x86_set_szp8(cpu, result);
+    md_x86_lazy(cpu, MD_LAZY_SUB8, a, b, result);
     return result;
 }
 
 static inline uint16_t md_x86_sub16(MdX86 *cpu, uint16_t a, uint16_t b)
 {
     const uint16_t result = (uint16_t)(a - b);
-    cpu->flags &= (uint16_t)~(MD_X86_FLAG_CF | MD_X86_FLAG_AF | MD_X86_FLAG_OF);
-    if (a < b) cpu->flags |= MD_X86_FLAG_CF;
-    if (((a ^ b ^ result) & 0x10u) != 0u) cpu->flags |= MD_X86_FLAG_AF;
-    if ((((a ^ b) & (a ^ result)) & 0x8000u) != 0u) cpu->flags |= MD_X86_FLAG_OF;
-    md_x86_set_szp16(cpu, result);
+    md_x86_lazy(cpu, MD_LAZY_SUB16, a, b, result);
     return result;
 }
 
 static inline uint8_t md_x86_sbb8(MdX86 *cpu, uint8_t a, uint8_t b)
 {
-    const unsigned borrow = (cpu->flags & MD_X86_FLAG_CF) != 0u;
-    const uint16_t rhs = (uint16_t)((uint16_t)b + (uint16_t)borrow);
-    const int16_t signed_wide = (int16_t)(int8_t)a - (int16_t)(int8_t)b - (int16_t)borrow;
-    const uint8_t result = (uint8_t)((uint16_t)a - rhs);
-    cpu->flags &= (uint16_t)~(MD_X86_FLAG_CF | MD_X86_FLAG_AF | MD_X86_FLAG_OF);
-    if ((uint16_t)a < rhs) cpu->flags |= MD_X86_FLAG_CF;
-    if ((a & 0x0Fu) < ((b & 0x0Fu) + borrow)) cpu->flags |= MD_X86_FLAG_AF;
-    if (signed_wide < -128 || signed_wide > 127) cpu->flags |= MD_X86_FLAG_OF;
-    md_x86_set_szp8(cpu, result);
+    const unsigned borrow = (unsigned)md_x86_cf(cpu);
+    const uint8_t result = (uint8_t)(a - b - borrow);
+    cpu->lazy_carry = (uint8_t)borrow;
+    md_x86_lazy(cpu, MD_LAZY_SBB8, a, b, result);
     return result;
 }
 
 static inline uint16_t md_x86_sbb16(MdX86 *cpu, uint16_t a, uint16_t b)
 {
-    const unsigned borrow = (cpu->flags & MD_X86_FLAG_CF) != 0u;
-    const uint32_t rhs = (uint32_t)b + borrow;
-    const int32_t signed_wide = (int32_t)(int16_t)a - (int32_t)(int16_t)b - (int32_t)borrow;
-    const uint16_t result = (uint16_t)((uint32_t)a - rhs);
-    cpu->flags &= (uint16_t)~(MD_X86_FLAG_CF | MD_X86_FLAG_AF | MD_X86_FLAG_OF);
-    if ((uint32_t)a < rhs) cpu->flags |= MD_X86_FLAG_CF;
-    if ((a & 0x0Fu) < ((b & 0x0Fu) + borrow)) cpu->flags |= MD_X86_FLAG_AF;
-    if (signed_wide < -32768 || signed_wide > 32767) cpu->flags |= MD_X86_FLAG_OF;
-    md_x86_set_szp16(cpu, result);
+    const unsigned borrow = (unsigned)md_x86_cf(cpu);
+    const uint16_t result = (uint16_t)(a - b - borrow);
+    cpu->lazy_carry = (uint8_t)borrow;
+    md_x86_lazy(cpu, MD_LAZY_SBB16, a, b, result);
     return result;
 }
 
 static inline uint8_t md_x86_logic8(MdX86 *cpu, uint8_t value)
 {
-    cpu->flags &= (uint16_t)~(MD_X86_FLAG_CF | MD_X86_FLAG_OF | MD_X86_FLAG_AF);
-    md_x86_set_szp8(cpu, value);
+    md_x86_lazy(cpu, MD_LAZY_LOGIC8, 0u, 0u, value);
     return value;
 }
 
 static inline uint16_t md_x86_logic16(MdX86 *cpu, uint16_t value)
 {
-    cpu->flags &= (uint16_t)~(MD_X86_FLAG_CF | MD_X86_FLAG_OF | MD_X86_FLAG_AF);
-    md_x86_set_szp16(cpu, value);
+    md_x86_lazy(cpu, MD_LAZY_LOGIC16, 0u, 0u, value);
     return value;
+}
+
+/* INC/DEC: like ADD/SUB 1 but CF is preserved (captured once, here). */
+static inline uint8_t md_x86_inc8(MdX86 *cpu, uint8_t a)
+{
+    const uint8_t result = (uint8_t)(a + 1u);
+    cpu->lazy_carry = (uint8_t)md_x86_cf(cpu);
+    md_x86_lazy(cpu, MD_LAZY_INC8, a, 1u, result);
+    return result;
+}
+
+static inline uint16_t md_x86_inc16(MdX86 *cpu, uint16_t a)
+{
+    const uint16_t result = (uint16_t)(a + 1u);
+    cpu->lazy_carry = (uint8_t)md_x86_cf(cpu);
+    md_x86_lazy(cpu, MD_LAZY_INC16, a, 1u, result);
+    return result;
+}
+
+static inline uint8_t md_x86_dec8(MdX86 *cpu, uint8_t a)
+{
+    const uint8_t result = (uint8_t)(a - 1u);
+    cpu->lazy_carry = (uint8_t)md_x86_cf(cpu);
+    md_x86_lazy(cpu, MD_LAZY_DEC8, a, 1u, result);
+    return result;
+}
+
+static inline uint16_t md_x86_dec16(MdX86 *cpu, uint16_t a)
+{
+    const uint16_t result = (uint16_t)(a - 1u);
+    cpu->lazy_carry = (uint8_t)md_x86_cf(cpu);
+    md_x86_lazy(cpu, MD_LAZY_DEC16, a, 1u, result);
+    return result;
 }
 
 static inline uint8_t md_x86_shift8(MdX86 *cpu, unsigned operation,
                                     uint8_t value, unsigned count)
 {
+    md_x86_flags_materialize(cpu);   /* shifts stay eager (M18) */
     uint8_t result = value;
     const uint8_t original = value;
     unsigned i;
@@ -159,7 +156,7 @@ static inline uint8_t md_x86_shift8(MdX86 *cpu, unsigned operation,
     if (count == 0u) return value;
 
     for (i = 0u; i < count; ++i) {
-        const unsigned old_cf = (cpu->flags & MD_X86_FLAG_CF) != 0u;
+        const unsigned old_cf = (cpu->flags_raw & MD_X86_FLAG_CF) != 0u;
         unsigned new_cf = 0u;
         switch (operation & 7u) {
             case 0u: /* ROL */
@@ -192,25 +189,25 @@ static inline uint8_t md_x86_shift8(MdX86 *cpu, unsigned operation,
                 result = (uint8_t)((result >> 1) | (result & 0x80u));
                 break;
         }
-        cpu->flags = (uint16_t)((cpu->flags & (uint16_t)~MD_X86_FLAG_CF) |
+        cpu->flags_raw = (uint16_t)((cpu->flags_raw & (uint16_t)~MD_X86_FLAG_CF) |
                                 (new_cf ? MD_X86_FLAG_CF : 0u));
     }
 
     if ((operation & 7u) >= 4u) md_x86_set_szp8(cpu, result);
 
     if (count == 1u) {
-        cpu->flags &= (uint16_t)~MD_X86_FLAG_OF;
+        cpu->flags_raw &= (uint16_t)~MD_X86_FLAG_OF;
         switch (operation & 7u) {
             case 0u: case 2u: case 4u: case 6u:
-                if ((((result >> 7) & 1u) ^ ((cpu->flags & MD_X86_FLAG_CF) != 0u)) != 0u)
-                    cpu->flags |= MD_X86_FLAG_OF;
+                if ((((result >> 7) & 1u) ^ ((cpu->flags_raw & MD_X86_FLAG_CF) != 0u)) != 0u)
+                    cpu->flags_raw |= MD_X86_FLAG_OF;
                 break;
             case 1u: case 3u:
                 if ((((result >> 7) ^ (result >> 6)) & 1u) != 0u)
-                    cpu->flags |= MD_X86_FLAG_OF;
+                    cpu->flags_raw |= MD_X86_FLAG_OF;
                 break;
             case 5u:
-                if ((original & 0x80u) != 0u) cpu->flags |= MD_X86_FLAG_OF;
+                if ((original & 0x80u) != 0u) cpu->flags_raw |= MD_X86_FLAG_OF;
                 break;
             default: /* SAR */
                 break;
@@ -222,6 +219,7 @@ static inline uint8_t md_x86_shift8(MdX86 *cpu, unsigned operation,
 static inline uint16_t md_x86_shift16(MdX86 *cpu, unsigned operation,
                                       uint16_t value, unsigned count)
 {
+    md_x86_flags_materialize(cpu);   /* shifts stay eager (M18) */
     uint16_t result = value;
     const uint16_t original = value;
     unsigned i;
@@ -230,7 +228,7 @@ static inline uint16_t md_x86_shift16(MdX86 *cpu, unsigned operation,
     if (count == 0u) return value;
 
     for (i = 0u; i < count; ++i) {
-        const unsigned old_cf = (cpu->flags & MD_X86_FLAG_CF) != 0u;
+        const unsigned old_cf = (cpu->flags_raw & MD_X86_FLAG_CF) != 0u;
         unsigned new_cf = 0u;
         switch (operation & 7u) {
             case 0u: /* ROL */
@@ -263,25 +261,25 @@ static inline uint16_t md_x86_shift16(MdX86 *cpu, unsigned operation,
                 result = (uint16_t)((result >> 1) | (result & 0x8000u));
                 break;
         }
-        cpu->flags = (uint16_t)((cpu->flags & (uint16_t)~MD_X86_FLAG_CF) |
+        cpu->flags_raw = (uint16_t)((cpu->flags_raw & (uint16_t)~MD_X86_FLAG_CF) |
                                 (new_cf ? MD_X86_FLAG_CF : 0u));
     }
 
     if ((operation & 7u) >= 4u) md_x86_set_szp16(cpu, result);
 
     if (count == 1u) {
-        cpu->flags &= (uint16_t)~MD_X86_FLAG_OF;
+        cpu->flags_raw &= (uint16_t)~MD_X86_FLAG_OF;
         switch (operation & 7u) {
             case 0u: case 2u: case 4u: case 6u:
-                if ((((result >> 15) & 1u) ^ ((cpu->flags & MD_X86_FLAG_CF) != 0u)) != 0u)
-                    cpu->flags |= MD_X86_FLAG_OF;
+                if ((((result >> 15) & 1u) ^ ((cpu->flags_raw & MD_X86_FLAG_CF) != 0u)) != 0u)
+                    cpu->flags_raw |= MD_X86_FLAG_OF;
                 break;
             case 1u: case 3u:
                 if ((((result >> 15) ^ (result >> 14)) & 1u) != 0u)
-                    cpu->flags |= MD_X86_FLAG_OF;
+                    cpu->flags_raw |= MD_X86_FLAG_OF;
                 break;
             case 5u:
-                if ((original & 0x8000u) != 0u) cpu->flags |= MD_X86_FLAG_OF;
+                if ((original & 0x8000u) != 0u) cpu->flags_raw |= MD_X86_FLAG_OF;
                 break;
             default:
                 break;
@@ -322,29 +320,27 @@ static inline uint16_t md_x86_alu16(MdX86 *cpu, unsigned operation, uint16_t lhs
 
 static inline int md_x86_condition(const MdX86 *cpu, unsigned cc)
 {
-    const unsigned cf = (cpu->flags & MD_X86_FLAG_CF) != 0u;
-    const unsigned pf = (cpu->flags & MD_X86_FLAG_PF) != 0u;
-    const unsigned zf = (cpu->flags & MD_X86_FLAG_ZF) != 0u;
-    const unsigned sf = (cpu->flags & MD_X86_FLAG_SF) != 0u;
-    const unsigned of = (cpu->flags & MD_X86_FLAG_OF) != 0u;
-
+    /* M18: direct lazy predicates; only JP/JNP needs the parity bit. */
     switch (cc & 0x0Fu) {
-        case 0x0u: return of != 0u;
-        case 0x1u: return of == 0u;
-        case 0x2u: return cf != 0u;
-        case 0x3u: return cf == 0u;
-        case 0x4u: return zf != 0u;
-        case 0x5u: return zf == 0u;
-        case 0x6u: return cf != 0u || zf != 0u;
-        case 0x7u: return cf == 0u && zf == 0u;
-        case 0x8u: return sf != 0u;
-        case 0x9u: return sf == 0u;
-        case 0xAu: return pf != 0u;
-        case 0xBu: return pf == 0u;
-        case 0xCu: return sf != of;
-        case 0xDu: return sf == of;
-        case 0xEu: return zf != 0u || sf != of;
-        default:   return zf == 0u && sf == of;
+        case 0x0u: return md_x86_of(cpu);
+        case 0x1u: return !md_x86_of(cpu);
+        case 0x2u: return md_x86_cf(cpu);
+        case 0x3u: return !md_x86_cf(cpu);
+        case 0x4u: return md_x86_zf(cpu);
+        case 0x5u: return !md_x86_zf(cpu);
+        case 0x6u: return md_x86_cf(cpu) || md_x86_zf(cpu);
+        case 0x7u: return !md_x86_cf(cpu) && !md_x86_zf(cpu);
+        case 0x8u: return md_x86_sf(cpu);
+        case 0x9u: return !md_x86_sf(cpu);
+        case 0xAu: case 0xBu: {
+            MdX86 tmp = *cpu;
+            const int pf = (md_x86_flags(&tmp) & MD_X86_FLAG_PF) != 0u;
+            return (cc & 1u) ? !pf : pf;
+        }
+        case 0xCu: return md_x86_sf(cpu) != md_x86_of(cpu);
+        case 0xDu: return md_x86_sf(cpu) == md_x86_of(cpu);
+        case 0xEu: return md_x86_zf(cpu) || md_x86_sf(cpu) != md_x86_of(cpu);
+        default:   return !md_x86_zf(cpu) && md_x86_sf(cpu) == md_x86_of(cpu);
     }
 }
 

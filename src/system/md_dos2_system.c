@@ -29,8 +29,9 @@ void md_dos2_system_set_aot(MdDos2System *sys, const MdAotProgram *const *progra
                             size_t count, bool enabled)
 {
     sys->aot_programs = programs;
-    sys->aot_program_count = count;
-    sys->aot_enabled = enabled && count != 0u;
+    sys->aot_program_count = enabled ? count : 0u;
+    sys->aot_enabled = enabled && (count != 0u || sys->kernel_program != NULL);
+    if (!enabled) sys->kernel_program = NULL;
 }
 
 bool md_dos2_system_start(MdDos2System *sys, const uint8_t *msdos_sys, size_t size)
@@ -40,13 +41,17 @@ bool md_dos2_system_start(MdDos2System *sys, const uint8_t *msdos_sys, size_t si
         return false;
     }
     md_msdos2_boot_prepare_cpu(&sys->runtime, &sys->boot, msdos_sys, size);
+    if (sys->aot_enabled && sys->kernel_program != NULL) {
+        sys->kernel_attached = sys->kernel_program->attach(&sys->runtime, sys->boot.dos_segment);
+        if (sys->kernel_attached) ++sys->aot_attaches;
+    }
     return true;
 }
 
-/* Programs only ever run outside the kernel and OEM/device segments. */
-static bool md_user_segment(const MdDos2System *sys, uint16_t cs)
+void md_dos2_system_set_kernel_aot(MdDos2System *sys, const MdAotProgram *kernel)
 {
-    return cs != sys->boot.dos_segment && cs != sys->boot.bios_segment;
+    sys->kernel_program = kernel;
+    if (kernel != NULL) sys->aot_enabled = true;
 }
 
 /* Returns the program whose compiled code may run at the current CS:IP,
@@ -57,6 +62,9 @@ static const MdAotProgram *md_aot_candidate(MdDos2System *sys)
     const uint16_t cs = rt->cpu.cs;
     size_t i;
 
+    if (cs == sys->boot.dos_segment) {
+        return sys->kernel_attached ? sys->kernel_program : NULL;
+    }
     for (i = 0; i < sys->aot_program_count; ++i) {
         const MdAotProgram *prog = sys->aot_programs[i];
         if (prog->ready(rt, cs)) return prog;
@@ -76,13 +84,43 @@ static bool md_aot_stop(const MdRuntime *rt, void *user)
     const uint16_t cs = rt->cpu.cs;
     size_t i;
 
-    if (!md_user_segment(sys, cs)) return false;
+    if (cs == sys->boot.dos_segment) {
+        return sys->kernel_attached && sys->kernel_program->block_ok(rt, cs, rt->cpu.ip);
+    }
+    if (cs == sys->boot.bios_segment) return false;
     if (rt->cpu.ip == 0x0100u) return true;
     for (i = 0; i < sys->aot_program_count; ++i) {
-        const MdAotProgram *prog = sys->aot_programs[i];
-        if (prog->is_entry(rt->cpu.ip) && prog->ready(rt, cs)) return true;
+        if (sys->aot_programs[i]->block_ok(rt, cs, rt->cpu.ip)) return true;
     }
     return false;
+}
+
+/* The compiled program attached at the current CS, attaching one if DOS has
+   just started it at XXXX:0100. NULL when CS holds no live attachment. */
+static const MdAotProgram *md_aot_here(MdDos2System *sys)
+{
+    MdRuntime *rt = &sys->runtime;
+    const uint16_t cs = rt->cpu.cs;
+    size_t i;
+
+    if (cs == sys->boot.dos_segment) {
+        return sys->kernel_attached && sys->kernel_program->ready(rt, cs) ? sys->kernel_program : NULL;
+    }
+    if (cs == sys->boot.bios_segment) return NULL;
+    /* fast path: the program we entered last, at the same segment */
+    if (sys->aot_last_program != NULL && sys->aot_last_segment == cs &&
+        sys->aot_last_program->ready(rt, cs)) {
+        return sys->aot_last_program;
+    }
+    for (i = 0; i < sys->aot_program_count; ++i) {
+        const MdAotProgram *prog = sys->aot_programs[i];
+        if (prog->ready(rt, cs)) return prog;
+        if (rt->cpu.ip == 0x0100u && prog->attach(rt, cs)) {
+            ++sys->aot_attaches;
+            return prog;
+        }
+    }
+    return NULL;
 }
 
 MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
@@ -97,33 +135,70 @@ MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
         if (used >= budget) break;
         left = budget - used;
 
-        if (sys->aot_enabled && md_aot_stop(rt, sys)) {
-            const MdAotProgram *prog = md_aot_candidate(sys);
-            if (prog != NULL && prog->is_entry(rt->cpu.ip)) {
-                const uint64_t before = rt->instructions;
-                const MdStopReason st =
-                    prog->enter(rt, left < MD_DOS2_AOT_CHUNK ? left : MD_DOS2_AOT_CHUNK);
-                ++sys->aot_enters;
-                sys->aot_last_program = prog;
-                sys->aot_last_segment = rt->cpu.cs;
-                if (st != MD_STOP_NONE) break;
-                if (rt->instructions != before) continue;
-            }
-            /* Not compiled here (or no progress): one canonical instruction
-               guarantees progress past the predicate's trigger point. */
-            (void)md_interp_step(rt);
-            continue;
-        }
-
         if (sys->cache != NULL) {
+            /* Cache mode keeps the M14 shape: predicate-driven hand-off. */
+            if (sys->aot_enabled && md_aot_stop(rt, sys)) {
+                const MdAotProgram *prog = md_aot_candidate(sys);
+                if (prog != NULL && prog->block_ok(rt, rt->cpu.cs, rt->cpu.ip)) {
+                    const uint64_t before = rt->instructions;
+                    const uint64_t before_aot = rt->aot_instructions;
+                    const MdStopReason st =
+                        prog->enter(rt, left < MD_DOS2_AOT_CHUNK ? left : MD_DOS2_AOT_CHUNK);
+                    ++sys->aot_enters;
+                    if (prog == sys->kernel_program) {
+                        sys->kernel_aot_instructions += rt->aot_instructions - before_aot;
+                    }
+                    if (st != MD_STOP_NONE) break;
+                    if (rt->instructions != before) continue;
+                }
+                (void)md_interp_step(rt);
+                continue;
+            }
             (void)md_interp_run_cached_until(rt, sys->cache, left,
                                              sys->aot_enabled ? md_aot_stop : NULL, sys);
             if (rt->stop_reason == MD_STOP_BUDGET) {
                 rt->stop_reason = MD_STOP_NONE;       /* slice boundary, not a stop */
                 break;
             }
-        } else {
-            (void)md_interp_step(rt);
+            continue;
+        }
+
+        if (sys->aot_enabled) {
+            /* M18 cheap re-entry: in a segment holding a live attachment just
+               enter; enter() itself refuses when no compiled block can run at
+               CS:IP (not an entry, invalid chunk), and only then is one
+               instruction interpreted. No separate predicate/block_ok pass. */
+            const MdAotProgram *prog = md_aot_here(sys);
+            if (prog != NULL) {
+                const uint64_t before = rt->instructions;
+                const uint64_t before_aot = rt->aot_instructions;
+                const uint16_t entered_cs = rt->cpu.cs;
+                const MdStopReason st =
+                    prog->enter(rt, left < MD_DOS2_AOT_CHUNK ? left : MD_DOS2_AOT_CHUNK);
+                ++sys->aot_enters;
+                if (prog == sys->kernel_program) {
+                    sys->kernel_aot_instructions += rt->aot_instructions - before_aot;
+                } else {
+                    sys->aot_last_program = prog;
+                    sys->aot_last_segment = entered_cs;
+                }
+                if (st != MD_STOP_NONE) break;
+                if (rt->instructions == before) {
+                    (void)md_interp_step(rt);
+                    ++sys->attached_steps;
+                }
+                continue;
+            }
+        }
+
+        /* M16: kernel, COMMAND.COM and non-compiled programs run on the
+           threaded interpreter. Compiled code can only become reachable
+           through a far transfer, INT or IRET, all of which change CS, so
+           returning on a CS change loses no AOT entry. */
+        (void)md_interp_run_until_cs_change(rt, left);
+        if (rt->stop_reason == MD_STOP_BUDGET) {
+            rt->stop_reason = MD_STOP_NONE;
+            break;
         }
     }
     return rt->stop_reason;

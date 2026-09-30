@@ -5,6 +5,11 @@
 #include "hybrid_recomp.h"
 #include "loop_recomp.h"
 #include "selfmod_recomp.h"
+#include "memloop_recomp.h"
+#include "dos2test_recomp.h"
+#include "xchgself_recomp.h"
+#include "divfault_recomp.h"
+#include "eager_flags_ref.h"
 #include "host_dos.h"
 #include "msdos2_boot.h"
 
@@ -486,6 +491,7 @@ static void test_aot_guard_byte_exact(uint8_t *memory)
 
     md_x86_write8(&runtime.cpu, 0x2000u, 0x0110u, 'X');   /* data byte */
     CHECK(prog->ready(&runtime, 0x2000u));
+    CHECK(prog->block_ok(&runtime, 0x2000u, 0x0100u));
 
     /* Enter compiled code at 0100: MOV AH,9 / MOV DX,010C / INT 21h. With an
        empty IVT the INT leaves the segment, so enter() returns NONE after
@@ -500,7 +506,7 @@ static void test_aot_guard_byte_exact(uint8_t *memory)
     CHECK(md_x86_get_reg8(&runtime.cpu, 4u) == 0x09u);
 
     md_x86_write8(&runtime.cpu, 0x2000u, 0x0102u, 0x90u);   /* instruction byte */
-    CHECK(!prog->ready(&runtime, 0x2000u));
+    CHECK(!prog->block_ok(&runtime, 0x2000u, 0x0100u));
     runtime.cpu.cs = 0x2000u;
     runtime.cpu.ip = 0x0100u;
     {
@@ -508,6 +514,461 @@ static void test_aot_guard_byte_exact(uint8_t *memory)
         CHECK(prog->enter(&runtime, 100u) == MD_STOP_NONE);
         CHECK(runtime.aot_instructions == before);         /* refused */
     }
+}
+
+/* hello.com bytes: code 0100-010B, '$'-terminated string 010C-0122. */
+static const uint8_t kHelloImage[] = {
+    0xB4, 0x09, 0xBA, 0x0C, 0x01, 0xCD, 0x21, 0xB8, 0x00, 0x4C, 0xCD, 0x21,
+    'H','e','l','l','o',' ','f','r','o','m',' ','m','i','c','r','o','D','O','S','!',
+    0x0D, 0x0A, '$'
+};
+
+static void test_load_hello(MdRuntime *rt, uint16_t segment)
+{
+    unsigned i;
+    for (i = 0; i < sizeof(kHelloImage); ++i) {
+        md_x86_write8(&rt->cpu, segment, (uint16_t)(0x0100u + i), kHelloImage[i]);
+    }
+}
+
+/* M15 BUG 1: a word store must be checked byte by byte against AOT guards,
+   including when both bytes sit on the same 4 KiB page. */
+static void test_aot_guard_word_writes(uint8_t *memory)
+{
+    MdRuntime rt;
+    MdHooks hooks = {0};
+    const MdAotProgram *prog = &md_recomp_hello_program;
+
+    /* data (PSP 00FF, outside the image) + code (0100), same page:
+       this is the case that used to be missed. */
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&rt, memory, &hooks);
+    test_load_hello(&rt, 0x2000u);
+    CHECK(prog->attach(&rt, 0x2000u));
+    CHECK(md_x86_code_page(md_x86_linear(0x2000u, 0x00FFu)) ==
+          md_x86_code_page(md_x86_linear(0x2000u, 0x0100u)));
+    md_x86_write16(&rt.cpu, 0x2000u, 0x00FFu, 0x1234u);
+    CHECK(!prog->block_ok(&rt, 0x2000u, 0x0100u));
+
+    /* code (010B, last byte of INT 21h) + data (010C), same page */
+    md_runtime_init(&rt, memory, &hooks);
+    test_load_hello(&rt, 0x2000u);
+    CHECK(prog->attach(&rt, 0x2000u));
+    md_x86_write16(&rt.cpu, 0x2000u, 0x010Bu, 0x21CDu);
+    CHECK(!prog->block_ok(&rt, 0x2000u, 0x0100u));
+
+    /* data + data inside the image: stays valid; page generation still
+       advances exactly once (block cache bookkeeping unchanged). */
+    md_runtime_init(&rt, memory, &hooks);
+    test_load_hello(&rt, 0x2000u);
+    CHECK(prog->attach(&rt, 0x2000u));
+    {
+        const unsigned page = md_x86_code_page(md_x86_linear(0x2000u, 0x0110u));
+        const uint32_t gen = rt.code_page_generation[page];
+        md_x86_write16(&rt.cpu, 0x2000u, 0x0110u, 0x5858u);
+        CHECK(prog->ready(&rt, 0x2000u));
+        CHECK(rt.code_page_generation[page] == gen + 1u);
+    }
+
+    /* cross-page: segment 20F0 puts 00FF at linear 20FFF (page 20h) and
+       0100 at 21000 (page 21h). Data byte on one page, code on the next. */
+    md_runtime_init(&rt, memory, &hooks);
+    test_load_hello(&rt, 0x20F0u);
+    CHECK(prog->attach(&rt, 0x20F0u));
+    CHECK(md_x86_code_page(md_x86_linear(0x20F0u, 0x00FFu)) + 1u ==
+          md_x86_code_page(md_x86_linear(0x20F0u, 0x0100u)));
+    md_x86_write16(&rt.cpu, 0x20F0u, 0x00FFu, 0xB4B4u);
+    CHECK(!prog->block_ok(&rt, 0x20F0u, 0x0100u));
+
+    /* byte stores: data keeps it valid, code invalidates it */
+    md_runtime_init(&rt, memory, &hooks);
+    test_load_hello(&rt, 0x2000u);
+    CHECK(prog->attach(&rt, 0x2000u));
+    md_x86_write8(&rt.cpu, 0x2000u, 0x0115u, 'Y');
+    CHECK(prog->ready(&rt, 0x2000u));
+    CHECK(prog->block_ok(&rt, 0x2000u, 0x0100u));
+    md_x86_write8(&rt.cpu, 0x2000u, 0x0100u, 0xB4u);
+    CHECK(!prog->block_ok(&rt, 0x2000u, 0x0100u));
+}
+
+/* M15 BUG 2 + slot hardening: attachments belong to one runtime and die
+   with its reset/init; the table evicts least-recently-used entries. */
+static void test_aot_attachment_lifetime(uint8_t *memory)
+{
+    MdRuntime a, b;
+    MdHooks hooks = {0};
+    const MdAotProgram *prog = &md_recomp_hello_program;
+    uint8_t *memory_b = (uint8_t *)calloc(1u, MD_X86_ADDRESS_SPACE);
+    unsigned i;
+
+    CHECK(memory_b != NULL);
+    if (memory_b == NULL) return;
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&a, memory, &hooks);
+    md_runtime_init(&b, memory_b, &hooks);
+    test_load_hello(&a, 0x2000u);
+    test_load_hello(&b, 0x2000u);
+
+    CHECK(prog->attach(&a, 0x2000u));
+    CHECK(prog->ready(&a, 0x2000u));
+    CHECK(!prog->ready(&b, 0x2000u));          /* same bytes, other runtime */
+    CHECK(prog->attach(&b, 0x2000u));
+    CHECK(prog->ready(&b, 0x2000u));
+
+    md_x86_write8(&a.cpu, 0x2000u, 0x0100u, 0x90u);   /* A only */
+    CHECK(!prog->block_ok(&a, 0x2000u, 0x0100u));
+    CHECK(prog->ready(&b, 0x2000u));
+
+    md_runtime_reset(&b);                       /* reset drops attachments */
+    CHECK(!prog->ready(&b, 0x2000u));
+    test_load_hello(&b, 0x2000u);
+    CHECK(prog->attach(&b, 0x2000u));
+    CHECK(prog->ready(&b, 0x2000u));
+    md_runtime_init(&b, memory_b, &hooks);      /* so does init */
+    CHECK(!prog->ready(&b, 0x2000u));
+
+    /* A reset runtime must not run compiled code via enter() either. */
+    b.cpu.cs = 0x2000u;
+    b.cpu.ip = 0x0100u;
+    CHECK(prog->enter(&b, 100u) == MD_STOP_NONE);
+    CHECK(b.aot_instructions == 0u);
+
+    /* LRU: attach MD_AOT_ATTACH_SLOTS + 1 copies; the oldest is evicted and
+       falls back to interpretation, the rest stay attached. */
+    md_runtime_init(&a, memory, &hooks);
+    for (i = 0; i <= MD_AOT_ATTACH_SLOTS; ++i) {
+        const uint16_t seg = (uint16_t)(0x3000u + i * 0x100u);
+        test_load_hello(&a, seg);
+        CHECK(prog->attach(&a, seg));
+    }
+    CHECK(a.aot_evictions == 1u);
+    CHECK(!prog->ready(&a, 0x3000u));
+    for (i = 1; i <= MD_AOT_ATTACH_SLOTS; ++i) {
+        CHECK(prog->ready(&a, (uint16_t)(0x3000u + i * 0x100u)));
+    }
+    free(memory_b);
+}
+
+/* M15: memloop.com (the Pico memory benchmark) must leave identical memory,
+   registers and instruction counts in all three engines. */
+static uint32_t test_window_sum(const uint8_t *memory)
+{
+    uint32_t h = 2166136261u;
+    uint32_t i;
+    for (i = 0x8000u; i < 0x10000u; ++i) h = (h ^ memory[i]) * 16777619u;
+    return h;
+}
+
+static void test_memloop_engines(uint8_t *memory)
+{
+    static const uint8_t kMemloop[] = {
+        0xB9,0x00,0x80, 0xBE,0x00,0x80, 0x8A,0x04, 0x04,0x03, 0x88,0x04,
+        0x83,0xC6,0x61, 0x81,0xCE,0x00,0x80, 0x49, 0x75,0xF0, 0xF4
+    };
+    MdRuntime rt;
+    MdHooks hooks = {0};
+    MdBlockCache cache;
+    uint32_t sum_interp, sum_cache, sum_aot;
+    uint16_t si_interp;
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&rt, memory, &hooks);
+    md_runtime_load_com(&rt, kMemloop, sizeof(kMemloop), 0x0000u);
+    CHECK(md_interp_run(&rt, 1000000u) == MD_STOP_HALT);
+    CHECK(rt.instructions == 229379u);
+    sum_interp = test_window_sum(memory);
+    si_interp = rt.cpu.r[MD_X86_SI];
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&rt, memory, &hooks);
+    md_block_cache_init(&cache);
+    md_runtime_load_com(&rt, kMemloop, sizeof(kMemloop), 0x0000u);
+    CHECK(md_interp_run_cached(&rt, &cache, 1000000u) == MD_STOP_HALT);
+    CHECK(rt.instructions == 229379u);
+    sum_cache = test_window_sum(memory);
+    CHECK(rt.cpu.r[MD_X86_SI] == si_interp);
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&rt, memory, &hooks);
+    CHECK(md_recomp_memloop(&rt, 0x0000u, 1000000u) == MD_STOP_HALT);
+    CHECK(rt.instructions == 229379u);
+    CHECK(rt.aot_instructions == 229379u);
+    sum_aot = test_window_sum(memory);
+    CHECK(rt.cpu.r[MD_X86_SI] == si_interp);
+
+    CHECK(sum_interp == sum_cache);
+    CHECK(sum_interp == sum_aot);
+    CHECK(sum_interp != test_window_sum((const uint8_t *)memset(memory, 0, MD_X86_ADDRESS_SPACE)));
+}
+
+/* M16: md_interp_run_until_cs_change() runs near control flow and the new
+   threaded fast paths without stopping, and returns MD_STOP_NONE exactly
+   after the instruction that changed CS. */
+static void test_run_until_cs_change(uint8_t *memory)
+{
+    /* 1000:0100  B9 03 00        mov cx,3
+                  E8 02 00        call +2 (near)        -> 0108
+                  EB 09           jmp  +9               -> 0111
+       1000:0108  50              push ax
+                  58              pop  ax
+                  49              dec  cx
+                  75 FB           jnz  -5               -> 0108 (x3)
+                  C3              ret                   -> 0106
+       1000:0106  (jmp) -> 0111
+       1000:0111  9A 00 00 00 20  call far 2000:0000
+       2000:0000  F4              hlt                                    */
+    static const uint8_t code[] = {
+        0xB9,0x03,0x00, 0xE8,0x02,0x00, 0xEB,0x09,
+        0x50, 0x58, 0x49, 0x75,0xFB, 0xC3,
+        0x90,0x90,0x90,
+        0x9A,0x00,0x00,0x00,0x20
+    };
+    MdRuntime rt;
+    MdHooks hooks = {0};
+    unsigned i;
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&rt, memory, &hooks);
+    for (i = 0; i < sizeof(code); ++i) md_x86_write8(&rt.cpu, 0x1000u, (uint16_t)(0x0100u + i), code[i]);
+    md_x86_write8(&rt.cpu, 0x2000u, 0x0000u, 0xF4u);
+    rt.cpu.cs = 0x1000u; rt.cpu.ip = 0x0100u;
+    rt.cpu.ss = 0x3000u; rt.cpu.r[MD_X86_SP] = 0xFFFEu;
+
+    CHECK(md_interp_run_until_cs_change(&rt, 1000u) == MD_STOP_NONE);
+    CHECK(rt.stop_reason == MD_STOP_NONE);
+    CHECK(rt.cpu.cs == 0x2000u && rt.cpu.ip == 0x0000u);
+    /* mov, call, 3x(push,pop,dec,jnz), ret, jmp, call far = 17 */
+    CHECK(rt.instructions == 17u);
+    CHECK(rt.cpu.r[MD_X86_CX] == 0u);
+
+    /* same CS from here on: runs to HLT like md_interp_run */
+    CHECK(md_interp_run_until_cs_change(&rt, 1000u) == MD_STOP_HALT);
+    CHECK(rt.instructions == 18u);
+
+    /* budget exhaustion without a CS change still reports BUDGET */
+    md_runtime_init(&rt, memory, &hooks);
+    rt.cpu.cs = 0x1000u; rt.cpu.ip = 0x0100u;
+    rt.cpu.ss = 0x3000u; rt.cpu.r[MD_X86_SP] = 0xFFFEu;
+    CHECK(md_interp_run_until_cs_change(&rt, 5u) == MD_STOP_BUDGET);
+    CHECK(rt.instructions == 5u);
+}
+
+/* M17: invalidation is per 64-byte chunk. A store to one compiled byte of
+   DOS2TEST disables only the blocks in that chunk; blocks elsewhere in the
+   same copy stay runnable, and the attachment itself stays live. */
+static void test_aot_chunk_invalidation(uint8_t *memory)
+{
+    MdRuntime rt;
+    MdHooks hooks = {0};
+    const MdAotProgram *prog = &md_recomp_dos2test_program;
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&rt, memory, &hooks);
+    /* standalone entry with a zero budget: loads, attaches, runs nothing */
+    CHECK(md_recomp_dos2test(&rt, 0x2000u, 0u) == MD_STOP_BUDGET);
+    CHECK(prog->ready(&rt, 0x2000u));
+    CHECK(prog->block_ok(&rt, 0x2000u, 0x0258u));    /* t_version */
+    CHECK(prog->block_ok(&rt, 0x2000u, 0x0B26u));    /* t_exec_command */
+    CHECK(!prog->block_ok(&rt, 0x2000u, 0x0259u));   /* not an entry */
+
+    md_x86_write8(&rt.cpu, 0x2000u, 0x0258u, 0xB4u);  /* same byte value */
+    CHECK(prog->ready(&rt, 0x2000u));                 /* attachment lives */
+    CHECK(!prog->block_ok(&rt, 0x2000u, 0x0258u));    /* this chunk is off */
+    CHECK(prog->block_ok(&rt, 0x2000u, 0x0B26u));     /* far chunk still on */
+
+    /* overwriting every compiled byte (DOS loading another program over
+       this copy) kills the attachment, so hosts stop treating the segment
+       as compiled code */
+    {
+        MdRuntime r2;
+        uint32_t i;
+        md_runtime_init(&r2, memory, &hooks);
+        CHECK(md_recomp_dos2test(&r2, 0x2000u, 0u) == MD_STOP_BUDGET);
+        CHECK(prog->ready(&r2, 0x2000u));
+        for (i = 0x0100u; i < 0x0100u + 4448u; ++i) md_x86_write8(&r2.cpu, 0x2000u, (uint16_t)i, 0x90u);
+        CHECK(!prog->ready(&r2, 0x2000u));
+        md_runtime_init(&rt, memory, &hooks);
+        CHECK(md_recomp_dos2test(&rt, 0x2000u, 0u) == MD_STOP_BUDGET);
+        md_x86_write8(&rt.cpu, 0x2000u, 0x0258u, 0xB4u);
+    }
+
+    /* entering at a disabled block makes no compiled progress */
+    rt.stop_reason = MD_STOP_NONE;          /* clear the zero-budget stop above */
+    rt.cpu.cs = 0x2000u;
+    rt.cpu.ip = 0x0258u;
+    rt.cpu.ss = 0x3000u;
+    rt.cpu.r[MD_X86_SP] = 0xFFFEu;
+    {
+        const uint64_t before = rt.aot_instructions;
+        CHECK(prog->enter(&rt, 100u) == MD_STOP_NONE);
+        CHECK(rt.aot_instructions == before);
+    }
+}
+
+/* M17 regression: XCHG [0100h],AH stores into a compiled byte. Compiled
+   code must finish the instruction (load AH) before handing over. */
+static void test_aot_store_completes_instruction(uint8_t *memory)
+{
+    MdRuntime rt;
+    MdHooks hooks = {0};
+    MdBlockCache cache;
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&rt, memory, &hooks);
+    md_block_cache_init(&cache);
+    md_runtime_set_block_cache(&rt, &cache);
+    CHECK(md_recomp_xchgself(&rt, 0x1000u, 100u) == MD_STOP_HALT);
+    CHECK(md_x86_get_reg8(&rt.cpu, 4u) == 0xB4u);
+    CHECK(md_x86_read8(&rt.cpu, 0x1000u, 0x0100u) == 0x42u);
+    CHECK(rt.instructions == 3u);
+}
+
+/* M18: MUL/DIV compiled through the shared interpreter core; the divide
+   fault must stop both engines identically. */
+static void test_aot_muldiv_fault(uint8_t *memory)
+{
+    static const uint8_t kProg[] = {
+        0xB8,0xD2,0x04, 0xB3,0x0A, 0xF6,0xE3, 0xB9,0x07,0x00, 0x31,0xD2,
+        0xF7,0xF1, 0x30,0xDB, 0xF6,0xF3, 0xF4
+    };
+    MdRuntime a, b;
+    MdHooks hooks = {0};
+
+    memset(memory, 0, MD_X86_ADDRESS_SPACE);
+    md_runtime_init(&a, memory, &hooks);
+    md_runtime_load_com(&a, kProg, sizeof(kProg), 0x1000u);
+    CHECK(md_interp_run(&a, 100u) == MD_STOP_FAULT);
+
+    {
+        static uint8_t mem_b[MD_X86_ADDRESS_SPACE];
+        md_runtime_init(&b, mem_b, &hooks);
+        CHECK(md_recomp_divfault(&b, 0x1000u, 100u) == MD_STOP_FAULT);
+        CHECK(b.aot_instructions > 0u);
+    }
+    CHECK(a.instructions == b.instructions);
+    CHECK(a.instructions == 8u);
+    CHECK(a.cpu.ip == b.cpu.ip);
+    CHECK(a.fault_linear == b.fault_linear);
+    CHECK(a.fault_opcode == b.fault_opcode);
+    /* MUL BL multiplies AL only: 0xD2 * 10 = 2100; 2100 / 7 = 300 r 0 */
+    CHECK(a.cpu.r[MD_X86_AX] == b.cpu.r[MD_X86_AX] && a.cpu.r[MD_X86_AX] == 300u);
+    CHECK(a.cpu.r[MD_X86_DX] == b.cpu.r[MD_X86_DX] && a.cpu.r[MD_X86_DX] == 0u);
+    CHECK(md_x86_flags(&a.cpu) == md_x86_flags(&b.cpu));
+}
+
+/* M18: lazy flags must produce exactly the pre-M18 eager flags. Compared
+   against the verbatim eager reference (eager_flags_ref.h): full FLAGS word
+   after materialisation, every condition code before materialisation, and
+   chains where ADC/SBB/INC/DEC take CF from a still-lazy previous result. */
+static uint32_t g_lf_seed = 12345u;
+static uint32_t lf_rand(void)
+{
+    g_lf_seed = g_lf_seed * 1664525u + 1013904223u;
+    return g_lf_seed >> 8;
+}
+
+static int lf_check(const MdX86 *lazy_cpu, uint16_t ref_flags, uint16_t lazy_result, uint16_t ref_result)
+{
+    MdX86 copy = *lazy_cpu;
+    RefCpu rc;
+    unsigned cc;
+    int ok = lazy_result == ref_result;
+    rc.flags = ref_flags;
+    for (cc = 0; cc < 16u; ++cc) {
+        if ((md_x86_condition(lazy_cpu, cc) != 0) != (ref_x86_condition(&rc, cc) != 0)) ok = 0;
+    }
+    if (md_x86_flags(&copy) != ref_flags) ok = 0;
+    return ok;
+}
+
+/* one lazy op vs the eager reference; `prev` selects the state that CF is
+   read from: 0 = materialised flags, 1 = a lazy SUB/ADD result */
+static int lf_one(unsigned op, int wide, unsigned a, unsigned b, uint16_t base, int prev_kind, unsigned pa, unsigned pb)
+{
+    MdX86 c;
+    RefCpu r;
+    unsigned lr, rr;
+    memset(&c, 0, sizeof(c));
+    md_x86_set_flags(&c, base);
+    r.flags = base;
+    if (prev_kind == 1) {              /* leave a lazy SUB behind (CF = pa < pb) */
+        if (wide) { (void)md_x86_sub16(&c, (uint16_t)pa, (uint16_t)pb); (void)ref_x86_sub16(&r, (uint16_t)pa, (uint16_t)pb); }
+        else { (void)md_x86_sub8(&c, (uint8_t)pa, (uint8_t)pb); (void)ref_x86_sub8(&r, (uint8_t)pa, (uint8_t)pb); }
+    } else if (prev_kind == 2) {       /* leave a lazy ADD behind */
+        if (wide) { (void)md_x86_add16(&c, (uint16_t)pa, (uint16_t)pb); (void)ref_x86_add16(&r, (uint16_t)pa, (uint16_t)pb); }
+        else { (void)md_x86_add8(&c, (uint8_t)pa, (uint8_t)pb); (void)ref_x86_add8(&r, (uint8_t)pa, (uint8_t)pb); }
+    }
+    if (op <= 7u) {
+        if (wide) { lr = md_x86_alu16(&c, op, (uint16_t)a, (uint16_t)b); rr = ref_x86_alu16(&r, op, (uint16_t)a, (uint16_t)b); }
+        else { lr = md_x86_alu8(&c, op, (uint8_t)a, (uint8_t)b); rr = ref_x86_alu8(&r, op, (uint8_t)a, (uint8_t)b); }
+        if (op == 7u) { lr = 0u; rr = 0u; }
+    } else {                           /* 8 = INC, 9 = DEC: eager = add/sub 1 + CF restore */
+        const uint16_t cf = r.flags & MD_X86_FLAG_CF;
+        if (wide) {
+            lr = op == 8u ? md_x86_inc16(&c, (uint16_t)a) : md_x86_dec16(&c, (uint16_t)a);
+            rr = op == 8u ? ref_x86_add16(&r, (uint16_t)a, 1u) : ref_x86_sub16(&r, (uint16_t)a, 1u);
+        } else {
+            lr = op == 8u ? md_x86_inc8(&c, (uint8_t)a) : md_x86_dec8(&c, (uint8_t)a);
+            rr = op == 8u ? ref_x86_add8(&r, (uint8_t)a, 1u) : ref_x86_sub8(&r, (uint8_t)a, 1u);
+        }
+        r.flags = (uint16_t)((r.flags & (uint16_t)~MD_X86_FLAG_CF) | cf);
+    }
+    return lf_check(&c, r.flags, (uint16_t)lr, (uint16_t)rr);
+}
+
+static void test_lazy_flags_equivalence(uint8_t *memory)
+{
+    static const uint16_t bases[] = {
+        (uint16_t)(MD_X86_FLAG_ALWAYS1),
+        (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF),
+        (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF | MD_X86_FLAG_ZF | MD_X86_FLAG_OF |
+                   MD_X86_FLAG_AF | MD_X86_FLAG_PF | MD_X86_FLAG_SF | MD_X86_FLAG_DF | MD_X86_FLAG_IF)
+    };
+    static const uint16_t edges[] = { 0u, 1u, 2u, 0x0Fu, 0x10u, 0x7Fu, 0x80u, 0xFFu, 0x100u,
+                                      0x7FFFu, 0x8000u, 0x8001u, 0xFFFEu, 0xFFFFu };
+    unsigned op, a, b, bi, pk, i, j;
+    unsigned long failures = 0, cases = 0;
+    (void)memory;
+
+    /* 8-bit: exhaustive over a, b for every op and every starting CF */
+    for (op = 0; op <= 9u; ++op)
+        for (bi = 0; bi < 3u; ++bi)
+            for (a = 0; a < 256u; ++a)
+                for (b = 0; b < 256u; ++b) {
+                    if (op >= 8u && b != 0u) break;      /* INC/DEC have no b */
+                    if (!lf_one(op, 0, a, b, bases[bi], 0, 0, 0)) ++failures;
+                    ++cases;
+                }
+    /* 8-bit chains: CF comes from a lazy SUB/ADD (both borrow outcomes) */
+    for (op = 0; op <= 9u; ++op)
+        for (pk = 1; pk <= 2u; ++pk)
+            for (i = 0; i < 4u; ++i)
+                for (a = 0; a < 256u; a += 3u)
+                    for (b = 0; b < 256u; b += 5u) {
+                        const unsigned pa = i < 2u ? 0x10u : 0xF0u, pb = (i & 1u) ? 0x20u : 0x05u;
+                        if (!lf_one(op, 0, a, b, bases[0], (int)pk, pa, pb)) ++failures;
+                        ++cases;
+                    }
+    /* 16-bit: all edge pairs, both starting CFs and chains, plus random */
+    for (op = 0; op <= 9u; ++op) {
+        for (i = 0; i < sizeof(edges) / sizeof(edges[0]); ++i)
+            for (j = 0; j < sizeof(edges) / sizeof(edges[0]); ++j)
+                for (bi = 0; bi < 3u; ++bi)
+                    for (pk = 0; pk <= 2u; ++pk) {
+                        if (!lf_one(op, 1, edges[i], edges[j], bases[bi], (int)pk, edges[j], edges[i])) ++failures;
+                        ++cases;
+                    }
+        for (i = 0; i < 40000u; ++i) {
+            const unsigned ra = lf_rand() & 0xFFFFu, rb = lf_rand() & 0xFFFFu;
+            if (!lf_one(op, 1, ra, rb, bases[lf_rand() % 3u], (int)(lf_rand() % 3u),
+                        lf_rand() & 0xFFFFu, lf_rand() & 0xFFFFu)) ++failures;
+            ++cases;
+        }
+    }
+    CHECK(failures == 0u);
+    CHECK(cases > 1000000u);
+    if (failures != 0u) printf("lazy flags: %lu of %lu cases differ from eager\n", failures, cases);
 }
 
 static void test_budget(uint8_t *memory)
@@ -529,26 +990,26 @@ static void test_phase_a_flag_semantics(void)
 {
     MdX86 cpu;
     memset(&cpu, 0, sizeof(cpu));
-    cpu.flags = (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF);
+    md_x86_set_flags(&cpu, (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF));
     CHECK(md_x86_adc8(&cpu, 0x7Fu, 0x00u) == 0x80u);
-    CHECK((cpu.flags & MD_X86_FLAG_OF) != 0u);
-    CHECK((cpu.flags & MD_X86_FLAG_CF) == 0u);
-    CHECK((cpu.flags & MD_X86_FLAG_AF) != 0u);
-    CHECK((cpu.flags & MD_X86_FLAG_SF) != 0u);
+    CHECK((md_x86_flags(&cpu) & MD_X86_FLAG_OF) != 0u);
+    CHECK((md_x86_flags(&cpu) & MD_X86_FLAG_CF) == 0u);
+    CHECK((md_x86_flags(&cpu) & MD_X86_FLAG_AF) != 0u);
+    CHECK((md_x86_flags(&cpu) & MD_X86_FLAG_SF) != 0u);
 
-    cpu.flags = (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF);
+    md_x86_set_flags(&cpu, (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF));
     CHECK(md_x86_adc16(&cpu, 0xFFFFu, 0x0000u) == 0x0000u);
-    CHECK((cpu.flags & MD_X86_FLAG_CF) != 0u);
-    CHECK((cpu.flags & MD_X86_FLAG_ZF) != 0u);
+    CHECK((md_x86_flags(&cpu) & MD_X86_FLAG_CF) != 0u);
+    CHECK((md_x86_flags(&cpu) & MD_X86_FLAG_ZF) != 0u);
 
-    cpu.flags = (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF);
+    md_x86_set_flags(&cpu, (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF));
     CHECK(md_x86_sbb8(&cpu, 0x80u, 0x00u) == 0x7Fu);
-    CHECK((cpu.flags & MD_X86_FLAG_OF) != 0u);
-    CHECK((cpu.flags & MD_X86_FLAG_CF) == 0u);
+    CHECK((md_x86_flags(&cpu) & MD_X86_FLAG_OF) != 0u);
+    CHECK((md_x86_flags(&cpu) & MD_X86_FLAG_CF) == 0u);
 
-    cpu.flags = (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF | MD_X86_FLAG_OF | MD_X86_FLAG_AF);
+    md_x86_set_flags(&cpu, (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF | MD_X86_FLAG_OF | MD_X86_FLAG_AF));
     CHECK(md_x86_logic16(&cpu, (uint16_t)(0x55AAu ^ 0xFFFFu)) == 0xAA55u);
-    CHECK((cpu.flags & (MD_X86_FLAG_CF | MD_X86_FLAG_OF | MD_X86_FLAG_AF)) == 0u);
+    CHECK((md_x86_flags(&cpu) & (MD_X86_FLAG_CF | MD_X86_FLAG_OF | MD_X86_FLAG_AF)) == 0u);
 }
 
 static void test_all_jcc_conditions(void)
@@ -556,21 +1017,21 @@ static void test_all_jcc_conditions(void)
     MdX86 cpu;
     memset(&cpu, 0, sizeof(cpu));
 
-    cpu.flags = MD_X86_FLAG_OF;
+    md_x86_set_flags(&cpu, MD_X86_FLAG_OF);
     CHECK(md_x86_condition(&cpu, 0x0u));
     CHECK(!md_x86_condition(&cpu, 0x1u));
 
-    cpu.flags = MD_X86_FLAG_CF;
+    md_x86_set_flags(&cpu, MD_X86_FLAG_CF);
     CHECK(md_x86_condition(&cpu, 0x2u));
     CHECK(!md_x86_condition(&cpu, 0x3u));
 
-    cpu.flags = MD_X86_FLAG_ZF;
+    md_x86_set_flags(&cpu, MD_X86_FLAG_ZF);
     CHECK(md_x86_condition(&cpu, 0x4u));
     CHECK(!md_x86_condition(&cpu, 0x5u));
     CHECK(md_x86_condition(&cpu, 0x6u));
     CHECK(!md_x86_condition(&cpu, 0x7u));
 
-    cpu.flags = MD_X86_FLAG_SF;
+    md_x86_set_flags(&cpu, MD_X86_FLAG_SF);
     CHECK(md_x86_condition(&cpu, 0x8u));
     CHECK(!md_x86_condition(&cpu, 0x9u));
     CHECK(md_x86_condition(&cpu, 0xCu));
@@ -578,11 +1039,11 @@ static void test_all_jcc_conditions(void)
     CHECK(md_x86_condition(&cpu, 0xEu));
     CHECK(!md_x86_condition(&cpu, 0xFu));
 
-    cpu.flags = MD_X86_FLAG_PF;
+    md_x86_set_flags(&cpu, MD_X86_FLAG_PF);
     CHECK(md_x86_condition(&cpu, 0xAu));
     CHECK(!md_x86_condition(&cpu, 0xBu));
 
-    cpu.flags = 0u;
+    md_x86_set_flags(&cpu, 0u);
     CHECK(!md_x86_condition(&cpu, 0x6u));
     CHECK(md_x86_condition(&cpu, 0x7u));
     CHECK(!md_x86_condition(&cpu, 0xEu));
@@ -632,7 +1093,7 @@ static void test_group1_mov_imm_xor_and_jcc(uint8_t *memory)
     CHECK(runtime.cpu.r[MD_X86_AX] == 0x12C0u);
     CHECK(md_x86_read16(&runtime.cpu, 0x1000u, 0x0200u) == 0x1234u);
     CHECK(md_x86_read8(&runtime.cpu, 0x1000u, 0x0202u) == 0x80u);
-    CHECK((runtime.cpu.flags & MD_X86_FLAG_ZF) != 0u);
+    CHECK((md_x86_flags(&runtime.cpu) & MD_X86_FLAG_ZF) != 0u);
 
     memset(memory, 0, MD_X86_ADDRESS_SPACE);
     md_runtime_init(&cached, memory, &hooks);
@@ -666,8 +1127,8 @@ static void test_prefix_string_and_direction_ops(uint8_t *memory)
     CHECK(runtime.cpu.r[MD_X86_CX] == 1u);
     CHECK(runtime.cpu.r[MD_X86_SI] == 0x0202u);
     CHECK(runtime.cpu.r[MD_X86_DI] == 0x0206u);
-    CHECK((runtime.cpu.flags & MD_X86_FLAG_ZF) == 0u);
-    CHECK((runtime.cpu.flags & MD_X86_FLAG_DF) == 0u);
+    CHECK((md_x86_flags(&runtime.cpu) & MD_X86_FLAG_ZF) == 0u);
+    CHECK((md_x86_flags(&runtime.cpu) & MD_X86_FLAG_DF) == 0u);
     CHECK(md_x86_read8(&runtime.cpu, 0x3000u, 0x0200u) == 0x11u);
     CHECK(md_x86_read8(&runtime.cpu, 0x3000u, 0x0201u) == 0x22u);
     CHECK(md_x86_read8(&runtime.cpu, 0x3000u, 0x0202u) == 0x99u);
@@ -705,7 +1166,7 @@ static void test_repne_scas(uint8_t *memory)
     CHECK(runtime.instructions == 8u);
     CHECK(runtime.cpu.r[MD_X86_CX] == 1u);
     CHECK(runtime.cpu.r[MD_X86_DI] == 0x0203u);
-    CHECK((runtime.cpu.flags & MD_X86_FLAG_ZF) != 0u);
+    CHECK((md_x86_flags(&runtime.cpu) & MD_X86_FLAG_ZF) != 0u);
 }
 
 static void test_loop_family(uint8_t *memory)
@@ -726,7 +1187,7 @@ static void test_loop_family(uint8_t *memory)
     md_runtime_load_com(&runtime, kLoopzOps, sizeof(kLoopzOps), 0x1000u);
     CHECK(md_interp_run(&runtime, 16u) == MD_STOP_HALT);
     CHECK(runtime.cpu.r[MD_X86_CX] == 0u);
-    CHECK((runtime.cpu.flags & MD_X86_FLAG_ZF) != 0u);
+    CHECK((md_x86_flags(&runtime.cpu) & MD_X86_FLAG_ZF) != 0u);
     CHECK(runtime.instructions == 6u);
 
     memset(memory, 0, MD_X86_ADDRESS_SPACE);
@@ -734,7 +1195,7 @@ static void test_loop_family(uint8_t *memory)
     md_runtime_load_com(&runtime, kLoopnzOps, sizeof(kLoopnzOps), 0x1000u);
     CHECK(md_interp_run(&runtime, 16u) == MD_STOP_HALT);
     CHECK(runtime.cpu.r[MD_X86_CX] == 0u);
-    CHECK((runtime.cpu.flags & MD_X86_FLAG_ZF) == 0u);
+    CHECK((md_x86_flags(&runtime.cpu) & MD_X86_FLAG_ZF) == 0u);
     CHECK(runtime.instructions == 6u);
 }
 
@@ -742,21 +1203,21 @@ static void test_shift_rotate_semantics(void)
 {
     MdX86 cpu;
     memset(&cpu, 0, sizeof(cpu));
-    cpu.flags = MD_X86_FLAG_ALWAYS1;
+    md_x86_set_flags(&cpu, MD_X86_FLAG_ALWAYS1);
 
     CHECK(md_x86_shift8(&cpu, 4u, 0x81u, 1u) == 0x02u);
-    CHECK((cpu.flags & MD_X86_FLAG_CF) != 0u);
-    CHECK((cpu.flags & MD_X86_FLAG_OF) != 0u);
+    CHECK((md_x86_flags(&cpu) & MD_X86_FLAG_CF) != 0u);
+    CHECK((md_x86_flags(&cpu) & MD_X86_FLAG_OF) != 0u);
 
-    cpu.flags = (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF);
+    md_x86_set_flags(&cpu, (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF));
     CHECK(md_x86_shift8(&cpu, 2u, 0x80u, 1u) == 0x01u); /* RCL through carry */
-    CHECK((cpu.flags & MD_X86_FLAG_CF) != 0u);
+    CHECK((md_x86_flags(&cpu) & MD_X86_FLAG_CF) != 0u);
 
-    cpu.flags = MD_X86_FLAG_ALWAYS1;
+    md_x86_set_flags(&cpu, MD_X86_FLAG_ALWAYS1);
     CHECK(md_x86_shift16(&cpu, 7u, 0x8001u, 1u) == 0xC000u);
-    CHECK((cpu.flags & MD_X86_FLAG_CF) != 0u);
-    CHECK((cpu.flags & MD_X86_FLAG_OF) == 0u);
-    CHECK((cpu.flags & MD_X86_FLAG_SF) != 0u);
+    CHECK((md_x86_flags(&cpu) & MD_X86_FLAG_CF) != 0u);
+    CHECK((md_x86_flags(&cpu) & MD_X86_FLAG_OF) == 0u);
+    CHECK((md_x86_flags(&cpu) & MD_X86_FLAG_SF) != 0u);
 }
 
 static void test_m7_control_and_flags(uint8_t *memory)
@@ -770,10 +1231,10 @@ static void test_m7_control_and_flags(uint8_t *memory)
     CHECK(md_interp_run(&runtime, 64u) == MD_STOP_HALT);
     CHECK(runtime.cpu.r[MD_X86_AX] == 0xFF80u);
     CHECK(runtime.cpu.r[MD_X86_DX] == 0xFFFFu);
-    CHECK((runtime.cpu.flags & MD_X86_FLAG_IF) != 0u);
-    CHECK((runtime.cpu.flags & MD_X86_FLAG_SF) != 0u);
-    CHECK((runtime.cpu.flags & MD_X86_FLAG_ZF) == 0u);
-    CHECK((runtime.cpu.flags & MD_X86_FLAG_CF) == 0u); /* TEST clears CF. */
+    CHECK((md_x86_flags(&runtime.cpu) & MD_X86_FLAG_IF) != 0u);
+    CHECK((md_x86_flags(&runtime.cpu) & MD_X86_FLAG_SF) != 0u);
+    CHECK((md_x86_flags(&runtime.cpu) & MD_X86_FLAG_ZF) == 0u);
+    CHECK((md_x86_flags(&runtime.cpu) & MD_X86_FLAG_CF) == 0u); /* TEST clears CF. */
 }
 
 static void test_m7_addressing_and_far_loads(uint8_t *memory)
@@ -820,7 +1281,7 @@ static void test_m7_group3(uint8_t *memory)
     md_runtime_load_com(&runtime, kGroup3Logic, sizeof(kGroup3Logic), 0x1000u);
     CHECK(md_interp_run(&runtime, 32u) == MD_STOP_HALT);
     CHECK(runtime.cpu.r[MD_X86_AX] == 0x1235u);
-    CHECK((runtime.cpu.flags & MD_X86_FLAG_ZF) == 0u);
+    CHECK((md_x86_flags(&runtime.cpu) & MD_X86_FLAG_ZF) == 0u);
 }
 
 static void test_m7_group45_and_indirect_control(uint8_t *memory)
@@ -874,7 +1335,7 @@ static void test_m7_far_call_iret_and_push_sp(uint8_t *memory)
     md_x86_write16(&runtime.cpu, 0x1000u, 0xFFFCu,
                    (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF | MD_X86_FLAG_IF));
     CHECK(md_interp_run(&runtime, 4u) == MD_STOP_HALT);
-    CHECK((runtime.cpu.flags & (MD_X86_FLAG_CF | MD_X86_FLAG_IF)) ==
+    CHECK((md_x86_flags(&runtime.cpu) & (MD_X86_FLAG_CF | MD_X86_FLAG_IF)) ==
           (MD_X86_FLAG_CF | MD_X86_FLAG_IF));
     CHECK(runtime.cpu.r[MD_X86_SP] == 0xFFFEu);
 
@@ -898,7 +1359,7 @@ static void test_m7_shift_and_adjust(uint8_t *memory)
     md_runtime_load_com(&runtime, kShiftOps, sizeof(kShiftOps), 0x1000u);
     CHECK(md_interp_run(&runtime, 32u) == MD_STOP_HALT);
     CHECK(runtime.cpu.r[MD_X86_AX] == 0xC000u);
-    CHECK((runtime.cpu.flags & MD_X86_FLAG_SF) != 0u);
+    CHECK((md_x86_flags(&runtime.cpu) & MD_X86_FLAG_SF) != 0u);
 
     memset(memory, 0, MD_X86_ADDRESS_SPACE);
     md_runtime_init(&runtime, memory, &hooks);
@@ -1419,7 +1880,7 @@ static bool test_postinit_interrupt_hook(MdRuntime *runtime, uint8_t vector, voi
             ++env->call_count;
         }
         if (ah == 0x3Eu) {                       /* CLOSE */
-            cpu->flags &= (uint16_t)~MD_X86_FLAG_CF;
+            md_x86_update_flags(cpu, MD_X86_FLAG_CF, 0u);
             return true;
         }
         if (ah == 0x3Du) {                       /* OPEN */
@@ -1428,7 +1889,7 @@ static bool test_postinit_interrupt_hook(MdRuntime *runtime, uint8_t vector, voi
                 CHECK(al == 2u);
                 CHECK(test_far_streq(cpu, seg, MD_MSDOS2_CONDEV_OFFSET, "\\DEV\\CON"));
                 if (env->fail_open_con) {
-                    cpu->flags |= MD_X86_FLAG_CF;
+                    md_x86_update_flags(cpu, 0u, MD_X86_FLAG_CF);
                     cpu->r[MD_X86_AX] = 2u;      /* file not found */
                     return true;
                 }
@@ -1442,13 +1903,13 @@ static bool test_postinit_interrupt_hook(MdRuntime *runtime, uint8_t vector, voi
                 CHECK(al == 1u);
                 cpu->r[MD_X86_AX] = 4u;
             }
-            cpu->flags &= (uint16_t)~MD_X86_FLAG_CF;
+            md_x86_update_flags(cpu, MD_X86_FLAG_CF, 0u);
             return true;
         }
         if (ah == 0x45u) {                       /* XDUP */
             CHECK(cpu->r[MD_X86_BX] == 0u);
             cpu->r[MD_X86_AX] = (uint16_t)env->next_dup++;
-            cpu->flags &= (uint16_t)~MD_X86_FLAG_CF;
+            md_x86_update_flags(cpu, MD_X86_FLAG_CF, 0u);
             return true;
         }
         if (ah == 0x4Bu && al == 0u) {
@@ -1479,11 +1940,11 @@ static bool test_postinit_interrupt_hook(MdRuntime *runtime, uint8_t vector, voi
             cpu->ss = 0x3000u;
             cpu->ip = MD_MSDOS2_COMMAND_ENTRY_OFFSET;
             cpu->r[MD_X86_SP] = 0xFFFEu;
-            cpu->flags &= (uint16_t)~MD_X86_FLAG_CF;
+            md_x86_update_flags(cpu, MD_X86_FLAG_CF, 0u);
             ++env->execs;
             return true;
         }
-        cpu->flags |= MD_X86_FLAG_CF;
+        md_x86_update_flags(cpu, 0u, MD_X86_FLAG_CF);
         cpu->r[MD_X86_AX] = 1u;
         return true;
     }
@@ -1508,7 +1969,7 @@ static void test_msdos2_postinit_program_execution(uint8_t *memory)
     md_msdos2_boot_install_devices(&runtime, &env.boot);
     runtime.cpu.ss = env.boot.stack_segment;
     runtime.cpu.r[MD_X86_SP] = 0xFFFEu;
-    runtime.cpu.flags = MD_X86_FLAG_ALWAYS1;
+    md_x86_set_flags(&runtime.cpu, MD_X86_FLAG_ALWAYS1);
 
     CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_RETURN_INT, &env.boot));
     reason = md_interp_run(&runtime, 1000u);
@@ -1560,7 +2021,7 @@ static void test_msdos2_postinit_stdio_failure(uint8_t *memory)
     md_msdos2_boot_install_devices(&runtime, &env.boot);
     runtime.cpu.ss = env.boot.stack_segment;
     runtime.cpu.r[MD_X86_SP] = 0xFFFEu;
-    runtime.cpu.flags = MD_X86_FLAG_ALWAYS1;
+    md_x86_set_flags(&runtime.cpu, MD_X86_FLAG_ALWAYS1);
 
     CHECK(md_msdos2_boot_interrupt(&runtime, MD_MSDOS2_NATIVE_RETURN_INT, &env.boot));
     reason = md_interp_run(&runtime, 1000u);
@@ -1583,7 +2044,7 @@ static void test_ivt(uint8_t *memory)
     runtime.cpu.ip = 0x5678u;
     runtime.cpu.ss = 0x2000u;
     runtime.cpu.r[MD_X86_SP] = 0x1000u;
-    runtime.cpu.flags = MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_IF | MD_X86_FLAG_TF;
+    md_x86_set_flags(&runtime.cpu, MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_IF | MD_X86_FLAG_TF);
     md_x86_write16_linear(&runtime.cpu, 0x30u * 4u, 0x1111u);
     md_x86_write16_linear(&runtime.cpu, 0x30u * 4u + 2u, 0x2222u);
     CHECK(!md_runtime_interrupt(&runtime, 0x30u));
@@ -1606,6 +2067,14 @@ int main(void)
     test_page_code_invalidation(memory);
     test_hybrid_aot_cache_handoff(memory);
     test_aot_guard_byte_exact(memory);
+    test_aot_guard_word_writes(memory);
+    test_aot_attachment_lifetime(memory);
+    test_memloop_engines(memory);
+    test_run_until_cs_change(memory);
+    test_aot_chunk_invalidation(memory);
+    test_aot_store_completes_instruction(memory);
+    test_aot_muldiv_fault(memory);
+    test_lazy_flags_equivalence(memory);
     test_aot_self_modifying_code(memory);
     test_budget(memory);
     test_phase_a_flag_semantics();

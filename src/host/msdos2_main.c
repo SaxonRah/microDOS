@@ -4,6 +4,9 @@
 #include "msdos2_boot.h"
 
 #include "dos2test_recomp.h"
+#if defined(MICRODOS_HAVE_KERNEL_AOT)
+#include "msdos2_recomp.h"
+#endif
 
 /* M13: programs compiled by dosrecomp and linked into the runner. When DOS
    starts one of them (CS:IP = XXXX:0100 with matching bytes) the runner
@@ -14,7 +17,18 @@ static const MdAotProgram *const g_md_aot_programs[] = {
 #define MD_AOT_PROGRAM_COUNT (sizeof(g_md_aot_programs) / sizeof(g_md_aot_programs[0]))
 #define MD_AOT_CHUNK 65536u
 
+/* M18: architectural FLAGS for logs/traces, read from a copy so tracing
+   never changes emulator state (lazy flags materialise on read). */
+static uint16_t md_trace_flags(const MdX86 *cpu)
+{
+    MdX86 copy = *cpu;
+    return md_x86_flags(&copy);
+}
+
 typedef struct MdAotStats {
+    bool kernel_attached;
+    uint64_t kernel_compiled;
+    uint32_t kernel_enters;
     uint32_t attaches;
     uint32_t enters;
     uint64_t interp_in_image;   /* instructions interpreted while CS was attached */
@@ -146,7 +160,7 @@ static void md_trace_record(MdTraceRing *ring, const MdRuntime *runtime)
     entry->sp = cpu->r[MD_X86_SP];
     entry->ds = cpu->ds;
     entry->es = cpu->es;
-    entry->flags = cpu->flags;
+    entry->flags = md_trace_flags(cpu);
     for (i = 0u; i < MD_TRACE_CODE_BYTES; ++i) {
         entry->code[i] = md_x86_read8(cpu, cpu->cs, (uint16_t)(cpu->ip + i));
     }
@@ -195,10 +209,10 @@ static bool md_capture_command_string_scan_pre(MdCommandStringScan *scan,
     scan->es = cpu->es;
     scan->di = cpu->r[MD_X86_DI];
     scan->cx = cpu->r[MD_X86_CX];
-    scan->flags = cpu->flags;
+    scan->flags = md_trace_flags(cpu);
     scan->al = md_x86_get_reg8(cpu, 0u);
 
-    step = (cpu->flags & MD_X86_FLAG_DF) != 0u ? -1 : 1;
+    step = (cpu->flags_raw & MD_X86_FLAG_DF) != 0u ? -1 : 1;   /* DF is never lazy */
     for (distance = 0u; distance < (uint32_t)scan->cx; ++distance) {
         const uint16_t offset = (uint16_t)((int32_t)scan->di +
                                            step * (int32_t)distance);
@@ -220,7 +234,7 @@ static void md_capture_command_string_scan_post(MdCommandStringScan *scan,
     scan->post_valid = true;
     scan->post_di = runtime->cpu.r[MD_X86_DI];
     scan->post_cx = runtime->cpu.r[MD_X86_CX];
-    scan->post_flags = runtime->cpu.flags;
+    scan->post_flags = md_trace_flags(&runtime->cpu);
 }
 
 static bool md_is_user_write_call(const MdRuntime *runtime,
@@ -258,7 +272,7 @@ static void md_capture_user_write_origin(MdUserWriteOrigin *origin,
     origin->dx = cpu->r[MD_X86_DX];
     origin->ds = cpu->ds;
     origin->es = cpu->es;
-    origin->flags = cpu->flags;
+    origin->flags = md_trace_flags(cpu);
 
     sample = count < (uint16_t)(MD_ORIGIN_SAMPLE_BYTES - 1u)
         ? (uint16_t)(count + 1u) : (uint16_t)MD_ORIGIN_SAMPLE_BYTES;
@@ -728,7 +742,7 @@ static void md_dump_cpu(const MdRuntime *runtime)
            c->cs, c->ip, c->ss, c->r[MD_X86_SP], c->ds, c->es);
     printf("  AX=%04X BX=%04X CX=%04X DX=%04X BP=%04X SI=%04X DI=%04X FLAGS=%04X\n",
            c->r[MD_X86_AX], c->r[MD_X86_BX], c->r[MD_X86_CX], c->r[MD_X86_DX],
-           c->r[MD_X86_BP], c->r[MD_X86_SI], c->r[MD_X86_DI], c->flags);
+           c->r[MD_X86_BP], c->r[MD_X86_SI], c->r[MD_X86_DI], md_trace_flags(c));
 }
 
 static bool md_guest_command_image_matches(const MdRuntime *runtime,
@@ -920,6 +934,10 @@ int main(int argc, char **argv)
     md_block_cache_init(&cache);
     md_runtime_set_block_cache(&runtime, &cache);
     md_msdos2_boot_prepare_cpu(&runtime, &boot, image, image_size);
+#if defined(MICRODOS_HAVE_KERNEL_AOT)
+    /* M17: the released kernel image is now at dos_segment:0000 */
+    if (aot_enabled) aot.kernel_attached = md_recomp_msdos2_program.attach(&runtime, boot.dos_segment);
+#endif
 
     md_host_break_install();
 
@@ -946,6 +964,16 @@ int main(int argc, char **argv)
         if (!aot_enabled) {
             puts("  aot:     disabled");
         }
+#if defined(MICRODOS_HAVE_KERNEL_AOT)
+        if (aot_enabled) {
+            printf("  aot:     %s kernel (%u instructions compiled, %u interpreter holes, %u entries)%s\n",
+                   md_recomp_msdos2_program.name,
+                   (unsigned)md_recomp_msdos2_program.compiled_instructions,
+                   (unsigned)md_recomp_msdos2_program.hole_instructions,
+                   (unsigned)md_recomp_msdos2_program.entry_count,
+                   aot.kernel_attached ? "" : " - NOT ATTACHED (image mismatch)");
+        }
+#endif
         for (pi = 0; aot_enabled && pi < MD_AOT_PROGRAM_COUNT; ++pi) {
             const MdAotProgram *prog = g_md_aot_programs[pi];
             printf("  aot:     %s (%u instructions compiled, %u interpreter holes, %u entries)\n",
@@ -981,6 +1009,20 @@ int main(int argc, char **argv)
             puts("[system] COMMAND.COM execution continuing; interactive CON active (Ctrl+] exits microDOS)");
         }
 
+#if defined(MICRODOS_HAVE_KERNEL_AOT)
+        if (aot.kernel_attached && runtime.cpu.cs == boot.dos_segment &&
+            md_recomp_msdos2_program.block_ok(&runtime, runtime.cpu.cs, runtime.cpu.ip)) {
+            const uint64_t before = runtime.instructions;
+            const uint64_t before_aot = runtime.aot_instructions;
+            const uint64_t left = budget - steps;
+            MdStopReason reason = md_recomp_msdos2_program.enter(&runtime, left < MD_AOT_CHUNK ? left : MD_AOT_CHUNK);
+            ++aot.kernel_enters;
+            aot.kernel_compiled += runtime.aot_instructions - before_aot;
+            steps += runtime.instructions - before;
+            if (reason != MD_STOP_NONE || runtime.stop_reason != MD_STOP_NONE) break;
+            if (runtime.instructions != before) continue;
+        }
+#endif
         if (aot_enabled && system_mode && boot.command_entered &&
             runtime.cpu.cs != boot.dos_segment && runtime.cpu.cs != boot.bios_segment) {
             const uint16_t cs = runtime.cpu.cs;
@@ -1001,7 +1043,7 @@ int main(int argc, char **argv)
             if (prog != NULL) {
                 aot.last_segment = cs;
                 aot.last_program = prog;
-                if (prog->is_entry(runtime.cpu.ip)) {
+                if (prog->block_ok(&runtime, cs, runtime.cpu.ip)) {
                     const uint64_t before = runtime.instructions;
                     const uint64_t left = budget - steps;
                     MdStopReason reason = prog->enter(&runtime, left < MD_AOT_CHUNK ? left : MD_AOT_CHUNK);
@@ -1136,14 +1178,19 @@ int main(int argc, char **argv)
            (unsigned)boot.console_write_calls,
            (unsigned)boot.console_bytes_written,
            (unsigned)boot.console_dollar_writes);
+    if (aot.kernel_attached) {
+        printf("[aot] MSDOS.SYS kernel: enters=%u compiled=%llu (%.1f%% of all instructions)\n",
+               (unsigned)aot.kernel_enters, (unsigned long long)aot.kernel_compiled,
+               runtime.instructions ? 100.0 * (double)aot.kernel_compiled / (double)runtime.instructions : 0.0);
+    }
     if (aot.attaches != 0u) {
-        const uint64_t total = runtime.aot_instructions + aot.interp_in_image;
+        const uint64_t total = runtime.aot_instructions - aot.kernel_compiled + aot.interp_in_image;
         printf("[aot] %s attached %u time(s), last at %04X:0100; enters=%u compiled=%llu interpreted-in-image=%llu (%.1f%% native)\n",
                aot.last_program != NULL ? aot.last_program->name : "?",
                (unsigned)aot.attaches, aot.last_segment, (unsigned)aot.enters,
-               (unsigned long long)runtime.aot_instructions,
+               (unsigned long long)(runtime.aot_instructions - aot.kernel_compiled),
                (unsigned long long)aot.interp_in_image,
-               total != 0u ? 100.0 * (double)runtime.aot_instructions / (double)total : 0.0);
+               total != 0u ? 100.0 * (double)(runtime.aot_instructions - aot.kernel_compiled) / (double)total : 0.0);
     }
     if (console.idle_sleeps != 0u) {
         printf("[host] idle sleeps=%u (CON polled with no input)\n",

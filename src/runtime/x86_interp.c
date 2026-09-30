@@ -180,19 +180,15 @@ static inline void md_op_mov_r16_imm(MdRuntime *runtime, uint8_t opcode)
 static inline void md_op_inc_r16(MdRuntime *runtime, uint8_t opcode)
 {
     MdX86 *cpu = &runtime->cpu;
-    const uint16_t old_cf = cpu->flags & MD_X86_FLAG_CF;
     const unsigned reg = opcode & 7u;
-    cpu->r[reg] = md_x86_add16(cpu, cpu->r[reg], 1u);
-    cpu->flags = (uint16_t)((cpu->flags & ~MD_X86_FLAG_CF) | old_cf);
+    cpu->r[reg] = md_x86_inc16(cpu, cpu->r[reg]);
 }
 
 static inline void md_op_dec_r16(MdRuntime *runtime, uint8_t opcode)
 {
     MdX86 *cpu = &runtime->cpu;
-    const uint16_t old_cf = cpu->flags & MD_X86_FLAG_CF;
     const unsigned reg = opcode & 7u;
-    cpu->r[reg] = md_x86_sub16(cpu, cpu->r[reg], 1u);
-    cpu->flags = (uint16_t)((cpu->flags & ~MD_X86_FLAG_CF) | old_cf);
+    cpu->r[reg] = md_x86_dec16(cpu, cpu->r[reg]);
 }
 
 static inline void md_op_mov_rm_r(MdRuntime *runtime, uint8_t opcode, const MdPrefixState *prefix)
@@ -314,7 +310,7 @@ static inline int md_execute_opcode(MdRuntime *runtime, uint8_t opcode,
 
 static inline int16_t md_string_delta(const MdX86 *cpu, unsigned width)
 {
-    return (cpu->flags & MD_X86_FLAG_DF) != 0u ? -(int16_t)width : (int16_t)width;
+    return (cpu->flags_raw & MD_X86_FLAG_DF) != 0u ? -(int16_t)width : (int16_t)width;
 }
 
 static inline void md_advance_index(uint16_t *value, int16_t delta)
@@ -408,7 +404,7 @@ static inline void md_op_string(MdRuntime *runtime, uint8_t opcode,
         cpu->r[MD_X86_CX] = (uint16_t)(cpu->r[MD_X86_CX] - 1u);
 
         if (compares) {
-            const int zf = (cpu->flags & MD_X86_FLAG_ZF) != 0u;
+            const int zf = md_x86_zf(cpu);
             if ((repeat == 0xF3u && !zf) || (repeat == 0xF2u && zf)) break;
         }
     }
@@ -426,9 +422,9 @@ static inline void md_op_loop(MdRuntime *runtime, uint8_t opcode)
         cpu->r[MD_X86_CX] = (uint16_t)(cpu->r[MD_X86_CX] - 1u);
         if (opcode == 0xE2u) take = cpu->r[MD_X86_CX] != 0u;
         else if (opcode == 0xE1u) take = cpu->r[MD_X86_CX] != 0u &&
-                                       (cpu->flags & MD_X86_FLAG_ZF) != 0u;
+                                       md_x86_zf(cpu);
         else take = cpu->r[MD_X86_CX] != 0u &&
-                    (cpu->flags & MD_X86_FLAG_ZF) == 0u;
+                    !md_x86_zf(cpu);
     }
 
     if (take) cpu->ip = (uint16_t)(cpu->ip + rel);
@@ -436,8 +432,8 @@ static inline void md_op_loop(MdRuntime *runtime, uint8_t opcode)
 
 static inline void md_set_cf_of(MdX86 *cpu, int set)
 {
-    cpu->flags &= (uint16_t)~(MD_X86_FLAG_CF | MD_X86_FLAG_OF);
-    if (set) cpu->flags |= (uint16_t)(MD_X86_FLAG_CF | MD_X86_FLAG_OF);
+    md_x86_update_flags(cpu, (uint16_t)(MD_X86_FLAG_CF | MD_X86_FLAG_OF),
+                        set ? (uint16_t)(MD_X86_FLAG_CF | MD_X86_FLAG_OF) : 0u);
 }
 
 static inline void md_op_test_rm_r(MdRuntime *runtime, uint8_t opcode,
@@ -543,32 +539,16 @@ static inline void md_op_shift(MdRuntime *runtime, uint8_t opcode,
     }
 }
 
-static inline void md_op_group3(MdRuntime *runtime, uint8_t opcode,
-                                uint16_t ip_before, const MdPrefixState *prefix)
+/* MUL/IMUL/DIV/IDIV (M18): one implementation shared by the interpreter's
+   group 3 and dosrecomp-generated code (md_interp_muldiv), so results, flags
+   and divide faults are identical in both. `ext` is ModR/M.reg (4..7). */
+static inline void md_muldiv_core(MdRuntime *runtime, uint8_t opcode, unsigned ext,
+                                  uint16_t operand, uint16_t ip_before)
 {
     MdX86 *cpu = &runtime->cpu;
-    const uint8_t modrm = md_fetch8(runtime);
-    const unsigned ext = (modrm >> 3) & 7u;
-    const int width16 = opcode == 0xF7u;
-    MdOperand rm = md_decode_rm(runtime, modrm, prefix);
-
-    if (!width16) {
-        const uint8_t value = md_operand_read8(runtime, rm);
+    if (opcode == 0xF6u) {
+        const uint8_t value = (uint8_t)operand;
         switch (ext) {
-            case 0u: {
-                const uint8_t imm = md_fetch8(runtime);
-                (void)md_x86_logic8(cpu, (uint8_t)(value & imm));
-                break;
-            }
-            case 1u:
-                md_fault(runtime, opcode, ip_before);
-                break;
-            case 2u:
-                md_operand_write8(runtime, rm, (uint8_t)~value);
-                break;
-            case 3u:
-                md_operand_write8(runtime, rm, md_x86_sub8(cpu, 0u, value));
-                break;
             case 4u: {
                 const uint16_t product = (uint16_t)md_x86_get_reg8(cpu, 0u) * (uint16_t)value;
                 cpu->r[MD_X86_AX] = product;
@@ -611,22 +591,8 @@ static inline void md_op_group3(MdRuntime *runtime, uint8_t opcode,
             }
         }
     } else {
-        const uint16_t value = md_operand_read16(runtime, rm);
+        const uint16_t value = operand;
         switch (ext) {
-            case 0u: {
-                const uint16_t imm = md_fetch16(runtime);
-                (void)md_x86_logic16(cpu, (uint16_t)(value & imm));
-                break;
-            }
-            case 1u:
-                md_fault(runtime, opcode, ip_before);
-                break;
-            case 2u:
-                md_operand_write16(runtime, rm, (uint16_t)~value);
-                break;
-            case 3u:
-                md_operand_write16(runtime, rm, md_x86_sub16(cpu, 0u, value));
-                break;
             case 4u: {
                 const uint32_t product = (uint32_t)cpu->r[MD_X86_AX] * (uint32_t)value;
                 cpu->r[MD_X86_AX] = (uint16_t)product;
@@ -674,6 +640,60 @@ static inline void md_op_group3(MdRuntime *runtime, uint8_t opcode,
     }
 }
 
+static inline void md_op_group3(MdRuntime *runtime, uint8_t opcode,
+                                uint16_t ip_before, const MdPrefixState *prefix)
+{
+    MdX86 *cpu = &runtime->cpu;
+    const uint8_t modrm = md_fetch8(runtime);
+    const unsigned ext = (modrm >> 3) & 7u;
+    const int width16 = opcode == 0xF7u;
+    MdOperand rm = md_decode_rm(runtime, modrm, prefix);
+
+    if (!width16) {
+        const uint8_t value = md_operand_read8(runtime, rm);
+        switch (ext) {
+            case 0u: {
+                const uint8_t imm = md_fetch8(runtime);
+                (void)md_x86_logic8(cpu, (uint8_t)(value & imm));
+                break;
+            }
+            case 1u:
+                md_fault(runtime, opcode, ip_before);
+                break;
+            case 2u:
+                md_operand_write8(runtime, rm, (uint8_t)~value);
+                break;
+            case 3u:
+                md_operand_write8(runtime, rm, md_x86_sub8(cpu, 0u, value));
+                break;
+            default:   /* 4 MUL, 5 IMUL, 6 DIV, 7 IDIV */
+                md_muldiv_core(runtime, opcode, ext, value, ip_before);
+                break;
+        }
+    } else {
+        const uint16_t value = md_operand_read16(runtime, rm);
+        switch (ext) {
+            case 0u: {
+                const uint16_t imm = md_fetch16(runtime);
+                (void)md_x86_logic16(cpu, (uint16_t)(value & imm));
+                break;
+            }
+            case 1u:
+                md_fault(runtime, opcode, ip_before);
+                break;
+            case 2u:
+                md_operand_write16(runtime, rm, (uint16_t)~value);
+                break;
+            case 3u:
+                md_operand_write16(runtime, rm, md_x86_sub16(cpu, 0u, value));
+                break;
+            default:   /* 4 MUL, 5 IMUL, 6 DIV, 7 IDIV */
+                md_muldiv_core(runtime, opcode, ext, value, ip_before);
+                break;
+        }
+    }
+}
+
 static inline void md_op_group45(MdRuntime *runtime, uint8_t opcode,
                                  uint16_t ip_before, const MdPrefixState *prefix)
 {
@@ -684,12 +704,9 @@ static inline void md_op_group45(MdRuntime *runtime, uint8_t opcode,
 
     if (opcode == 0xFEu) {
         uint8_t value;
-        uint16_t old_cf;
         if (ext > 1u) { md_fault(runtime, opcode, ip_before); return; }
         value = md_operand_read8(runtime, rm);
-        old_cf = cpu->flags & MD_X86_FLAG_CF;
-        value = ext == 0u ? md_x86_add8(cpu, value, 1u) : md_x86_sub8(cpu, value, 1u);
-        cpu->flags = (uint16_t)((cpu->flags & (uint16_t)~MD_X86_FLAG_CF) | old_cf);
+        value = ext == 0u ? md_x86_inc8(cpu, value) : md_x86_dec8(cpu, value);
         md_operand_write8(runtime, rm, value);
         return;
     }
@@ -697,9 +714,7 @@ static inline void md_op_group45(MdRuntime *runtime, uint8_t opcode,
     switch (ext) {
         case 0u: case 1u: {
             uint16_t value = md_operand_read16(runtime, rm);
-            const uint16_t old_cf = cpu->flags & MD_X86_FLAG_CF;
-            value = ext == 0u ? md_x86_add16(cpu, value, 1u) : md_x86_sub16(cpu, value, 1u);
-            cpu->flags = (uint16_t)((cpu->flags & (uint16_t)~MD_X86_FLAG_CF) | old_cf);
+            value = ext == 0u ? md_x86_inc16(cpu, value) : md_x86_dec16(cpu, value);
             md_operand_write16(runtime, rm, value);
             break;
         }
@@ -747,13 +762,14 @@ static inline void md_op_group45(MdRuntime *runtime, uint8_t opcode,
 
 static inline void md_op_daa(MdX86 *cpu)
 {
+    md_x86_flags_materialize(cpu);   /* BCD adjusts stay eager (M18) */
     uint8_t al = md_x86_get_reg8(cpu, 0u);
     const uint8_t old_al = al;
-    const int old_cf = (cpu->flags & MD_X86_FLAG_CF) != 0u;
+    const int old_cf = (cpu->flags_raw & MD_X86_FLAG_CF) != 0u;
     int af = 0;
     int cf = 0;
 
-    if ((al & 0x0Fu) > 9u || (cpu->flags & MD_X86_FLAG_AF) != 0u) {
+    if ((al & 0x0Fu) > 9u || (cpu->flags_raw & MD_X86_FLAG_AF) != 0u) {
         al = (uint8_t)(al + 6u);
         af = 1;
     }
@@ -761,22 +777,23 @@ static inline void md_op_daa(MdX86 *cpu)
         al = (uint8_t)(al + 0x60u);
         cf = 1;
     }
-    cpu->flags &= (uint16_t)~(MD_X86_FLAG_AF | MD_X86_FLAG_CF);
-    if (af) cpu->flags |= MD_X86_FLAG_AF;
-    if (cf) cpu->flags |= MD_X86_FLAG_CF;
+    cpu->flags_raw &= (uint16_t)~(MD_X86_FLAG_AF | MD_X86_FLAG_CF);
+    if (af) cpu->flags_raw |= MD_X86_FLAG_AF;
+    if (cf) cpu->flags_raw |= MD_X86_FLAG_CF;
     md_x86_set_reg8(cpu, 0u, al);
     md_x86_set_szp8(cpu, al);
 }
 
 static inline void md_op_das(MdX86 *cpu)
 {
+    md_x86_flags_materialize(cpu);   /* BCD adjusts stay eager (M18) */
     uint8_t al = md_x86_get_reg8(cpu, 0u);
     const uint8_t old_al = al;
-    const int old_cf = (cpu->flags & MD_X86_FLAG_CF) != 0u;
+    const int old_cf = (cpu->flags_raw & MD_X86_FLAG_CF) != 0u;
     int af = 0;
     int cf = 0;
 
-    if ((al & 0x0Fu) > 9u || (cpu->flags & MD_X86_FLAG_AF) != 0u) {
+    if ((al & 0x0Fu) > 9u || (cpu->flags_raw & MD_X86_FLAG_AF) != 0u) {
         al = (uint8_t)(al - 6u);
         af = 1;
     }
@@ -784,23 +801,24 @@ static inline void md_op_das(MdX86 *cpu)
         al = (uint8_t)(al - 0x60u);
         cf = 1;
     }
-    cpu->flags &= (uint16_t)~(MD_X86_FLAG_AF | MD_X86_FLAG_CF);
-    if (af) cpu->flags |= MD_X86_FLAG_AF;
-    if (cf) cpu->flags |= MD_X86_FLAG_CF;
+    cpu->flags_raw &= (uint16_t)~(MD_X86_FLAG_AF | MD_X86_FLAG_CF);
+    if (af) cpu->flags_raw |= MD_X86_FLAG_AF;
+    if (cf) cpu->flags_raw |= MD_X86_FLAG_CF;
     md_x86_set_reg8(cpu, 0u, al);
     md_x86_set_szp8(cpu, al);
 }
 
 static inline void md_op_aaa(MdX86 *cpu, int subtract)
 {
+    md_x86_flags_materialize(cpu);   /* BCD adjusts stay eager (M18) */
     uint8_t al = md_x86_get_reg8(cpu, 0u);
     uint8_t ah = md_x86_get_reg8(cpu, 4u);
-    if ((al & 0x0Fu) > 9u || (cpu->flags & MD_X86_FLAG_AF) != 0u) {
+    if ((al & 0x0Fu) > 9u || (cpu->flags_raw & MD_X86_FLAG_AF) != 0u) {
         al = subtract ? (uint8_t)(al - 6u) : (uint8_t)(al + 6u);
         ah = subtract ? (uint8_t)(ah - 1u) : (uint8_t)(ah + 1u);
-        cpu->flags |= (uint16_t)(MD_X86_FLAG_AF | MD_X86_FLAG_CF);
+        cpu->flags_raw |= (uint16_t)(MD_X86_FLAG_AF | MD_X86_FLAG_CF);
     } else {
-        cpu->flags &= (uint16_t)~(MD_X86_FLAG_AF | MD_X86_FLAG_CF);
+        cpu->flags_raw &= (uint16_t)~(MD_X86_FLAG_AF | MD_X86_FLAG_CF);
     }
     md_x86_set_reg8(cpu, 0u, (uint8_t)(al & 0x0Fu));
     md_x86_set_reg8(cpu, 4u, ah);
@@ -965,17 +983,17 @@ static inline int md_execute_opcode(MdRuntime *runtime, uint8_t opcode, uint16_t
             break;
         }
         case 0x9B: break; /* WAIT: no coprocessor scheduling in the core. */
-        case 0x9C: md_x86_push(cpu, (uint16_t)(cpu->flags | MD_X86_FLAG_ALWAYS1)); break;
-        case 0x9D: cpu->flags = (uint16_t)(md_x86_pop(cpu) | MD_X86_FLAG_ALWAYS1); break;
+        case 0x9C: md_x86_push(cpu, (uint16_t)(md_x86_flags(cpu) | MD_X86_FLAG_ALWAYS1)); break;
+        case 0x9D: md_x86_set_flags(cpu, (uint16_t)(md_x86_pop(cpu) | MD_X86_FLAG_ALWAYS1)); break;
         case 0x9E: { /* SAHF */
             const uint16_t mask = MD_X86_FLAG_SF | MD_X86_FLAG_ZF | MD_X86_FLAG_AF |
                                   MD_X86_FLAG_PF | MD_X86_FLAG_CF;
             const uint16_t ah = md_x86_get_reg8(cpu, 4u);
-            cpu->flags = (uint16_t)((cpu->flags & (uint16_t)~mask) | (ah & mask) | MD_X86_FLAG_ALWAYS1);
+            md_x86_update_flags(cpu, mask, (uint16_t)((ah & mask) | MD_X86_FLAG_ALWAYS1));
             break;
         }
         case 0x9F: /* LAHF */
-            md_x86_set_reg8(cpu, 4u, (uint8_t)((cpu->flags & 0x00D5u) | 0x02u));
+            md_x86_set_reg8(cpu, 4u, (uint8_t)((md_x86_flags(cpu) & 0x00D5u) | 0x02u));
             break;
 
         case 0xA0: {
@@ -1038,12 +1056,12 @@ static inline int md_execute_opcode(MdRuntime *runtime, uint8_t opcode, uint16_t
             break;
         }
         case 0xCE:
-            if ((cpu->flags & MD_X86_FLAG_OF) != 0u) (void)md_runtime_interrupt(runtime, 4u);
+            if (md_x86_of(cpu)) (void)md_runtime_interrupt(runtime, 4u);
             break;
         case 0xCF:
             cpu->ip = md_x86_pop(cpu);
             cpu->cs = md_x86_pop(cpu);
-            cpu->flags = (uint16_t)(md_x86_pop(cpu) | MD_X86_FLAG_ALWAYS1);
+            md_x86_set_flags(cpu, (uint16_t)(md_x86_pop(cpu) | MD_X86_FLAG_ALWAYS1));
             break;
         case 0xD4: { /* AAM imm8 */
             const uint8_t base = md_fetch8(runtime);
@@ -1065,7 +1083,7 @@ static inline int md_execute_opcode(MdRuntime *runtime, uint8_t opcode, uint16_t
             break;
         }
         case 0xD6: /* SALC, undocumented but present on original 8086 */
-            md_x86_set_reg8(cpu, 0u, (cpu->flags & MD_X86_FLAG_CF) != 0u ? 0xFFu : 0u);
+            md_x86_set_reg8(cpu, 0u, md_x86_cf(cpu) ? 0xFFu : 0u);
             break;
         case 0xD7: { /* XLAT */
             const uint16_t segment = md_prefixed_segment(cpu, prefix, cpu->ds);
@@ -1108,13 +1126,14 @@ static inline int md_execute_opcode(MdRuntime *runtime, uint8_t opcode, uint16_t
         case 0xEE: md_port_out8(runtime, cpu->r[MD_X86_DX], md_x86_get_reg8(cpu, 0u)); break;
         case 0xEF: md_port_out16(runtime, cpu->r[MD_X86_DX], cpu->r[MD_X86_AX]); break;
         case 0xF4: runtime->stop_reason = MD_STOP_HALT; break;
-        case 0xF5: cpu->flags ^= MD_X86_FLAG_CF; break;
-        case 0xF8: cpu->flags &= (uint16_t)~MD_X86_FLAG_CF; break;
-        case 0xF9: cpu->flags |= MD_X86_FLAG_CF; break;
-        case 0xFA: cpu->flags &= (uint16_t)~MD_X86_FLAG_IF; break;
-        case 0xFB: cpu->flags |= MD_X86_FLAG_IF; break;
-        case 0xFC: cpu->flags &= (uint16_t)~MD_X86_FLAG_DF; break;
-        case 0xFD: cpu->flags |= MD_X86_FLAG_DF; break;
+        case 0xF5: md_x86_update_flags(cpu, MD_X86_FLAG_CF, md_x86_cf(cpu) ? 0u : MD_X86_FLAG_CF); break;
+        case 0xF8: md_x86_update_flags(cpu, MD_X86_FLAG_CF, 0u); break;
+        case 0xF9: md_x86_update_flags(cpu, 0u, MD_X86_FLAG_CF); break;
+        /* IF/DF are never lazy: the raw word is authoritative for them */
+        case 0xFA: cpu->flags_raw &= (uint16_t)~MD_X86_FLAG_IF; break;
+        case 0xFB: cpu->flags_raw |= MD_X86_FLAG_IF; break;
+        case 0xFC: cpu->flags_raw &= (uint16_t)~MD_X86_FLAG_DF; break;
+        case 0xFD: cpu->flags_raw |= MD_X86_FLAG_DF; break;
 
         default:
             md_fault(runtime, opcode, ip_before);
@@ -1124,13 +1143,21 @@ static inline int md_execute_opcode(MdRuntime *runtime, uint8_t opcode, uint16_t
 }
 
 #if defined(MD_THREADED_DISPATCH) && (defined(__GNUC__) || defined(__clang__))
-static MdStopReason md_interp_run_threaded(MdRuntime *runtime, uint64_t instruction_budget)
+/* M16: one threaded loop serves both md_interp_run() and
+   md_interp_run_until_cs_change() (watch_cs != 0: return MD_STOP_NONE as
+   soon as CS differs from its value on entry). Per-instruction counters are
+   32-bit locals; runtime->instructions is updated on every exit and before
+   interrupt hooks run, so observers still see exact counts. */
+static MdStopReason md_interp_run_threaded(MdRuntime *runtime, uint32_t instruction_budget,
+                                           int watch_cs)
 {
     static void *dispatch[256] = {0};
     static int initialized = 0;
     uint8_t opcode;
     uint16_t ip_before;
-    uint64_t remaining = instruction_budget;
+    uint32_t remaining = instruction_budget;
+    uint32_t done = 0u;
+    const uint16_t cs0 = runtime->cpu.cs;
     unsigned i;
 
     if (!initialized) {
@@ -1142,6 +1169,27 @@ static MdStopReason md_interp_run_threaded(MdRuntime *runtime, uint64_t instruct
         for (i = 0x50u; i <= 0x57u; ++i) dispatch[i] = &&op_push_r16;
         for (i = 0x58u; i <= 0x5Fu; ++i) dispatch[i] = &&op_pop_r16;
         for (i = 0x70u; i <= 0x7Fu; ++i) dispatch[i] = &&op_jcc8;
+        /* M16: direct entries for the opcodes that dominate the MS-DOS 2.0
+           kernel/COMMAND.COM mix (profiled on DOS2TEST). They call the same
+           md_op_* semantics as md_execute_opcode, skipping its range-test
+           chain. Prefixed forms still take op_prefix. */
+        for (i = 0x00u; i <= 0x3Bu; ++i) if ((i & 0x04u) == 0u) dispatch[i] = &&op_alu_rm;
+        for (i = 0x00u; i <= 0x3Du; ++i) if ((i & 0x06u) == 0x04u) dispatch[i] = &&op_alu_acc;
+        for (i = 0x80u; i <= 0x83u; ++i) dispatch[i] = &&op_group1;
+        for (i = 0x88u; i <= 0x8Bu; ++i) dispatch[i] = &&op_mov_rm;
+        for (i = 0xE0u; i <= 0xE3u; ++i) dispatch[i] = &&op_loop;
+        for (i = 0xA4u; i <= 0xA7u; ++i) dispatch[i] = &&op_string;
+        for (i = 0xAAu; i <= 0xAFu; ++i) dispatch[i] = &&op_string;
+        dispatch[0x06] = &&op_push_sreg;
+        dispatch[0x0E] = &&op_push_sreg;
+        dispatch[0x16] = &&op_push_sreg;
+        dispatch[0x1E] = &&op_push_sreg;
+        dispatch[0x07] = &&op_pop_sreg;
+        dispatch[0x17] = &&op_pop_sreg;
+        dispatch[0x1F] = &&op_pop_sreg;
+        dispatch[0xC3] = &&op_ret;
+        dispatch[0xE8] = &&op_call16;
+        dispatch[0xE9] = &&op_jmp16;
         dispatch[0x26] = &&op_prefix;
         dispatch[0x2E] = &&op_prefix;
         dispatch[0x36] = &&op_prefix;
@@ -1156,11 +1204,20 @@ static MdStopReason md_interp_run_threaded(MdRuntime *runtime, uint64_t instruct
         initialized = 1;
     }
 
+/* CS can only change through INT, far CALL/JMP/RET, IRET or a prefixed form
+   of those, which all reach op_int, op_generic or op_prefix. Checking CS
+   there instead of in every MD_NEXT keeps the fast paths at full speed
+   (a per-instruction check cost ~35% on the DEC/JNZ benchmark). */
+#define MD_NEXT_CS() do { \
+        if (watch_cs && runtime->cpu.cs != cs0) goto md_exit; \
+        MD_NEXT(); \
+    } while (0)
+
 #define MD_NEXT() do { \
-        if (runtime->stop_reason != MD_STOP_NONE) return runtime->stop_reason; \
-        if (remaining == 0u) { runtime->stop_reason = MD_STOP_BUDGET; return MD_STOP_BUDGET; } \
+        if (runtime->stop_reason != MD_STOP_NONE) goto md_exit; \
+        if (remaining == 0u) { runtime->stop_reason = MD_STOP_BUDGET; goto md_exit; } \
         --remaining; \
-        ++runtime->instructions; \
+        ++done; \
         ip_before = runtime->cpu.ip; \
         opcode = md_fetch8(runtime); \
         goto *dispatch[opcode]; \
@@ -1202,15 +1259,70 @@ op_jcc8: {
 
 op_prefix:
     (void)md_execute_prefixed(runtime, opcode, ip_before);
+    MD_NEXT_CS();
+
+op_alu_rm:
+    md_op_alu_rm_r(runtime, opcode, NULL);
     MD_NEXT();
+
+op_alu_acc:
+    md_op_alu_acc_imm(runtime, opcode);
+    MD_NEXT();
+
+op_group1:
+    md_op_group1_imm(runtime, opcode, NULL);
+    MD_NEXT();
+
+op_mov_rm:
+    md_op_mov_rm_r(runtime, opcode, NULL);
+    MD_NEXT();
+
+op_loop:
+    md_op_loop(runtime, opcode);
+    MD_NEXT();
+
+op_string:
+    md_op_string(runtime, opcode, NULL);
+    MD_NEXT();
+
+op_push_sreg:
+    md_x86_push(&runtime->cpu, md_get_sreg(&runtime->cpu, (opcode >> 3) & 3u));
+    MD_NEXT();
+
+op_pop_sreg: {
+    const uint16_t v = md_x86_pop(&runtime->cpu);
+    if (opcode == 0x07u) runtime->cpu.es = v;
+    else if (opcode == 0x17u) runtime->cpu.ss = v;
+    else runtime->cpu.ds = v;
+    MD_NEXT();
+}
+
+op_ret:
+    runtime->cpu.ip = md_x86_pop(&runtime->cpu);
+    MD_NEXT();
+
+op_call16: {
+    const int16_t rel = (int16_t)md_fetch16(runtime);
+    md_x86_push(&runtime->cpu, runtime->cpu.ip);
+    runtime->cpu.ip = (uint16_t)(runtime->cpu.ip + rel);
+    MD_NEXT();
+}
+
+op_jmp16: {
+    const int16_t rel = (int16_t)md_fetch16(runtime);
+    runtime->cpu.ip = (uint16_t)(runtime->cpu.ip + rel);
+    MD_NEXT();
+}
 
 op_nop:
     MD_NEXT();
 
 op_int: {
     const uint8_t vector = md_fetch8(runtime);
+    runtime->instructions += done;     /* hooks may observe the count */
+    done = 0u;
     (void)md_runtime_interrupt(runtime, vector);
-    MD_NEXT();
+    MD_NEXT_CS();
 }
 
 op_jmp8: {
@@ -1221,23 +1333,31 @@ op_jmp8: {
 
 op_hlt:
     runtime->stop_reason = MD_STOP_HALT;
-    return MD_STOP_HALT;
+    goto md_exit;
 
 op_generic:
     (void)md_execute_opcode(runtime, opcode, ip_before, NULL);
-    MD_NEXT();
+    MD_NEXT_CS();
+
+md_exit:
+    runtime->instructions += done;
+    return runtime->stop_reason;
 
 #undef MD_NEXT
+#undef MD_NEXT_CS
 }
 #endif
 
 #if !defined(MD_THREADED_DISPATCH) || !(defined(__GNUC__) || defined(__clang__))
-static MdStopReason md_interp_run_switch(MdRuntime *runtime, uint64_t instruction_budget)
+static MdStopReason md_interp_run_switch(MdRuntime *runtime, uint32_t instruction_budget,
+                                         int watch_cs)
 {
-    uint64_t remaining = instruction_budget;
+    uint32_t remaining = instruction_budget;
+    const uint16_t cs0 = runtime->cpu.cs;
     while (runtime->stop_reason == MD_STOP_NONE) {
         uint16_t ip_before;
         uint8_t opcode;
+        if (watch_cs && runtime->cpu.cs != cs0) break;
         if (remaining == 0u) {
             runtime->stop_reason = MD_STOP_BUDGET;
             break;
@@ -1266,11 +1386,52 @@ MdStopReason md_interp_step(MdRuntime *runtime)
     return runtime->stop_reason;
 }
 
+/* Budgets above 2^30 are run in 32-bit chunks so the hot loop never does
+   64-bit arithmetic; a chunk boundary is invisible to the guest. */
+static MdStopReason md_interp_run_chunked(MdRuntime *runtime, uint64_t instruction_budget,
+                                         int watch_cs)
+{
+    const uint16_t cs0 = runtime->cpu.cs;
+    for (;;) {
+        const uint32_t chunk = instruction_budget > 0x40000000u ? 0x40000000u
+                                                                : (uint32_t)instruction_budget;
+        MdStopReason st;
+#if defined(MD_THREADED_DISPATCH) && (defined(__GNUC__) || defined(__clang__))
+        st = md_interp_run_threaded(runtime, chunk, watch_cs);
+#else
+        st = md_interp_run_switch(runtime, chunk, watch_cs);
+#endif
+        instruction_budget -= chunk;
+        if (st != MD_STOP_BUDGET || instruction_budget == 0u) return st;
+        if (watch_cs && runtime->cpu.cs != cs0) return st;
+        runtime->stop_reason = MD_STOP_NONE;     /* chunk boundary, not a stop */
+    }
+}
+
 MdStopReason md_interp_run(MdRuntime *runtime, uint64_t instruction_budget)
 {
-#if defined(MD_THREADED_DISPATCH) && (defined(__GNUC__) || defined(__clang__))
-    return md_interp_run_threaded(runtime, instruction_budget);
-#else
-    return md_interp_run_switch(runtime, instruction_budget);
-#endif
+    return md_interp_run_chunked(runtime, instruction_budget, 0);
+}
+
+MdStopReason md_interp_run_until_cs_change(MdRuntime *runtime, uint64_t instruction_budget)
+{
+    return md_interp_run_chunked(runtime, instruction_budget, 1);
+}
+
+/* ---- M18 exports for dosrecomp-generated code -------------------------- */
+
+void md_interp_muldiv(MdRuntime *runtime, uint8_t opcode, unsigned ext, uint16_t operand,
+                      uint16_t ip_before)
+{
+    md_muldiv_core(runtime, opcode, ext, operand, ip_before);
+}
+
+void md_interp_string_op(MdRuntime *runtime, uint8_t opcode, uint8_t segment_prefix,
+                         uint8_t repeat_prefix)
+{
+    MdPrefixState prefix;
+    memset(&prefix, 0, sizeof(prefix));
+    prefix.segment_override = segment_prefix;
+    prefix.repeat = repeat_prefix;
+    md_op_string(runtime, opcode, &prefix);
 }

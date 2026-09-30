@@ -43,18 +43,40 @@ enum {
 #define MD_X86_CODE_PAGE_MASK (MD_X86_CODE_PAGE_SIZE - 1u)
 #define MD_X86_CODE_PAGE_COUNT (MD_X86_ADDRESS_SPACE / MD_X86_CODE_PAGE_SIZE)
 
-/* M13 byte-exact AOT invalidation. A generated image registers one guard per
-   loaded copy: `base` is the linear address of image byte 0 and `code_bits`
-   has one bit per image byte that belongs to a compiled instruction. Writes
-   to other bytes of the image (variables next to code) leave it valid. */
+/* Byte-exact AOT invalidation (M13, reworked in M15).
+   Each attachment of a generated image owns one guard. `base` is the linear
+   address of image byte 0 and `code_bits` has one bit per image byte that
+   belongs to a compiled instruction. Writes to other bytes of the image
+   (variables next to code) leave it valid.
+
+   Guards live in a table owned by MdRuntime (see md_runtime_aot_attach), so
+   resetting or re-initialising a runtime drops every attachment with it and
+   two runtimes never share attachment state. */
+#ifndef MD_AOT_ATTACH_SLOTS
+#define MD_AOT_ATTACH_SLOTS 8u
+#endif
+
+/* M17 chunk-granular invalidation: a store to a compiled byte clears only the
+   valid bit of its 64-byte chunk, so data reuse of one region (e.g. DOS
+   turning its one-time init code into buffers) disables just the blocks
+   there. Generated blocks check the chunks they span on entry. */
+#define MD_AOT_CHUNK_SHIFT 6u
+#define MD_AOT_MAX_CHUNKS (0x10000u >> MD_AOT_CHUNK_SHIFT)
+
 typedef struct MdAotGuard {
     uint32_t base;
     uint32_t size;
     const uint8_t *code_bits;
-    struct MdAotGuard *next;
-    uint32_t invalidations;
-    uint8_t valid;
-    uint8_t registered;
+    const void *program;        /* identity of the generated image */
+    uint32_t invalidations;     /* compiled-byte stores seen */
+    uint32_t epoch;             /* advances on every such store */
+    uint32_t live_chunks;       /* chunks that hold compiled code and are
+                                   still valid; the attachment dies at 0 */
+    uint32_t last_use;          /* LRU clock for slot replacement */
+    uint16_t segment;
+    uint8_t valid;              /* attachment is live (whole-image switch) */
+    uint8_t in_use;             /* slot holds an attachment */
+    uint8_t chunk_ok[MD_AOT_MAX_CHUNKS / 8u];   /* per-64-byte validity */
 } MdAotGuard;
 
 typedef struct MdX86 {
@@ -64,7 +86,18 @@ typedef struct MdX86 {
     uint16_t ss;
     uint16_t ds;
     uint16_t ip;
-    uint16_t flags;
+    /* M18 lazy flags. `flags_raw` always holds the non-arithmetic bits
+       (TF/IF/DF/...) and holds OSZAPC only while `lazy_op` is MD_LAZY_NONE.
+       Otherwise OSZAPC are derived on demand from the last flag-producing
+       ALU operation. Never read flags_raw's OSZAPC bits directly: use
+       md_x86_flags() / md_x86_cf() ... (the field was renamed from `flags`
+       so the compiler finds every access). */
+    uint16_t flags_raw;
+    uint8_t lazy_op;
+    uint8_t lazy_carry;       /* ADC/SBB carry-in, or INC/DEC preserved CF */
+    uint16_t lazy_a;
+    uint16_t lazy_b;
+    uint16_t lazy_res;
     uint8_t *memory;
 
     /* Optional runtime-owned code tracking. Standalone MdX86 users may leave
@@ -73,9 +106,136 @@ typedef struct MdX86 {
     uint8_t *code_page_executable;
     uint32_t *code_write_epoch;
 
-    /* Optional generated-image guards (see MdAotGuard). */
+    /* Optional generated-image guards (see MdAotGuard), runtime-owned. */
     MdAotGuard *aot_guards;
+    unsigned aot_guard_count;
 } MdX86;
+
+/* ---- M18 lazy flags ---------------------------------------------------- */
+
+enum {
+    MD_LAZY_NONE = 0,
+    MD_LAZY_ADD8, MD_LAZY_ADD16,
+    MD_LAZY_ADC8, MD_LAZY_ADC16,
+    MD_LAZY_SUB8, MD_LAZY_SUB16,
+    MD_LAZY_SBB8, MD_LAZY_SBB16,
+    MD_LAZY_LOGIC8, MD_LAZY_LOGIC16,
+    MD_LAZY_INC8, MD_LAZY_INC16,
+    MD_LAZY_DEC8, MD_LAZY_DEC16
+};
+
+#define MD_X86_FLAGS_OSZAPC (0x0001u | 0x0004u | 0x0010u | 0x0040u | 0x0080u | 0x0800u)
+
+static inline int md_lazy_wide(unsigned op)
+{
+    return (op & 1u) == 0u;   /* even enum values are the 16-bit forms */
+}
+
+static inline unsigned md_lazy_sign(unsigned op)
+{
+    return md_lazy_wide(op) ? 0x8000u : 0x80u;
+}
+
+static inline unsigned md_lazy_mask(unsigned op)
+{
+    return md_lazy_wide(op) ? 0xFFFFu : 0xFFu;
+}
+
+static inline int md_x86_cf(const MdX86 *cpu)
+{
+    const unsigned a = cpu->lazy_a, b = cpu->lazy_b, r = cpu->lazy_res;
+    switch (cpu->lazy_op) {
+        case MD_LAZY_NONE: return (cpu->flags_raw & 0x0001u) != 0u;
+        case MD_LAZY_ADD8: case MD_LAZY_ADD16: return r < a;
+        case MD_LAZY_ADC8: case MD_LAZY_ADC16: return cpu->lazy_carry ? r <= a : r < a;
+        case MD_LAZY_SUB8: case MD_LAZY_SUB16: return a < b;
+        case MD_LAZY_SBB8: case MD_LAZY_SBB16: return cpu->lazy_carry ? a <= b : a < b;
+        case MD_LAZY_LOGIC8: case MD_LAZY_LOGIC16: return 0;
+        default: return cpu->lazy_carry != 0u;           /* INC/DEC keep CF */
+    }
+}
+
+static inline int md_x86_zf(const MdX86 *cpu)
+{
+    if (cpu->lazy_op == MD_LAZY_NONE) return (cpu->flags_raw & 0x0040u) != 0u;
+    return (cpu->lazy_res & md_lazy_mask(cpu->lazy_op)) == 0u;
+}
+
+static inline int md_x86_sf(const MdX86 *cpu)
+{
+    if (cpu->lazy_op == MD_LAZY_NONE) return (cpu->flags_raw & 0x0080u) != 0u;
+    return (cpu->lazy_res & md_lazy_sign(cpu->lazy_op)) != 0u;
+}
+
+static inline int md_x86_of(const MdX86 *cpu)
+{
+    const unsigned a = cpu->lazy_a, b = cpu->lazy_b, r = cpu->lazy_res;
+    const unsigned sign = md_lazy_sign(cpu->lazy_op);
+    switch (cpu->lazy_op) {
+        case MD_LAZY_NONE: return (cpu->flags_raw & 0x0800u) != 0u;
+        case MD_LAZY_ADD8: case MD_LAZY_ADD16:
+        case MD_LAZY_ADC8: case MD_LAZY_ADC16:
+        case MD_LAZY_INC8: case MD_LAZY_INC16:           /* INC: b == 1 */
+            return ((~(a ^ b) & (a ^ r)) & sign) != 0u;
+        case MD_LAZY_SUB8: case MD_LAZY_SUB16:
+        case MD_LAZY_SBB8: case MD_LAZY_SBB16:
+        case MD_LAZY_DEC8: case MD_LAZY_DEC16:           /* DEC: b == 1 */
+            return (((a ^ b) & (a ^ r)) & sign) != 0u;
+        default: return 0;                               /* logic */
+    }
+}
+
+/* Folds a pending lazy result into flags_raw (same values the eager
+   helpers used to compute, proven by tests/test_runtime.c). */
+static inline void md_x86_flags_materialize(MdX86 *cpu)
+{
+    const unsigned op = cpu->lazy_op;
+    unsigned f;
+    uint8_t p;
+    if (op == MD_LAZY_NONE) return;
+    f = cpu->flags_raw & (uint16_t)~MD_X86_FLAGS_OSZAPC;
+    if (md_x86_cf(cpu)) f |= 0x0001u;
+    p = (uint8_t)cpu->lazy_res;
+    p ^= (uint8_t)(p >> 4);
+    p &= 0x0Fu;
+    if ((0x9669u >> p) & 1u) f |= 0x0004u;
+    if (op != MD_LAZY_LOGIC8 && op != MD_LAZY_LOGIC16 &&
+        ((cpu->lazy_a ^ cpu->lazy_b ^ cpu->lazy_res) & 0x10u) != 0u) f |= 0x0010u;
+    if (md_x86_zf(cpu)) f |= 0x0040u;
+    if (md_x86_sf(cpu)) f |= 0x0080u;
+    if (md_x86_of(cpu)) f |= 0x0800u;
+    cpu->flags_raw = (uint16_t)f;
+    cpu->lazy_op = MD_LAZY_NONE;
+}
+
+/* The architectural FLAGS word (materialises). */
+static inline uint16_t md_x86_flags(MdX86 *cpu)
+{
+    md_x86_flags_materialize(cpu);
+    return cpu->flags_raw;
+}
+
+/* Replace the whole FLAGS word (POPF, IRET, SAHF-merged values, tests). */
+static inline void md_x86_set_flags(MdX86 *cpu, uint16_t value)
+{
+    cpu->lazy_op = MD_LAZY_NONE;
+    cpu->flags_raw = value;
+}
+
+/* Set/clear individual OSZAPC bits (CLC/STC/CMC, MUL/DIV, native services). */
+static inline void md_x86_update_flags(MdX86 *cpu, uint16_t clear_mask, uint16_t set_mask)
+{
+    md_x86_flags_materialize(cpu);
+    cpu->flags_raw = (uint16_t)((cpu->flags_raw & (uint16_t)~clear_mask) | set_mask);
+}
+
+static inline void md_x86_lazy(MdX86 *cpu, unsigned op, unsigned a, unsigned b, unsigned r)
+{
+    cpu->lazy_op = (uint8_t)op;
+    cpu->lazy_a = (uint16_t)a;
+    cpu->lazy_b = (uint16_t)b;
+    cpu->lazy_res = (uint16_t)r;
+}
 
 static inline uint32_t md_x86_linear(uint16_t segment, uint16_t offset)
 {
@@ -87,16 +247,29 @@ static inline unsigned md_x86_code_page(uint32_t address)
     return (unsigned)((address & MD_X86_ADDRESS_MASK) >> MD_X86_CODE_PAGE_SHIFT);
 }
 
-static inline void md_x86_note_code_write(MdX86 *cpu, uint32_t address)
+/* True when every chunk covering image offsets [first, last] is valid. */
+static inline int md_aot_chunks_ok(const MdAotGuard *guard, uint32_t first, uint32_t last)
+{
+    uint32_t c;
+    for (c = first >> MD_AOT_CHUNK_SHIFT; c <= (last >> MD_AOT_CHUNK_SHIFT); ++c) {
+        if (((guard->chunk_ok[c >> 3] >> (c & 7u)) & 1u) == 0u) return 0;
+    }
+    return 1;
+}
+
+static inline int md_x86_page_executable(const MdX86 *cpu, uint32_t address)
+{
+    return cpu->code_page_generation != NULL &&
+           cpu->code_page_executable != NULL &&
+           cpu->code_page_executable[md_x86_code_page(address)] != 0u;
+}
+
+/* Page-granular bookkeeping for the decoded-block cache and the global code
+   write epoch. Call at most once per touched executable page per store. */
+static inline void md_x86_note_page_write(MdX86 *cpu, uint32_t address)
 {
     const unsigned page = md_x86_code_page(address);
     uint32_t next;
-
-    if (cpu->code_page_generation == NULL ||
-        cpu->code_page_executable == NULL ||
-        cpu->code_page_executable[page] == 0u) {
-        return;
-    }
 
     next = cpu->code_page_generation[page] + 1u;
     if (next == 0u) next = 1u;
@@ -107,21 +280,47 @@ static inline void md_x86_note_code_write(MdX86 *cpu, uint32_t address)
         if (next == 0u) next = 1u;
         *cpu->code_write_epoch = next;
     }
+}
 
-    /* Only reached for executable pages, so ordinary data writes never pay
-       for this walk. */
-    {
-        MdAotGuard *guard;
-        const uint32_t a = address & MD_X86_ADDRESS_MASK;
-        for (guard = cpu->aot_guards; guard != NULL; guard = guard->next) {
-            const uint32_t off = (a - guard->base) & MD_X86_ADDRESS_MASK;
-            if (off < guard->size &&
-                ((guard->code_bits[off >> 3] >> (off & 7u)) & 1u) != 0u) {
-                guard->valid = 0u;
-                ++guard->invalidations;
+/* Byte-exact AOT check. Must be called for EVERY modified byte that lies on
+   an executable page, including both bytes of a same-page word store (M15
+   bug fix: the second byte used to be skipped unless it crossed a page). */
+static inline void md_x86_note_aot_write(MdX86 *cpu, uint32_t address)
+{
+    const uint32_t a = address & MD_X86_ADDRESS_MASK;
+    unsigned i;
+    for (i = 0; i < cpu->aot_guard_count; ++i) {
+        MdAotGuard *guard = &cpu->aot_guards[i];
+        uint32_t off;
+        if (!guard->valid) continue;
+        off = (a - guard->base) & MD_X86_ADDRESS_MASK;
+        if (off < guard->size &&
+            ((guard->code_bits[off >> 3] >> (off & 7u)) & 1u) != 0u) {
+            const uint32_t chunk = off >> MD_AOT_CHUNK_SHIFT;
+            const uint8_t bit = (uint8_t)(1u << (chunk & 7u));
+            if ((guard->chunk_ok[chunk >> 3] & bit) != 0u) {
+                guard->chunk_ok[chunk >> 3] &= (uint8_t)~bit;
+                /* Every compiled chunk overwritten (e.g. DOS loaded another
+                   program here): the attachment is dead, so hosts stop
+                   treating this segment as compiled code. */
+                if (guard->live_chunks != 0u && --guard->live_chunks == 0u) guard->valid = 0u;
+                /* M17b: only a chunk that goes valid -> invalid can affect a
+                   running block (blocks are checked on entry), so only that
+                   advances the epoch. Stores into chunks that are already
+                   invalid (DOS buffers in old init code) no longer force
+                   compiled code out after every store check. */
+                ++guard->epoch;
             }
+            ++guard->invalidations;
         }
     }
+}
+
+static inline void md_x86_note_code_write(MdX86 *cpu, uint32_t address)
+{
+    if (!md_x86_page_executable(cpu, address)) return;
+    md_x86_note_page_write(cpu, address);
+    md_x86_note_aot_write(cpu, address);
 }
 
 static inline uint8_t md_x86_read8_linear(const MdX86 *cpu, uint32_t address)
@@ -150,10 +349,16 @@ static inline void md_x86_write16_linear(MdX86 *cpu, uint32_t address, uint16_t 
     const unsigned p0 = md_x86_code_page(a0);
     const unsigned p1 = md_x86_code_page(a1);
 
+    const int e0 = md_x86_page_executable(cpu, a0);
+    const int e1 = p1 == p0 ? e0 : md_x86_page_executable(cpu, a1);
+
     cpu->memory[a0] = (uint8_t)value;
     cpu->memory[a1] = (uint8_t)(value >> 8);
-    md_x86_note_code_write(cpu, a0);
-    if (p1 != p0) md_x86_note_code_write(cpu, a1);
+    /* Page generations: once per touched page. AOT guards: every byte. */
+    if (e0) md_x86_note_page_write(cpu, a0);
+    if (e1 && p1 != p0) md_x86_note_page_write(cpu, a1);
+    if (e0) md_x86_note_aot_write(cpu, a0);
+    if (e1) md_x86_note_aot_write(cpu, a1);
 }
 
 static inline uint8_t md_x86_read8(const MdX86 *cpu, uint16_t segment, uint16_t offset)

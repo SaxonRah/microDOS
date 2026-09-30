@@ -75,8 +75,13 @@ if exist "%MD_ROOT%\build-host\Release\mkfat12.exe" set "MKFAT_EXE=%MD_ROOT%\bui
 cmake -S "%MD_ROOT%\pico" -B "%MD_ROOT%\build-pico\out" -G Ninja "-DCMAKE_MAKE_PROGRAM=%NINJA_EXE%" "-DMICRODOS_HOST_BUILD=%MD_ROOT%\build-host" "-DMICRODOS_PICO_DISK=%MD_ROOT%\build-pico\pico_disk.img" || exit /b 1
 cmake --build "%MD_ROOT%\build-pico\out" || exit /b 1
 echo.
-echo Firmware: %MD_ROOT%\build-pico\out\microdos_pico.uf2
-echo Hold BOOTSEL while plugging in the Pico Plus 2, then copy the .uf2 to the RP2350 drive.
+echo Firmware in %MD_ROOT%\build-pico\out\ :
+echo   microdos_pico.uf2           DOS, compiled kernel, 300 MHz ^(default^)
+echo   microdos_pico_150.uf2       DOS, compiled kernel, 150 MHz
+echo   microdos_pico_nokernel.uf2  DOS, interpreted kernel, 300 MHz ^(A/B^)
+echo   microdos_bench.uf2          benchmark matrix, 300 MHz
+echo   microdos_bench_150.uf2      benchmark matrix, 150 MHz
+echo Hold BOOTSEL while plugging in the Pico Plus 2, then copy a .uf2 to the RP2350 drive.
 exit /b 0
 
 :run

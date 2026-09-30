@@ -511,3 +511,184 @@ data beside its code, which causes frequent decoded-block invalidations
 reports MIPS and cache statistics (Ctrl+]) so the next step, moving hot
 interpreter paths to SRAM or refining invalidation, is driven by numbers.
 Disk persistence to flash is a later milestone; this one keeps writes in RAM.
+
+## 39. Page bookkeeping and AOT guards are separate write notifications
+
+M13 reused the page-granular write hook for byte-exact guards, and the word
+store only notified its second byte when that byte crossed a page. That was
+correct for page generations and wrong for guards: a same-page word store
+whose high byte landed on compiled code left the image valid.
+
+`md_x86_note_page_write()` (once per touched executable page) and
+`md_x86_note_aot_write()` (every modified byte on an executable page) are now
+separate. `md_x86_write16_linear()` calls the page note once per page and the
+guard note for both bytes, so page generations advance exactly as before.
+The regression test fails on the old code and passes on the new.
+
+## 40. AOT attachments are runtime state
+
+Generated images used to keep four static slots of their own while the guard
+list lived in the runtime, so a reset runtime could leave a slot claiming to
+be valid. The attachment table now lives in `MdRuntime` (8 slots, LRU
+replacement, eviction count), keyed by (image descriptor, segment).
+`md_runtime_init/reset` clear it; two runtimes cannot see each other's
+attachments; generated code holds no mutable static state. An evicted copy
+simply runs interpreted.
+
+## 41. Measure before optimising: the RP2350 matrix
+
+The first Pico run was ~50x slower than expected with two plausible causes
+(flash code and PSRAM data sharing the 16 KiB XIP cache; a block cache that
+misses more than it hits under the DOS kernel). Rather than guess, M15 builds
+both axes as separate firmwares: benchmark rows for guest SRAM vs PSRAM and
+step/threaded/cache/AOT, each built with code in flash and in SRAM
+(`copy_to_ram`, with the MSDOS.SYS/disk blobs kept in flash through
+`.flashdata`), plus DOS firmwares for code flash/SRAM x cache on/off with
+exact time accounting. The default DOS firmware is chosen from those numbers.
+
+## 42. DOS runs on the threaded interpreter; CS changes are the AOT boundary
+
+The M14 system loop checked the AOT predicate and single-stepped every
+instruction. Compiled code can only become reachable when CS changes (EXEC's
+far transfer, INT into and IRET out of the kernel, far calls), so the loop now
+uses `md_interp_run_until_cs_change()` everywhere except inside a segment that
+holds an attached compiled program. Profiling DOS2TEST on the host: 94% of
+instructions run in that mode, in runs averaging ~49 instructions.
+
+The CS check is performed only on the dispatch exits that can change CS
+(`op_int`, `op_generic`, `op_prefix`). A check in every `MD_NEXT` was measured
+at ~35% of the DEC/JNZ benchmark and was removed. A unit test pins the
+semantics: near CALL/RET/JMP/loops run through; a far CALL stops with an exact
+instruction count; budgets still report BUDGET.
+
+## 43. Fast paths follow the measured DOS opcode mix
+
+The DOS2TEST session's opcode histogram is broad (Jcc, segment-override
+prefixes, CALL/RET, ALU ModR/M, CMP AL, segment push/pop, LOOP, LODSW...).
+Those opcodes get direct threaded entries that call the existing `md_op_*`
+semantics, so there is still one implementation per instruction. Together with
+decision 42 this took the host DOS session from ~72 to ~103 MIPS. Per-
+instruction counters in the threaded loop are 32-bit locals flushed on exit
+and before interrupt hooks.
+
+## 44. RP2350 defaults are chosen by measurement, clock by variant
+
+Measured on DOS2TEST (M15): code in SRAM beats flash XIP by 33% (the DOS
+working set overflows the 16 KiB XIP cache; tiny benchmark loops do not), and
+the decoded-block cache loses 37% to plain interpretation under the DOS
+kernel's code/data layout. `microdos_pico` is therefore copy_to_ram with the
+cache off. A 300 MHz variant raises clk_sys, then recomputes and re-applies
+the PSRAM QMI timings for the new clock (`psram_configure_params` +
+`psram_reinitialize`) before anything is placed in PSRAM.
+
+## 45. The kernel is compiled; its entry points are source- and profile-assisted
+
+`MSDOS.SYS` is compiled as a raw image at base 0000h. Static discovery from
+offset 0 is cut short by the INT 21h push/ret dispatch, so the 88-entry
+dispatch table (found in the binary via the `PUSH CS:[BX+DISPATCH]`
+instruction) is supplied as a pointer table, and a profiled DOS2TEST session
+contributes every kernel offset reached by a non-sequential transfer. The
+table alone already reaches ~99.8% of what discovery finds; the profile adds
+IVT handlers and device-return paths. Undiscovered code runs interpreted.
+
+## 46. Invalidation is per 64-byte chunk, and attachments die when empty
+
+Profiling showed 641 executed kernel code bytes rewritten during a session:
+DOS reuses DOSINIT (3E7B-40AF) and a smaller region (02B0-033E) as data.
+With image-wide invalidation the first such store would disable the whole
+kernel. Each attachment now has one valid bit per 64-byte chunk; a store to a
+compiled byte clears its chunk, and every compiled block checks the chunks it
+spans on entry (the same check is used by the resume predicate and
+`block_ok()`, so they cannot disagree). When the last chunk holding code is
+cleared, the attachment is marked dead; otherwise a program loaded over an
+old attachment would be single-stepped as if it were compiled code.
+
+## 47. A store check follows the instruction's last effect
+
+Found by lockstep on the compiled kernel: XCHG r/m,reg stored memory, checked
+for a compiled-byte store, and handed over before writing the register. The
+check is now emitted by the block walker after the whole instruction, never
+inside it (`dr_wr()` only records that a store happened). `xchgself.com` pins
+it: it fails on the old generator and passes on the new one.
+
+## 48. Lockstep differential is part of the test suite
+
+`microdos_dos2_e2e --lockstep` runs the compiled system and a pure
+interpreter side by side with identical scripted input. The compiled side runs
+one unit (a whole compiled entry, or one interpreted instruction); the
+interpreter then runs exactly as many instructions; CPU state is compared
+after every unit and all 1 MiB of memory periodically. It also requires 25/25
+from DOS2TEST. `--lockstep-trace N` single-steps the interpreter through unit
+N to name the diverging instruction.
+
+## 49. Generated code is dense: per-block accounting, compact dispatch
+
+The first kernel build was 806 KB of ARM (130 bytes per x86 instruction):
+per-instruction budget checks, 64-bit counters, `cpu->ip` stores, three
+sparse switches. Now the block's instruction count is charged on entry
+(exits give back what did not run), counters are 32-bit locals flushed on
+exit and before interrupts, `cpu->ip` is written only where observable, and
+dispatch is a sorted table plus a dense switch. 244 KB for the kernel, which
+fits the copy_to_ram SRAM layout with ~138 KB to spare. `MD_AOT_COMPACT`
+(shared out-of-line helpers) is available but currently barely smaller.
+
+## 50. Compiled code must stay compiled: fix exits, not instructions
+
+The first RP2350 run of the compiled kernel (88% of instructions compiled)
+was no faster than the interpreter. Host profiling of *why* compiled code
+returned to the system loop showed ~26 instructions per entry:
+45% holes, 32% dispatch misses, 21% store checks. Each return costs a table
+search, a slot lookup and chunk checks, which ate the gain. Three changes:
+
+- `POP r/m16` is compiled. The two hottest misses were DOS's register
+  save/restore routines, which begin with `POP CS:[067Eh]`; a block that
+  starts with a hole is not an entry.
+- The guard epoch advances only when a chunk goes valid -> invalid, and is
+  resynced at each block entry. Stores into already-invalid chunks (DOS
+  buffers in old init code) used to trip every later store check.
+- Holes run inline (`md_interp_step` in place) and continue into the next
+  compiled block. `--interp-at` holes keep the explicit hand-off.
+
+Result: ~83 instructions per entry, exits dominated by CS changes into
+device drivers and user programs (inherent), attached-segment single steps
+58,853 -> 573. The lockstep differential still reports no divergence.
+
+## 51. Compiled code calls the interpreter's semantics for complex instructions
+
+MUL/IMUL/DIV/IDIV and REP string instructions are compiled as calls into
+functions exported from the interpreter (`md_interp_muldiv`,
+`md_interp_string_op`); the interpreter's own group-3 and string paths call
+the same functions. The generator never re-implements them, so results,
+flags and the divide fault cannot diverge. A divide fault stops compiled code
+at the same IP and instruction count as the interpreter (`divfault.com`).
+
+## 52. Re-entry is a bucket lookup, and the loop just enters
+
+Entry lookup uses a table with one slot per 16 image bytes (first entry index
+at or after that offset), so a lookup scans the one or two entries of a
+bucket; `dosrecomp` self-checks the table. In a segment with a live
+attachment the system loop calls `enter()` directly, which already declines
+cheaply when no compiled block can run, instead of running a predicate and
+`block_ok()` first.
+
+## 53. Lazy flags, proven against the eager implementation
+
+The hot ALU operations record (kind, operands, result, carry-in); OSZAPC are
+derived when read. Jcc uses direct CF/ZF/SF/OF predicates; PF/AF are computed
+only when the whole word is read (PUSHF, INT, LAHF). Shifts, MUL/DIV, BCD
+adjusts, POPF, SAHF and CLC/STC/CMC materialise first and stay eager. IF/DF/TF
+are never lazy, so they are read from the raw word directly.
+
+The flags field was renamed (`flags` -> `flags_raw`) so every one of ~220
+access sites had to be converted deliberately through accessors. The lockstep
+differential cannot detect a wrong lazy formula (both sides share it), so a
+dedicated test compares against the verbatim pre-M18 eager helpers
+(`tests/eager_flags_ref.h`): every 8-bit operand/carry combination, chained
+operations whose carry comes from a still-lazy result, 16-bit edges and a
+random sample; every condition code and the full materialised word. A
+deliberately wrong overflow rule is caught by it.
+
+## 54. 300 MHz is the RP2350 default
+
+It held through a soak test with repeated DOS2TEST runs and a long idle at
+the prompt. `microdos_pico_150` remains for comparison.

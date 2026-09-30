@@ -56,6 +56,12 @@ struct MdRuntime {
     /* Optional caller-owned decoded cache. Generated AOT uses this when it must
        leave compiled code and execute an unknown/modified region. */
     MdBlockCache *block_cache;
+
+    /* Attachments of generated images (M15). Cleared by init/reset, so an
+       attachment can never outlive the runtime it was made for. */
+    MdAotGuard aot_slots[MD_AOT_ATTACH_SLOTS];
+    uint32_t aot_use_clock;
+    uint32_t aot_evictions;
 };
 
 void md_runtime_init(MdRuntime *runtime, uint8_t *memory, const MdHooks *hooks);
@@ -80,12 +86,49 @@ void md_runtime_mark_code_range(MdRuntime *runtime, uint16_t segment,
    the function performs real-mode 8086 interrupt-vector dispatch through the IVT. */
 bool md_runtime_interrupt(MdRuntime *runtime, uint8_t vector);
 
-/* Link a generated-image guard into the write-tracking path (idempotent). */
-void md_runtime_register_aot_guard(MdRuntime *runtime, MdAotGuard *guard);
-void md_runtime_unregister_aot_guard(MdRuntime *runtime, MdAotGuard *guard);
+/* Generated-image attachments (see MdAotGuard). An attachment is keyed by
+   (program identity, segment). attach() reuses that key's slot, else a free
+   slot, else evicts the least recently used one (the evicted copy simply
+   runs interpreted). It arms the guard valid. find() returns the slot index
+   or -1; the slot may exist but be invalid after a code write. */
+int md_runtime_aot_find(const MdRuntime *runtime, const void *program, uint16_t segment);
+MdAotGuard *md_runtime_aot_attach(MdRuntime *runtime, const void *program, uint16_t segment,
+                                  uint32_t base, uint32_t size, const uint8_t *code_bits);
+/* Marks the slot most recently used (call when entering compiled code). */
+void md_runtime_aot_touch(MdRuntime *runtime, int slot);
+
+/* M17 out-of-line helpers for compact generated code (MD_AOT_COMPACT):
+   one shared copy instead of the store/guard/flag logic inlined at every
+   compiled instruction. Semantics are exactly the inline versions'. */
+void md_aot_store8(MdX86 *cpu, uint16_t segment, uint16_t offset, uint8_t value);
+void md_aot_store16(MdX86 *cpu, uint16_t segment, uint16_t offset, uint16_t value);
+void md_aot_push(MdX86 *cpu, uint16_t value);
+void md_aot_push_reg(MdX86 *cpu, unsigned reg);
+uint8_t md_aot_alu8(MdX86 *cpu, unsigned operation, uint8_t lhs, uint8_t rhs);
+uint16_t md_aot_alu16(MdX86 *cpu, unsigned operation, uint16_t lhs, uint16_t rhs);
+uint8_t md_aot_shift8(MdX86 *cpu, unsigned operation, uint8_t value, unsigned count);
+uint16_t md_aot_shift16(MdX86 *cpu, unsigned operation, uint16_t value, unsigned count);
+uint8_t md_aot_incdec8(MdX86 *cpu, uint8_t value, int dec);     /* CF preserved */
+uint16_t md_aot_incdec16(MdX86 *cpu, uint16_t value, int dec);  /* CF preserved */
+int md_aot_condition(const MdX86 *cpu, unsigned cc);
+int md_aot_chunks_ok_ol(const MdAotGuard *guard, uint32_t first, uint32_t last);
+
+/* M18: interpreter semantics exported for compiled code, so the generator
+   never re-implements them. `ext` is ModR/M.reg (4 MUL .. 7 IDIV); a divide
+   fault stops the runtime exactly as the interpreter does. The string op
+   takes the raw prefix bytes (0 = none; 26/2E/36/3E; F2/F3). */
+void md_interp_muldiv(MdRuntime *runtime, uint8_t opcode, unsigned ext, uint16_t operand,
+                      uint16_t ip_before);
+void md_interp_string_op(MdRuntime *runtime, uint8_t opcode, uint8_t segment_prefix,
+                         uint8_t repeat_prefix);
 
 MdStopReason md_interp_step(MdRuntime *runtime);
 MdStopReason md_interp_run(MdRuntime *runtime, uint64_t instruction_budget);
+/* Like md_interp_run(), but also returns (with MD_STOP_NONE) as soon as CS
+   changes: far jumps/calls/returns, INT and IRET. The DOS system loop uses it
+   to run the kernel and non-compiled programs at threaded speed while still
+   stopping wherever compiled code could take over (M16). */
+MdStopReason md_interp_run_until_cs_change(MdRuntime *runtime, uint64_t instruction_budget);
 const char *md_stop_reason_name(MdStopReason reason);
 
 #ifdef __cplusplus

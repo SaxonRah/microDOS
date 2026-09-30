@@ -60,10 +60,10 @@ set(MD_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
 set(MICRODOS_HOST_BUILD "${MD_ROOT}/build-host" CACHE PATH "Desktop build directory")
 set(MICRODOS_PICO_KERNEL "${MD_ROOT}/third_party/msdos/v2.0/bin/MSDOS.SYS" CACHE FILEPATH "MSDOS.SYS")
 set(MICRODOS_PICO_DISK "${MD_ROOT}/build-pico/pico_disk.img" CACHE FILEPATH "FAT12 image")
-set(MICRODOS_PICO_SYS_KHZ 0 CACHE STRING "clk_sys in kHz (0 = SDK default)")
 
 set(MD_GENERATED "${MICRODOS_HOST_BUILD}/generated")
-foreach(req "${MD_GENERATED}/dos2test_recomp.c" "${MICRODOS_PICO_KERNEL}" "${MICRODOS_PICO_DISK}")
+foreach(req "${MD_GENERATED}/dos2test_recomp.c" "${MD_GENERATED}/msdos2_recomp.c" "${MD_GENERATED}/loop_recomp.c"
+            "${MD_GENERATED}/memloop_recomp.c" "${MICRODOS_PICO_KERNEL}" "${MICRODOS_PICO_DISK}")
     if(NOT EXISTS "${req}")
         message(FATAL_ERROR "microDOS Pico: missing ${req}\n"
                             "Run .\\md.bat build pico (it builds the host tools and disk first).")
@@ -81,30 +81,72 @@ configure_file("${CMAKE_CURRENT_LIST_DIR}/md_pico_blobs.S.in"
 set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/md_pico_blobs.S" PROPERTIES
     OBJECT_DEPENDS "${MICRODOS_PICO_KERNEL};${MICRODOS_PICO_DISK}")
 
-add_executable(microdos_pico
-    "${CMAKE_CURRENT_LIST_DIR}/microdos_pico.c"
-    "${CMAKE_CURRENT_BINARY_DIR}/md_pico_blobs.S"
-    "${MD_ROOT}/src/system/md_dos2_system.c"
-    "${MD_ROOT}/src/host/msdos2_boot.c"
+set(MD_RUNTIME_SOURCES
     "${MD_ROOT}/src/runtime/runtime.c"
     "${MD_ROOT}/src/runtime/x86_interp.c"
-    "${MD_ROOT}/src/runtime/x86_block_cache.c"
-    "${MD_GENERATED}/dos2test_recomp.c")
+    "${MD_ROOT}/src/runtime/x86_block_cache.c")
 
-target_include_directories(microdos_pico PRIVATE
-    "${MD_ROOT}/include" "${MD_ROOT}/src/runtime" "${MD_ROOT}/src/host"
-    "${MD_ROOT}/src/system" "${MD_GENERATED}")
+function(md_pico_common target code_in_sram)
+    target_include_directories(${target} PRIVATE
+        "${MD_ROOT}/include" "${MD_ROOT}/src/runtime" "${MD_ROOT}/src/host"
+        "${MD_ROOT}/src/system" "${MD_GENERATED}")
+    target_compile_definitions(${target} PRIVATE
+        MD_THREADED_DISPATCH=1
+        PICO_STDIO_DEFAULT_CRLF=0                 # DOS already sends CR LF
+        PICO_STDIO_USB_CONNECT_WAIT_TIMEOUT_MS=0
+        MICRODOS_PICO_CODE_IN_SRAM=${code_in_sram})
+    target_compile_options(${target} PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(${target} PRIVATE pico_stdlib hardware_psram hardware_clocks)
+    if(code_in_sram)
+        # All code and read-only data run from SRAM; only .flashdata (the
+        # MSDOS.SYS and disk blobs) stays in flash. Frees the 16 KiB XIP
+        # cache for PSRAM guest memory.
+        pico_set_binary_type(${target} copy_to_ram)
+    endif()
+    pico_enable_stdio_usb(${target} 1)
+    pico_enable_stdio_uart(${target} 0)
+    pico_add_extra_outputs(${target})
+    target_link_options(${target} PRIVATE "-Wl,--print-memory-usage")
+endfunction()
 
-target_compile_definitions(microdos_pico PRIVATE
-    MD_THREADED_DISPATCH=1
-    PICO_STDIO_DEFAULT_CRLF=0                 # DOS already sends CR LF
-    PICO_STDIO_USB_CONNECT_WAIT_TIMEOUT_MS=0
-    MICRODOS_PICO_SYS_KHZ=${MICRODOS_PICO_SYS_KHZ})
-target_compile_options(microdos_pico PRIVATE -O2 -Wall -Wextra -Wno-unused-parameter)
+# DOS firmware: name, code_in_sram, block_cache, sys_khz (0 = SDK default),
+# kernel_aot (1 = link the compiled MSDOS.SYS, M17)
+function(md_pico_dos target code_in_sram cache sys_khz kernel_aot)
+    add_executable(${target}
+        "${CMAKE_CURRENT_LIST_DIR}/microdos_pico.c"
+        "${CMAKE_CURRENT_BINARY_DIR}/md_pico_blobs.S"
+        "${MD_ROOT}/src/system/md_dos2_system.c"
+        "${MD_ROOT}/src/host/msdos2_boot.c"
+        ${MD_RUNTIME_SOURCES}
+        "${MD_GENERATED}/dos2test_recomp.c")
+    if(kernel_aot)
+        target_sources(${target} PRIVATE "${MD_GENERATED}/msdos2_recomp.c")
+    endif()
+    md_pico_common(${target} ${code_in_sram})
+    target_compile_definitions(${target} PRIVATE MICRODOS_PICO_CACHE=${cache}
+                               MICRODOS_PICO_SYS_KHZ=${sys_khz}
+                               MICRODOS_PICO_KERNEL_AOT=${kernel_aot})
+    pico_set_program_name(${target} "microDOS")
+endfunction()
 
-target_link_libraries(microdos_pico PRIVATE pico_stdlib hardware_psram hardware_clocks)
-pico_enable_stdio_usb(microdos_pico 1)
-pico_enable_stdio_uart(microdos_pico 0)
-pico_set_program_name(microdos_pico "microDOS")
-pico_add_extra_outputs(microdos_pico)
-target_link_options(microdos_pico PRIVATE "-Wl,--print-memory-usage")
+# Benchmark firmware: name, code_in_sram, sys_khz
+function(md_pico_bench target code_in_sram sys_khz)
+    add_executable(${target}
+        "${CMAKE_CURRENT_LIST_DIR}/microdos_bench.c"
+        ${MD_RUNTIME_SOURCES}
+        "${MD_GENERATED}/loop_recomp.c"
+        "${MD_GENERATED}/memloop_recomp.c")
+    md_pico_common(${target} ${code_in_sram})
+    target_compile_definitions(${target} PRIVATE MICRODOS_PICO_SYS_KHZ=${sys_khz})
+    pico_set_program_name(${target} "microDOS bench")
+endfunction()
+
+# M16 defaults come from the M15 measurements: code in SRAM (+33% on DOS),
+# block cache off (+60% on DOS). The other variants stay for comparison.
+# M18: 300 MHz is the default (soak-tested); the compiled kernel stays on.
+# *_150 and *_nokernel are kept for comparison runs.
+md_pico_dos(microdos_pico          1 0 300000 1)   # default: SRAM, no cache, 300 MHz, kernel AOT
+md_pico_dos(microdos_pico_150      1 0 0      1)   # same at 150 MHz
+md_pico_dos(microdos_pico_nokernel 1 0 300000 0)   # interpreted kernel at 300 MHz (A/B)
+md_pico_bench(microdos_bench     1 300000)
+md_pico_bench(microdos_bench_150 1 0)

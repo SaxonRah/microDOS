@@ -349,7 +349,7 @@ void md_msdos2_boot_prepare_cpu(MdRuntime *runtime, MdMsdos2Boot *boot,
     cpu->r[MD_X86_DX] = boot->memory_paragraphs;
     cpu->ss = boot->stack_segment;
     cpu->r[MD_X86_SP] = 0xFFFEu;
-    cpu->flags = (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_IF);
+    md_x86_set_flags(cpu, (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_IF));
 
     /* Recreate SYSINIT's FAR CALL MSDOS stack frame. RETF pops IP then CS. */
     md_x86_push(cpu, boot->bios_segment);

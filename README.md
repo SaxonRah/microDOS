@@ -244,6 +244,70 @@ is preserved between runs; use `md.bat image dos2` to reset it.
 ```
 
 
+### M18 hot holes compiled, cheap re-entry, lazy flags
+
+- MUL/IMUL/DIV/IDIV, REP string instructions and far indirect CALL/JMP are
+  compiled, calling the interpreter's own implementations (exported as
+  `md_interp_muldiv` / `md_interp_string_op`), so semantics stay single-source.
+  The kernel now has 1 hole in 6100 instructions; DOS2TEST has none.
+- Re-entry: a 16-byte-bucket entry index replaces binary search, and the
+  system loop enters compiled code directly instead of re-validating it.
+- Lazy flags: ADD/ADC/SUB/SBB/CMP/logic/INC/DEC record operands and result;
+  flags are derived when read (Jcc uses direct predicates). An exhaustive test
+  proves identical flags to the old eager code (kept as
+  `tests/eager_flags_ref.h`); the field is now `flags_raw`, read through
+  `md_x86_flags()` / `md_x86_cf()` etc.
+- Host: compiled `loop` ~460 -> ~760 MIPS, DOS2TEST session ~83 -> ~147 MIPS.
+  Pico default is now 300 MHz.
+
+### M17 the MS-DOS 2.0 kernel itself is compiled
+
+`MSDOS.SYS` is recompiled at build time (6100 instructions discovered, 6023
+compiled, 77 interpreter holes that run inline) and attached at `1000:0000`
+at boot. In a
+DOS2TEST session 77-86% of all guest instructions now run as compiled kernel
+code. Supporting changes:
+
+- `dosrecomp --base` (raw images), pointer tables (the INT 21h dispatch
+  table), native IRET and far CALL/JMP, profile-guided entries
+  (`aot/msdos2.entries`).
+- Invalidation per 64-byte chunk instead of per image: DOS reuses its init
+  code as buffers, which now disables only those blocks. An attachment dies
+  when every compiled chunk is overwritten (another program loaded there).
+- Store checks run after an instruction's last effect (the kernel exposed an
+  XCHG that handed over half-done; fixture `xchgself.com`).
+- Denser code: per-block budget/count accounting, compact sorted dispatch.
+  The compiled kernel is 244 KB of ARM (806 KB before) and runs from SRAM.
+- `dos2_e2e_lockstep`: compiled system vs pure interpreter, compared after
+  every compiled unit, over the whole DOS2TEST session.
+
+### M16 threaded DOS loop and RP2350 defaults
+
+- `md_interp_run_until_cs_change()`: the threaded interpreter, returning when
+  CS changes. The DOS system loop now runs the kernel, COMMAND.COM and
+  non-compiled programs on it instead of single-stepping; compiled code can
+  only become reachable through a CS change, so no AOT entry is missed.
+- Direct threaded entries for the opcodes that dominate MS-DOS 2.0 (ALU
+  ModR/M forms, group 1, MOV r/m, CALL/RET/JMP, LOOP, string ops, segment
+  push/pop), using the same `md_op_*` semantics as the generic executor.
+- Guard walks are skipped until something attaches, so DOS kernel stack
+  writes (its stack shares pages with its code) cost nothing extra.
+- Host: the DOS2TEST session through the system loop went from ~72 to ~103
+  MIPS. Pico defaults: code in SRAM, block cache off; a 300 MHz variant.
+
+### M15 correctness fixes and RP2350 performance matrix
+
+- Word stores now check both bytes against AOT guards (a same-page word
+  write whose second byte hit compiled code used to be missed).
+- AOT attachments live in `MdRuntime` (8 slots, LRU), so they die with a
+  runtime reset/init and never leak between runtimes.
+- `memloop.com` joins the fixtures; a unit test requires identical memory
+  and instruction counts from interpreter, block cache and AOT.
+- The Pico build produces a benchmark matrix (code in flash vs SRAM, guest in
+  SRAM vs PSRAM, step/threaded/cache/AOT) and four DOS variants (code
+  flash/SRAM x cache on/off) with exact active-time accounting. See
+  `pico/README.md`.
+
 ### M14 Pico 2 target and portable system loop
 
 `src/system/md_dos2_system.c` is a platform-neutral MS-DOS 2.0 loop: boot

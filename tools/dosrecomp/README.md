@@ -19,7 +19,10 @@ points) improves analysis but never replaces the machine code.
 6. Embeds a one-bit-per-byte code map and arms a byte-exact write guard, so
    writes to data that shares a page with code do not disable compiled code,
    while writes to instruction bytes do, immediately.
-7. Exports two ways to run: standalone (`md_recomp_X(runtime, seg, budget)`,
+7. Keeps no attachment state of its own: guards live in `MdRuntime`
+   (`md_runtime_aot_attach`), keyed by the image's descriptor address and
+   segment, so a runtime reset drops them (M15).
+8. Exports two ways to run: standalone (`md_recomp_X(runtime, seg, budget)`,
    loads the embedded image) and attach mode (`md_recomp_X_program`, see
    `include/microdos/aot.h`) for images loaded by a real DOS.
 

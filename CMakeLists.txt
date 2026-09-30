@@ -84,9 +84,26 @@ md_recompile_com(loop md_recomp_loop tests/programs/loop.com 0x107)
 # this fixture keeps proving the AOT -> cached interpreter -> AOT handoff.
 md_recompile_com(hybrid md_recomp_hybrid tests/programs/hybrid.com 0x109 --interp-at 0x105)
 md_recompile_com(selfmod md_recomp_selfmod tests/programs/selfmod.com 0x107)
+md_recompile_com(memloop md_recomp_memloop tests/programs/memloop.com 0x117)
+md_recompile_com(xchgself md_recomp_xchgself tests/programs/xchgself.com 0x107)
+md_recompile_com(divfault md_recomp_divfault tests/programs/divfault.com 0x113)
 
 # M13: DOS2TEST.COM compiled natively and attached when DOS loads it at A>.
 # Entry points come from the NASM listing (tests reached via CALL BX).
+# M17: the released MS-DOS 2.0 kernel itself, compiled when the pinned
+# Microsoft binaries are present (.\md.bat deps msdos). Raw image at 0000h;
+# entry points = profile-guided list + the INT 21h dispatch table.
+set(MD_MSDOS2_SYS "${CMAKE_CURRENT_LIST_DIR}/third_party/msdos/v2.0/bin/MSDOS.SYS")
+if(EXISTS "${MD_MSDOS2_SYS}")
+    set(MD_HAVE_KERNEL_AOT ON)
+    set(MD_RECOMP_EXTRA_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/aot/msdos2.entries")
+    md_recompile_com(msdos2 md_recomp_msdos2 third_party/msdos/v2.0/bin/MSDOS.SYS 0x4132
+        --base 0 --entries "${CMAKE_CURRENT_LIST_DIR}/aot/msdos2.entries" --name MSDOS.SYS)
+    unset(MD_RECOMP_EXTRA_DEPENDS)
+else()
+    set(MD_HAVE_KERNEL_AOT OFF)
+endif()
+
 set(MD_RECOMP_EXTRA_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tests/dos2/DOS2TEST.entries")
 md_recompile_com(dos2test md_recomp_dos2test tests/dos2/DOS2TEST.COM 0x0B97
     --entries "${CMAKE_CURRENT_LIST_DIR}/tests/dos2/DOS2TEST.entries" --name DOS2TEST.COM)
@@ -100,6 +117,10 @@ if(MD_BUILD_HOST)
     add_executable(microdos_msdos2 src/host/msdos2_main.c src/host/msdos2_boot.c
         "${MD_RECOMP_dos2test_C}" "${MD_RECOMP_dos2test_H}")
     target_link_libraries(microdos_msdos2 PRIVATE microdos::runtime)
+    if(MD_HAVE_KERNEL_AOT)
+        target_sources(microdos_msdos2 PRIVATE "${MD_RECOMP_msdos2_C}" "${MD_RECOMP_msdos2_H}")
+        target_compile_definitions(microdos_msdos2 PRIVATE MICRODOS_HAVE_KERNEL_AOT=1)
+    endif()
     target_include_directories(microdos_msdos2 PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/host" "${MD_GENERATED_DIR}")
     if(MSVC)
         target_compile_definitions(microdos_msdos2 PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -121,7 +142,11 @@ if(MD_BUILD_TESTS)
         "${MD_RECOMP_hello_C}" "${MD_RECOMP_hello_H}"
         "${MD_RECOMP_loop_C}" "${MD_RECOMP_loop_H}"
         "${MD_RECOMP_hybrid_C}" "${MD_RECOMP_hybrid_H}"
-        "${MD_RECOMP_selfmod_C}" "${MD_RECOMP_selfmod_H}")
+        "${MD_RECOMP_selfmod_C}" "${MD_RECOMP_selfmod_H}"
+        "${MD_RECOMP_memloop_C}" "${MD_RECOMP_memloop_H}"
+        "${MD_RECOMP_dos2test_C}" "${MD_RECOMP_dos2test_H}"
+        "${MD_RECOMP_xchgself_C}" "${MD_RECOMP_xchgself_H}"
+        "${MD_RECOMP_divfault_C}" "${MD_RECOMP_divfault_H}")
     target_link_libraries(microdos_tests PRIVATE microdos::runtime)
     target_include_directories(microdos_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/host" "${MD_GENERATED_DIR}")
     add_test(NAME microdos_runtime COMMAND microdos_tests)
@@ -135,8 +160,9 @@ if(MD_BUILD_TESTS)
     if(EXISTS "${MD_MSDOS2_BIN}/MSDOS.SYS" AND EXISTS "${MD_MSDOS2_BIN}/COMMAND.COM")
         add_executable(microdos_dos2_e2e tests/test_dos2_e2e.c
             src/system/md_dos2_system.c src/host/msdos2_boot.c
-            "${MD_RECOMP_dos2test_C}" "${MD_RECOMP_dos2test_H}")
-        target_link_libraries(microdos_dos2_e2e PRIVATE microdos::runtime)
+            "${MD_RECOMP_dos2test_C}" "${MD_RECOMP_dos2test_H}"
+            "${MD_RECOMP_msdos2_C}" "${MD_RECOMP_msdos2_H}")
+        target_link_libraries(microdos_dos2_e2e PRIVATE microdos::runtime microdos::decode)
         target_include_directories(microdos_dos2_e2e PRIVATE
             "${CMAKE_CURRENT_LIST_DIR}/src/host" "${CMAKE_CURRENT_LIST_DIR}/src/system" "${MD_GENERATED_DIR}")
         if(MSVC)
@@ -150,7 +176,13 @@ if(MD_BUILD_TESTS)
         set_tests_properties(dos2_e2e_image PROPERTIES FIXTURES_SETUP dos2_image)
         add_test(NAME dos2_e2e_aot COMMAND microdos_dos2_e2e "${MD_MSDOS2_BIN}/MSDOS.SYS" "${MD_E2E_IMG}")
         add_test(NAME dos2_e2e_interp COMMAND microdos_dos2_e2e "${MD_MSDOS2_BIN}/MSDOS.SYS" "${MD_E2E_IMG}" --no-aot)
-        set_tests_properties(dos2_e2e_aot dos2_e2e_interp PROPERTIES FIXTURES_REQUIRED dos2_image)
+        # Same configuration as the Pico *_nocache firmware (M15).
+        add_test(NAME dos2_e2e_nocache COMMAND microdos_dos2_e2e "${MD_MSDOS2_BIN}/MSDOS.SYS" "${MD_E2E_IMG}" --no-cache)
+        # M17: compiled kernel + DOS2TEST vs pure interpreter, compared after
+        # every compiled unit (CPU state) and periodically (all of memory).
+        add_test(NAME dos2_e2e_lockstep COMMAND microdos_dos2_e2e "${MD_MSDOS2_BIN}/MSDOS.SYS" "${MD_E2E_IMG}" --lockstep)
+        set_tests_properties(dos2_e2e_aot dos2_e2e_interp dos2_e2e_nocache dos2_e2e_lockstep
+                             PROPERTIES FIXTURES_REQUIRED dos2_image)
     else()
         message(STATUS "microDOS: DOS 2 end-to-end tests skipped (run .\\md.bat deps msdos)")
     endif()

@@ -10,10 +10,19 @@
  *   kernel        MSDOS.SYS embedded in flash
  *   AOT           DOS2TEST.COM compiled by dosrecomp, attached when DOS runs it
  *
- * Keys: Ctrl+] prints runtime statistics (it is not passed to DOS).
+ * Keys: Ctrl+] prints runtime statistics (it is not passed to DOS): totals
+ * since boot and the interval since the previous Ctrl+]. Press it right
+ * before and right after a program to measure just that program.
+ *
+ * Build variants (pico/CMakeLists.txt):
+ *   MICRODOS_PICO_CACHE        1 = decoded-block cache, 0 = canonical stepping
+ *   MICRODOS_PICO_CODE_IN_SRAM 1 = copy_to_ram binary (informational here)
  */
 #include "md_dos2_system.h"
 #include "dos2test_recomp.h"
+#if MICRODOS_PICO_KERNEL_AOT
+#include "msdos2_recomp.h"
+#endif
 
 #include "hardware/clocks.h"
 #include "hardware/psram.h"
@@ -53,6 +62,38 @@ typedef struct PicoConsole {
 
 static PicoConsole g_con;
 static uint32_t g_disk_writes;
+
+#ifndef MICRODOS_PICO_CACHE
+#define MICRODOS_PICO_CACHE 1
+#endif
+#ifndef MICRODOS_PICO_CODE_IN_SRAM
+#define MICRODOS_PICO_CODE_IN_SRAM 0
+#endif
+#ifndef MICRODOS_PICO_KERNEL_AOT
+#define MICRODOS_PICO_KERNEL_AOT 0
+#endif
+
+/* M15 exact time accounting. Everything is measured, nothing estimated:
+   active = time inside md_dos2_system_run minus the host work it calls
+   back into (idle sleeps, console output, blocking input, disk copies). */
+typedef struct PicoPerf {
+    uint64_t run_us;
+    uint64_t idle_sleep_us;
+    uint64_t console_out_us;
+    uint64_t input_wait_us;
+    uint64_t disk_us;
+    uint64_t instructions;
+    uint64_t aot_instructions;
+    uint64_t cache_hits;
+    uint64_t cache_misses;
+    uint64_t cache_invalidations;
+    uint64_t cache_fallback;
+    uint32_t idle_sleeps;
+    uint64_t at_us;
+} PicoPerf;
+
+static PicoPerf g_perf;          /* running totals */
+static PicoPerf g_perf_mark;     /* snapshot at the previous Ctrl+] */
 
 /* ---- host text (CR LF explicit: stdio CRLF translation is off) --------- */
 
@@ -96,10 +137,12 @@ static bool pico_fetch(PicoConsole *con, bool block, uint8_t *value)
 static void con_write(void *user, const uint8_t *data, size_t size)
 {
     PicoConsole *con = (PicoConsole *)user;
+    const uint64_t t0 = time_us_64();
     size_t i;
     con->idle_polls = 0u;
     for (i = 0; i < size; ++i) putchar_raw((int)data[i]);
     stdio_flush();
+    g_perf.console_out_us += time_us_64() - t0;
 }
 
 static bool con_peek(void *user, uint8_t *value)
@@ -108,8 +151,10 @@ static bool con_peek(void *user, uint8_t *value)
     if (!con->have_pending) {
         if (!pico_fetch(con, false, &con->pending)) {
             if (++con->idle_polls >= MD_IDLE_POLLS) {
+                const uint64_t t0 = time_us_64();
                 ++con->idle_sleeps;
                 sleep_us(500);                    /* idle prompt: stop spinning */
+                g_perf.idle_sleep_us += time_us_64() - t0;
             }
             return false;
         }
@@ -129,7 +174,12 @@ static bool con_read(void *user, uint8_t *value)
         con->have_pending = false;
         return true;
     }
-    return pico_fetch(con, true, value);
+    {
+        const uint64_t t0 = time_us_64();
+        const bool ok = pico_fetch(con, true, value);
+        g_perf.input_wait_us += time_us_64() - t0;
+        return ok;
+    }
 }
 
 static void con_flush(void *user)
@@ -146,7 +196,11 @@ static bool disk_read(void *user, uint32_t sector, uint8_t *data, size_t size)
     (void)user;
     if (size != 512u || off + size > MD_DISK_BYTES) return false;
     g_con.idle_polls = 0u;
-    memcpy(data, g_disk + off, size);
+    {
+        const uint64_t t0 = time_us_64();
+        memcpy(data, g_disk + off, size);
+        g_perf.disk_us += time_us_64() - t0;
+    }
     return true;
 }
 
@@ -156,9 +210,36 @@ static bool disk_write(void *user, uint32_t sector, const uint8_t *data, size_t 
     (void)user;
     if (size != 512u || off + size > MD_DISK_BYTES) return false;
     g_con.idle_polls = 0u;
-    memcpy(g_disk + off, data, size);
+    {
+        const uint64_t t0 = time_us_64();
+        memcpy(g_disk + off, data, size);
+        g_perf.disk_us += time_us_64() - t0;
+    }
     ++g_disk_writes;
     return true;
+}
+
+/* ---- clock --------------------------------------------------------------- */
+
+#ifndef MICRODOS_PICO_SYS_KHZ
+#define MICRODOS_PICO_SYS_KHZ 0
+#endif
+
+/* M16: optional higher clk_sys. The SDK initialises PSRAM before main() for
+   the boot clock, so after changing clk_sys the QMI divider/rxdelay/select
+   timings are recomputed from the new clock and PSRAM is re-initialised.
+   Nothing lives in PSRAM yet at this point. Same approach microconsole uses
+   for 300 MHz on this board, plus the PSRAM retime. */
+static bool md_pico_set_clock(void)
+{
+#if MICRODOS_PICO_SYS_KHZ > 0
+    if (!set_sys_clock_khz(MICRODOS_PICO_SYS_KHZ, false)) return false;
+    if (psram_configure_params(PICO_DEFAULT_PSRAM_MAX_FREQ, PICO_DEFAULT_PSRAM_MAX_SELECT,
+                               PICO_DEFAULT_PSRAM_MIN_DESELECT) != 0) return false;
+    return psram_reinitialize() == 0;
+#else
+    return true;
+#endif
 }
 
 /* ---- boot checks -------------------------------------------------------- */
@@ -187,25 +268,71 @@ static bool md_psram_ok(void)
     return true;
 }
 
+static void md_perf_snapshot(PicoPerf *p)
+{
+    p->instructions = g_sys.runtime.instructions;
+    p->aot_instructions = g_sys.runtime.aot_instructions;
+    p->cache_hits = g_cache.hits;
+    p->cache_misses = g_cache.misses;
+    p->cache_invalidations = g_cache.invalidations;
+    p->cache_fallback = g_cache.fallback_instructions;
+    p->idle_sleeps = g_con.idle_sleeps;
+    p->at_us = time_us_64();
+}
+
+static void md_perf_report(const char *label, const PicoPerf *now, const PicoPerf *from, uint64_t since_us)
+{
+    const uint64_t wall = now->at_us - since_us;
+    const uint64_t run = now->run_us - from->run_us;
+    const uint64_t sleep = now->idle_sleep_us - from->idle_sleep_us;
+    const uint64_t out = now->console_out_us - from->console_out_us;
+    const uint64_t in = now->input_wait_us - from->input_wait_us;
+    const uint64_t disk = now->disk_us - from->disk_us;
+    const uint64_t host = sleep + out + in + disk;
+    const uint64_t active = run > host ? run - host : 0u;
+    const uint64_t instr = now->instructions - from->instructions;
+
+    md_say("[perf] --- %s ---\n", label);
+    md_say("[perf] wall %9.3f s   in-guest-loop %9.3f s\n", (double)wall / 1e6, (double)run / 1e6);
+    md_say("[perf] active %7.3f s   idle-sleep %.3f s   console-out %.3f s   input-wait %.3f s   disk %.3f s\n",
+           (double)active / 1e6, (double)sleep / 1e6, (double)out / 1e6, (double)in / 1e6, (double)disk / 1e6);
+    md_say("[perf] instructions %llu (aot %llu)   active %.3f MIPS\n",
+           (unsigned long long)instr,
+           (unsigned long long)(now->aot_instructions - from->aot_instructions),
+           active != 0u ? (double)instr / (double)active : 0.0);
+    md_say("[perf] cache hits %llu misses %llu invalidations %llu fallback %llu   idle-sleeps %lu\n",
+           (unsigned long long)(now->cache_hits - from->cache_hits),
+           (unsigned long long)(now->cache_misses - from->cache_misses),
+           (unsigned long long)(now->cache_invalidations - from->cache_invalidations),
+           (unsigned long long)(now->cache_fallback - from->cache_fallback),
+           (unsigned long)(now->idle_sleeps - from->idle_sleeps));
+}
+
 static void md_stats(uint64_t start_us)
 {
-    const MdRuntime *rt = &g_sys.runtime;
-    const uint64_t us = time_us_64() - start_us;
-    const double mips = us != 0u ? (double)rt->instructions / (double)us : 0.0;
+    PicoPerf now = g_perf;
+    PicoPerf zero;
+    memset(&zero, 0, sizeof(zero));
+    md_perf_snapshot(&now);
 
-    md_say("\n[stats] uptime=%.1fs instructions=%llu avg=%.2f MIPS\n",
-           (double)us / 1e6, (unsigned long long)rt->instructions, mips);
-    md_say("[stats] aot: %s attaches=%lu enters=%lu compiled=%llu\n",
-           g_programs[0]->name, (unsigned long)g_sys.aot_attaches,
-           (unsigned long)g_sys.aot_enters, (unsigned long long)rt->aot_instructions);
-    md_say("[stats] cache: hits=%llu misses=%llu invalidations=%llu fallback=%llu\n",
-           (unsigned long long)g_cache.hits, (unsigned long long)g_cache.misses,
-           (unsigned long long)g_cache.invalidations,
-           (unsigned long long)g_cache.fallback_instructions);
-    md_say("[stats] console polls=%lu idle-sleeps=%lu disk sector writes=%lu (RAM only)\n",
-           (unsigned long)g_sys.boot.console_poll_calls, (unsigned long)g_con.idle_sleeps,
-           (unsigned long)g_disk_writes);
-    md_say("[stats] CS:IP=%04X:%04X\n", rt->cpu.cs, rt->cpu.ip);
+    md_say("\n[perf] config: M18, clk %lu MHz, code %s, block cache %s, kernel AOT %s, guest PSRAM\n",
+           (unsigned long)(clock_get_hz(clk_sys) / 1000000u),
+           MICRODOS_PICO_CODE_IN_SRAM ? "SRAM (copy_to_ram)" : "flash XIP",
+           MICRODOS_PICO_CACHE ? "ON" : "OFF",
+           g_sys.kernel_attached ? "ON" : "OFF");
+    md_perf_report("since boot", &now, &zero, start_us);
+    md_perf_report("since previous Ctrl+]", &now, &g_perf_mark,
+                   g_perf_mark.at_us != 0u ? g_perf_mark.at_us : start_us);
+    md_say("[perf] aot: kernel compiled %llu (%.1f%% of all)   DOS2TEST compiled %llu   attached-segment steps %llu\n",
+           (unsigned long long)g_sys.kernel_aot_instructions,
+           now.instructions ? 100.0 * (double)g_sys.kernel_aot_instructions / (double)now.instructions : 0.0,
+           (unsigned long long)(now.aot_instructions - g_sys.kernel_aot_instructions),
+           (unsigned long long)g_sys.attached_steps);
+    md_say("[perf] aot: attaches=%lu enters=%lu evictions=%lu   disk writes %lu (RAM only)   CS:IP=%04X:%04X\n",
+           (unsigned long)g_sys.aot_attaches,
+           (unsigned long)g_sys.aot_enters, (unsigned long)g_sys.runtime.aot_evictions,
+           (unsigned long)g_disk_writes, g_sys.runtime.cpu.cs, g_sys.runtime.cpu.ip);
+    g_perf_mark = now;
 }
 
 int main(void)
@@ -215,15 +342,14 @@ int main(void)
     uint64_t start_us;
     MdStopReason stop = MD_STOP_NONE;
 
-#if MICRODOS_PICO_SYS_KHZ > 0
-    set_sys_clock_khz(MICRODOS_PICO_SYS_KHZ, true);
-#endif
+    const bool clock_ok = md_pico_set_clock();
     stdio_init_all();
     while (!stdio_usb_connected()) sleep_ms(20);    /* wait for a terminal */
     sleep_ms(300);
 
     md_say("\nmicroDOS for Pico 2 (Pimoroni Pico Plus 2)\n");
-    md_say("  clk_sys: %lu MHz\n", (unsigned long)(clock_get_hz(clk_sys) / 1000000u));
+    md_say("  clk_sys: %lu MHz%s\n", (unsigned long)(clock_get_hz(clk_sys) / 1000000u),
+           MICRODOS_PICO_SYS_KHZ > 0 ? (clock_ok ? " (raised; PSRAM retimed)" : " (REQUESTED CLOCK FAILED)") : "");
     md_say("  psram:   %lu KiB (sdk available=%d)\n",
            (unsigned long)(psram_get_size() / 1024u), psram_is_available() ? 1 : 0);
 
@@ -242,7 +368,7 @@ int main(void)
     memcpy(g_disk, md_blob_disk, MD_DISK_BYTES);
     md_say("  disk:    360 KiB image copied from flash to PSRAM (writes are lost at reset)\n");
 
-    md_dos2_system_init(&g_sys, g_guest, &g_cache);
+    md_dos2_system_init(&g_sys, g_guest, MICRODOS_PICO_CACHE ? &g_cache : NULL);
     g_sys.boot.console.write = con_write;
     g_sys.boot.console.peek = con_peek;
     g_sys.boot.console.read = con_read;
@@ -256,6 +382,9 @@ int main(void)
     g_sys.boot.disk.writable = true;
     g_sys.boot.clock_days = 1162u;          /* 1983-03-08; set it at the DOS prompt */
     g_sys.boot.clock_hours = 12u;
+#if MICRODOS_PICO_KERNEL_AOT
+    md_dos2_system_set_kernel_aot(&g_sys, &md_recomp_msdos2_program);   /* M17 */
+#endif
     md_dos2_system_set_aot(&g_sys, g_programs, 1u, true);
 
     if (!md_dos2_system_start(&g_sys, md_blob_msdos_sys, kernel_size)) {
@@ -264,14 +393,27 @@ int main(void)
         for (;;) sleep_ms(1000);
     }
     md_say("  kernel:  MSDOS.SYS %lu bytes\n", (unsigned long)kernel_size);
+#if MICRODOS_PICO_KERNEL_AOT
+    md_say("  aot:     MSDOS.SYS kernel (%lu compiled, %lu holes) %s\n",
+           (unsigned long)md_recomp_msdos2_program.compiled_instructions,
+           (unsigned long)md_recomp_msdos2_program.hole_instructions,
+           g_sys.kernel_attached ? "attached" : "NOT ATTACHED (image mismatch)");
+#else
+    md_say("  aot:     MSDOS.SYS kernel: not compiled in this firmware\n");
+#endif
     md_say("  aot:     %s (%lu compiled, %lu holes)\n", g_programs[0]->name,
            (unsigned long)g_programs[0]->compiled_instructions,
            (unsigned long)g_programs[0]->hole_instructions);
-    md_say("  keys:    Ctrl+] -> statistics\n");
+    md_say("  config:  code %s, block cache %s\n",
+           MICRODOS_PICO_CODE_IN_SRAM ? "SRAM (copy_to_ram)" : "flash XIP",
+           MICRODOS_PICO_CACHE ? "ON" : "OFF");
+    md_say("  keys:    Ctrl+] -> statistics (since boot + since previous Ctrl+])\n");
 
     start_us = time_us_64();
     for (;;) {
+        const uint64_t t0 = time_us_64();
         stop = md_dos2_system_run(&g_sys, MD_SLICE);
+        g_perf.run_us += time_us_64() - t0;
         if (g_con.stats_requested) {
             g_con.stats_requested = false;
             md_stats(start_us);

@@ -24,6 +24,10 @@
 
 typedef struct DrOptions {
     const char *input;
+    uint16_t base;                /* guest offset of image byte 0 (0100h for .COM) */
+    int code_start_set;
+    struct { uint16_t addr; uint16_t count; } tables[16];
+    size_t table_count;
     const char *output_c;
     const char *output_h;
     const char *symbol;
@@ -45,6 +49,7 @@ enum {
 };
 
 typedef struct DrProgram {
+    uint16_t base;
     uint8_t *image;
     size_t image_size;
     uint16_t code_start;
@@ -71,7 +76,12 @@ static void dr_usage(const char *exe)
     fprintf(stderr,
             "usage: %s --input file.com --output-c out.c --output-h out.h --symbol name\n"
             "          [--code-start N] [--code-end N] [--entry N]... [--entries FILE]\n"
-            "          [--interp-at N]... [--name NAME] [--dump]\n", exe);
+            "          [--interp-at N]... [--name NAME] [--base N] [--pointer-table ADDR:COUNT]...\n"
+            "          [--dump]\n"
+            "  --base N               guest offset of image byte 0 (default 0x100 = .COM;\n"
+            "                         0 for raw images such as MSDOS.SYS)\n"
+            "  --pointer-table A:N    N little-endian near code pointers stored at offset A\n"
+            "                         (e.g. a dispatch table) become entry points\n", exe);
 }
 
 static int dr_parse_u32(const char *text, uint32_t *out)
@@ -99,6 +109,18 @@ static int dr_load_entries(const char *path, DrOptions *opt)
         unsigned long v;
         while (*p == ' ' || *p == '\t') ++p;
         if (*p == '#' || *p == ';' || *p == '\n' || *p == '\r' || *p == '\0') continue;
+        if (strncmp(p, "table", 5) == 0) {
+            unsigned long a, n;
+            char *e1, *e2;
+            a = strtoul(p + 5, &e1, 0);
+            n = strtoul(e1, &e2, 0);
+            if (e1 != p + 5 && e2 != e1 && a <= 0xFFFFul && n <= 0xFFFFul && opt->table_count < 16u) {
+                opt->tables[opt->table_count].addr = (uint16_t)a;
+                opt->tables[opt->table_count].count = (uint16_t)n;
+                ++opt->table_count;
+            }
+            continue;
+        }
         v = strtoul(p, &end, 0);
         if (end == p || v > 0xFFFFul) continue;
         if (strncmp(end, " interp", 7) == 0) {
@@ -115,6 +137,7 @@ static int dr_parse_options(int argc, char **argv, DrOptions *opt)
 {
     int i;
     memset(opt, 0, sizeof(*opt));
+    opt->base = DR_COM_BASE;
     opt->code_start = DR_COM_BASE;
     opt->code_end = DR_IP_SPACE;
     for (i = 1; i < argc; ++i) {
@@ -128,9 +151,23 @@ static int dr_parse_options(int argc, char **argv, DrOptions *opt)
         else if (strcmp(a, "--symbol") == 0) opt->symbol = argv[++i];
         else if (strcmp(a, "--name") == 0) opt->program_name = argv[++i];
         else if (strcmp(a, "--entries") == 0) { if (!dr_load_entries(argv[++i], opt)) return 0; }
+        else if (strcmp(a, "--base") == 0) {
+            if (!dr_parse_u32(argv[++i], &v) || v > 0xFFFFu) return 0;
+            opt->base = (uint16_t)v;
+        } else if (strcmp(a, "--pointer-table") == 0) {
+            char *colon = strchr(argv[++i], ':');
+            uint32_t n;
+            if (colon == NULL || opt->table_count >= 16u) return 0;
+            *colon = '\0';
+            if (!dr_parse_u32(argv[i], &v) || !dr_parse_u32(colon + 1, &n) || v > 0xFFFFu || n > 0xFFFFu) return 0;
+            opt->tables[opt->table_count].addr = (uint16_t)v;
+            opt->tables[opt->table_count].count = (uint16_t)n;
+            ++opt->table_count;
+        }
         else if (strcmp(a, "--code-start") == 0) {
             if (!dr_parse_u32(argv[++i], &v) || v > 0xFFFFu) return 0;
             opt->code_start = (uint16_t)v;
+            opt->code_start_set = 1;
         } else if (strcmp(a, "--code-end") == 0) {
             if (!dr_parse_u32(argv[++i], &v) || v > DR_IP_SPACE) return 0;
             opt->code_end = v;
@@ -143,6 +180,7 @@ static int dr_parse_options(int argc, char **argv, DrOptions *opt)
             opt->interp_at[opt->interp_count++] = (uint16_t)v;
         } else return 0;
     }
+    if (!opt->code_start_set) opt->code_start = opt->base;
     return opt->input && opt->output_c && opt->output_h && opt->symbol;
 }
 
@@ -182,7 +220,7 @@ static uint8_t *dr_read_file(const char *path, size_t *size_out)
 
 static int dr_in_image(const DrProgram *p, uint32_t ip)
 {
-    return ip >= DR_COM_BASE && ip < DR_COM_BASE + p->image_size;
+    return ip >= p->base && ip < (uint32_t)p->base + p->image_size;
 }
 
 static int dr_in_code(const DrProgram *p, uint32_t ip)
@@ -192,7 +230,7 @@ static int dr_in_code(const DrProgram *p, uint32_t ip)
 
 static uint8_t dr_u8(const DrProgram *p, uint32_t ip)
 {
-    return dr_in_image(p, ip) ? p->image[ip - DR_COM_BASE] : 0u;
+    return dr_in_image(p, ip) ? p->image[ip - p->base] : 0u;
 }
 
 static uint16_t dr_u16(const DrProgram *p, uint32_t ip)
@@ -221,17 +259,27 @@ static int dr_discover(DrProgram *p, const DrOptions *opt)
         dr_queue(p, opt->entries[i]);
         dr_mark_start(p, opt->entries[i]);
     }
+    for (i = 0; i < opt->table_count; ++i) {
+        unsigned k;
+        for (k = 0; k < opt->tables[i].count; ++k) {
+            const uint32_t at = (uint32_t)opt->tables[i].addr + 2u * k;
+            const uint16_t target = dr_u16(p, at);
+            if (!dr_in_image(p, at + 1u)) break;
+            dr_queue(p, target);
+            dr_mark_start(p, target);
+        }
+    }
     while (p->head < p->tail) {
         const uint16_t ip = p->queue[p->head++];
         MdDecodedInstruction d;
         uint32_t b;
-        if (!md_decode_8086(p->image, p->image_size, DR_COM_BASE, ip, &d)) continue;
+        if (!md_decode_8086(p->image, p->image_size, p->base, ip, &d)) continue;
         if (!dr_in_code(p, (uint32_t)ip + d.length - 1u)) continue;
         p->reachable[ip] = 1u;
         p->dec[ip] = d;
         ++p->inst_count;
         for (b = ip; b < (uint32_t)ip + d.length; ++b) {
-            const uint32_t off = b - DR_COM_BASE;
+            const uint32_t off = b - p->base;
             p->code_bits[off >> 3] |= (uint8_t)(1u << (off & 7u));
         }
         switch (d.flow) {
@@ -262,11 +310,21 @@ static int dr_discover(DrProgram *p, const DrOptions *opt)
 /* ------------------------------------------------------------------------ */
 /* Emitter. dr_gen(p, ip, f) with f == NULL only classifies.                  */
 
-typedef struct DrOut { FILE *f; } DrOut;
+/* Emitter output: a FILE, an in-memory buffer (so the block walker can fill
+   in per-instruction details afterwards), or nothing (classification). */
+typedef struct DrOut { FILE *f; char *buf; size_t len, cap; } DrOut;
 
 static void o(DrOut *out, const char *fmt, ...)
 {
     va_list ap;
+    if (out->buf != NULL) {
+        int n;
+        va_start(ap, fmt);
+        n = vsnprintf(out->buf + out->len, out->cap - out->len, fmt, ap);
+        va_end(ap);
+        if (n > 0) out->len += (size_t)n < out->cap - out->len ? (size_t)n : out->cap - out->len - 1u;
+        return;
+    }
     if (out->f == NULL) return;
     va_start(ap, fmt);
     vfprintf(out->f, fmt, ap);
@@ -351,14 +409,20 @@ static void dr_rd(char *buf, size_t n, const DrModrm *m, int w16)
     if (m->is_reg) snprintf(buf, n, w16 ? "cpu->r[%u]" : "md_x86_get_reg8(cpu, %uu)", m->rm);
     else snprintf(buf, n, w16 ? "md_x86_read16(cpu, s_, o_)" : "md_x86_read8(cpu, s_, o_)");
 }
+/* Set when an instruction stored to memory through dr_wr(). The store check
+   (MD_AOT_WCHK) is emitted by the block emitter only after the instruction's
+   last effect: checking right after the store could hand over to the
+   interpreter with the instruction half done (M17: XCHG r/m,reg). */
+static int g_dr_store_pending;
+
 static void dr_wr(DrOut *out, const DrModrm *m, int w16, const char *value)
 {
     if (m->is_reg) {
         if (w16) o(out, "        cpu->r[%u] = %s;\n", m->rm, value);
         else o(out, "        md_x86_set_reg8(cpu, %uu, %s);\n", m->rm, value);
     } else {
-        o(out, "        md_x86_write%s(cpu, s_, o_, %s);\n", w16 ? "16" : "8", value);
-        o(out, "        MD_AOT_WCHK();\n");
+        o(out, "        MD_W%s(s_, o_, %s);\n", w16 ? "16" : "8", value);
+        g_dr_store_pending = 1;
     }
 }
 
@@ -366,7 +430,7 @@ static void dr_goto(DrOut *out, const DrProgram *p, uint16_t target)
 {
     if (dr_in_code(p, target) && p->block_start[target] && p->reachable[target] &&
         p->kind[target] != DR_GEN_HOLE) {
-        o(out, "    MD_AOT_GOTO(0x%04Xu, md_block_%04X);\n", target, target);
+        o(out, "    goto md_block_%04X;\n", target);
     } else {
         o(out, "    cpu->ip = 0x%04Xu; goto md_dispatch;\n", target);
     }
@@ -374,10 +438,8 @@ static void dr_goto(DrOut *out, const DrProgram *p, uint16_t target)
 
 static const char *const kAluName[8] = { "add", "or", "adc", "sbb", "and", "sub", "xor", "cmp" };
 
-static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
+static int dr_gen_to(DrProgram *p, uint16_t ip, DrOut *out)
 {
-    DrOut out_ = { file };
-    DrOut *out = &out_;
     const MdDecodedInstruction *d = &p->dec[ip];
     const uint32_t at = (uint32_t)ip + d->prefix_count;       /* opcode */
     const uint8_t op = dr_u8(p, at);
@@ -388,7 +450,7 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
     char a[96], b[96];
     DrModrm m;
 
-#define TICK() o(out, "    MD_AOT_TICK(0x%04Xu, 0x%04Xu);\n", ip, next)
+#define TICK() ((void)0)   /* M17: accounting is per block (MD_AOT_BLOCK) */
 #define OPEN() o(out, "    {\n")
 #define CLOSE() o(out, "    }\n")
 
@@ -408,14 +470,14 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
             if (wide) snprintf(b, sizeof(b), "cpu->r[%u]", m.reg);
             else snprintf(b, sizeof(b), "md_x86_get_reg8(cpu, %uu)", m.reg);
             if (to_reg) {
-                if (alu == 7u) o(out, "        (void)md_x86_alu%s(cpu, 7u, %s, %s);\n", wide ? "16" : "8", b, a);
-                else if (wide) o(out, "        cpu->r[%u] = md_x86_alu16(cpu, %uu, %s, %s);\n", m.reg, alu, b, a);
-                else o(out, "        md_x86_set_reg8(cpu, %uu, md_x86_alu8(cpu, %uu, %s, %s));\n", m.reg, alu, b, a);
+                if (alu == 7u) o(out, "        (void)MD_ALU%s(7u, %s, %s);\n", wide ? "16" : "8", b, a);
+                else if (wide) o(out, "        cpu->r[%u] = MD_ALU16(%uu, %s, %s);\n", m.reg, alu, b, a);
+                else o(out, "        md_x86_set_reg8(cpu, %uu, MD_ALU8(%uu, %s, %s));\n", m.reg, alu, b, a);
             } else {
                 char v[256];
-                if (alu == 7u) o(out, "        (void)md_x86_alu%s(cpu, 7u, %s, %s);\n", wide ? "16" : "8", a, b);
+                if (alu == 7u) o(out, "        (void)MD_ALU%s(7u, %s, %s);\n", wide ? "16" : "8", a, b);
                 else {
-                    snprintf(v, sizeof(v), "md_x86_alu%s(cpu, %uu, %s, %s)", wide ? "16" : "8", alu, a, b);
+                    snprintf(v, sizeof(v), "MD_ALU%s(%uu, %s, %s)", wide ? "16" : "8", alu, a, b);
                     dr_wr(out, &m, wide, v);
                 }
             }
@@ -425,11 +487,11 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
         }
         TICK();
         if (form == 4u) {
-            if (alu == 7u) o(out, "    (void)md_x86_alu8(cpu, 7u, md_x86_get_reg8(cpu, 0u), 0x%02Xu);\n", dr_u8(p, at + 1u));
-            else o(out, "    md_x86_set_reg8(cpu, 0u, md_x86_alu8(cpu, %uu, md_x86_get_reg8(cpu, 0u), 0x%02Xu));\n", alu, dr_u8(p, at + 1u));
+            if (alu == 7u) o(out, "    (void)MD_ALU8(7u, md_x86_get_reg8(cpu, 0u), 0x%02Xu);\n", dr_u8(p, at + 1u));
+            else o(out, "    md_x86_set_reg8(cpu, 0u, MD_ALU8(%uu, md_x86_get_reg8(cpu, 0u), 0x%02Xu));\n", alu, dr_u8(p, at + 1u));
         } else {
-            if (alu == 7u) o(out, "    (void)md_x86_alu16(cpu, 7u, cpu->r[0], 0x%04Xu);\n", dr_u16(p, at + 1u));
-            else o(out, "    cpu->r[0] = md_x86_alu16(cpu, %uu, cpu->r[0], 0x%04Xu);\n", alu, dr_u16(p, at + 1u));
+            if (alu == 7u) o(out, "    (void)MD_ALU16(7u, cpu->r[0], 0x%04Xu);\n", dr_u16(p, at + 1u));
+            else o(out, "    cpu->r[0] = MD_ALU16(%uu, cpu->r[0], 0x%04Xu);\n", alu, dr_u16(p, at + 1u));
         }
         return DR_GEN_CONTINUE;
     }
@@ -438,7 +500,7 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
         /* ---- segment register push/pop ------------------------------- */
         case 0x06: case 0x0E: case 0x16: case 0x1E:
             TICK();
-            o(out, "    md_x86_push(cpu, %s);\n    MD_AOT_WCHK();\n", kSeg[(op >> 3) & 3u]);
+            o(out, "    MD_PUSH(%s);\n    MD_AOT_WCHK_HERE();\n", kSeg[(op >> 3) & 3u]);
             return DR_GEN_CONTINUE;
         case 0x07: case 0x17: case 0x1F:
             TICK();
@@ -450,15 +512,12 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
     if (op >= 0x40u && op <= 0x4Fu) {           /* INC/DEC r16, CF preserved */
         const unsigned r = op & 7u;
         TICK();
-        o(out, "    { const uint16_t cf_ = cpu->flags & MD_X86_FLAG_CF;\n"
-               "      cpu->r[%u] = md_x86_%s16(cpu, cpu->r[%u], 1u);\n"
-               "      cpu->flags = (uint16_t)((cpu->flags & (uint16_t)~MD_X86_FLAG_CF) | cf_); }\n",
-          r, op < 0x48u ? "add" : "sub", r);
+        o(out, "    cpu->r[%u] = MD_INCDEC16(cpu->r[%u], %d);\n", r, r, op < 0x48u ? 0 : 1);
         return DR_GEN_CONTINUE;
     }
     if (op >= 0x50u && op <= 0x57u) {
         TICK();
-        o(out, "    md_x86_push_reg(cpu, %uu);\n    MD_AOT_WCHK();\n", op & 7u);
+        o(out, "    MD_PUSHR(%uu);\n    MD_AOT_WCHK_HERE();\n", op & 7u);
         return DR_GEN_CONTINUE;
     }
     if (op >= 0x58u && op <= 0x5Fu) {
@@ -468,7 +527,7 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
     }
     if (op >= 0x70u && op <= 0x7Fu) {           /* Jcc rel8 */
         TICK();
-        o(out, "    if (md_x86_condition(cpu, 0x%Xu)) {\n", op & 0x0Fu);
+        o(out, "    if (MD_COND(0x%Xu)) {\n", op & 0x0Fu);
         dr_goto(out, p, d->target);
         o(out, "    }\n");
         dr_goto(out, p, next);
@@ -484,10 +543,10 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
         TICK(); OPEN(); dr_ea(out, &m);
         dr_rd(a, sizeof(a), &m, wide);
         if (m.reg == 7u) {
-            o(out, "        (void)md_x86_alu%s(cpu, 7u, %s, 0x%04Xu);\n", wide ? "16" : "8", a, imm);
+            o(out, "        (void)MD_ALU%s(7u, %s, 0x%04Xu);\n", wide ? "16" : "8", a, imm);
         } else {
             char v[256];
-            snprintf(v, sizeof(v), "md_x86_alu%s(cpu, %uu, %s, 0x%04Xu)", wide ? "16" : "8", m.reg, a, imm);
+            snprintf(v, sizeof(v), "MD_ALU%s(%uu, %s, 0x%04Xu)", wide ? "16" : "8", m.reg, a, imm);
             dr_wr(out, &m, wide, v);
         }
         CLOSE();
@@ -514,8 +573,8 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
             dr_modrm(p, at + 1u, seg_ov, &m);
             TICK(); OPEN(); dr_ea(out, &m);
             dr_rd(a, sizeof(a), &m, w16);
-            if (w16) o(out, "        (void)md_x86_logic16(cpu, (uint16_t)(%s & cpu->r[%u]));\n", a, m.reg);
-            else o(out, "        (void)md_x86_logic8(cpu, (uint8_t)(%s & md_x86_get_reg8(cpu, %uu)));\n", a, m.reg);
+            if (w16) o(out, "        (void)MD_ALU16(4u, 0xFFFFu, (uint16_t)(%s & cpu->r[%u]));\n", a, m.reg);
+            else o(out, "        (void)MD_ALU8(4u, 0xFFu, (uint8_t)(%s & md_x86_get_reg8(cpu, %uu)));\n", a, m.reg);
             CLOSE();
             return DR_GEN_CONTINUE;
 
@@ -589,20 +648,20 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
             return DR_GEN_CONTINUE;
         case 0x9C:
             TICK();
-            o(out, "    md_x86_push(cpu, (uint16_t)(cpu->flags | MD_X86_FLAG_ALWAYS1));\n    MD_AOT_WCHK();\n");
+            o(out, "    MD_PUSH((uint16_t)(md_x86_flags(cpu) | MD_X86_FLAG_ALWAYS1));\n    MD_AOT_WCHK_HERE();\n");
             return DR_GEN_CONTINUE;
         case 0x9D:
             TICK();
-            o(out, "    cpu->flags = (uint16_t)(md_x86_pop(cpu) | MD_X86_FLAG_ALWAYS1);\n");
+            o(out, "    md_x86_set_flags(cpu, (uint16_t)(md_x86_pop(cpu) | MD_X86_FLAG_ALWAYS1));\n");
             return DR_GEN_CONTINUE;
         case 0x9E:
             TICK();
             o(out, "    { const uint16_t mk_ = MD_X86_FLAG_SF | MD_X86_FLAG_ZF | MD_X86_FLAG_AF | MD_X86_FLAG_PF | MD_X86_FLAG_CF;\n"
-                   "      cpu->flags = (uint16_t)((cpu->flags & (uint16_t)~mk_) | (md_x86_get_reg8(cpu, 4u) & mk_) | MD_X86_FLAG_ALWAYS1); }\n");
+                   "      md_x86_update_flags(cpu, mk_, (uint16_t)((md_x86_get_reg8(cpu, 4u) & mk_) | MD_X86_FLAG_ALWAYS1)); }\n");
             return DR_GEN_CONTINUE;
         case 0x9F:
             TICK();
-            o(out, "    md_x86_set_reg8(cpu, 4u, (uint8_t)((cpu->flags & 0x00D5u) | 0x02u));\n");
+            o(out, "    md_x86_set_reg8(cpu, 4u, (uint8_t)((md_x86_flags(cpu) & 0x00D5u) | 0x02u));\n");
             return DR_GEN_CONTINUE;
 
         case 0xA0: case 0xA1: case 0xA2: case 0xA3: {   /* MOV acc <-> moffs */
@@ -611,8 +670,8 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
             TICK();
             if (op == 0xA0u) o(out, "    md_x86_set_reg8(cpu, 0u, md_x86_read8(cpu, %s, 0x%04Xu));\n", sg, addr);
             else if (op == 0xA1u) o(out, "    cpu->r[0] = md_x86_read16(cpu, %s, 0x%04Xu);\n", sg, addr);
-            else if (op == 0xA2u) o(out, "    md_x86_write8(cpu, %s, 0x%04Xu, md_x86_get_reg8(cpu, 0u));\n    MD_AOT_WCHK();\n", sg, addr);
-            else o(out, "    md_x86_write16(cpu, %s, 0x%04Xu, cpu->r[0]);\n    MD_AOT_WCHK();\n", sg, addr);
+            else if (op == 0xA2u) o(out, "    MD_W8(%s, 0x%04Xu, md_x86_get_reg8(cpu, 0u));\n    MD_AOT_WCHK_HERE();\n", sg, addr);
+            else o(out, "    MD_W16(%s, 0x%04Xu, cpu->r[0]);\n    MD_AOT_WCHK_HERE();\n", sg, addr);
             return DR_GEN_CONTINUE;
         }
 
@@ -620,24 +679,34 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
         case 0xAA: case 0xAB: case 0xAC: case 0xAD: case 0xAE: case 0xAF: {
             const char *src = kSeg[seg_ov >= 0 ? seg_ov : 3];
             const char *wd = w16 ? "16" : "8";
-            if (rep) return DR_GEN_HOLE;                 /* REP strings stay canonical */
+            if (rep) {                                   /* M18: REP via shared semantics */
+                unsigned rp = 0u, i2;
+                for (i2 = 0; i2 < d->prefix_count; ++i2) {
+                    if (d->prefixes[i2] == 0xF2u || d->prefixes[i2] == 0xF3u) rp = d->prefixes[i2];
+                }
+                TICK();
+                o(out, "    md_interp_string_op(runtime, 0x%02Xu, 0x%02Xu, 0x%02Xu);\n", op,
+                  seg_ov >= 0 ? (unsigned)(seg_ov == 0 ? 0x26u : seg_ov == 1 ? 0x2Eu : seg_ov == 2 ? 0x36u : 0x3Eu) : 0u, rp);
+                if ((op & 0xFEu) == 0xA4u || (op & 0xFEu) == 0xAAu) o(out, "    MD_AOT_WCHK_HERE();\n");
+                return DR_GEN_CONTINUE;
+            }
             TICK();
-            o(out, "    { const uint16_t dl_ = (cpu->flags & MD_X86_FLAG_DF) != 0u ? (uint16_t)-%d : %du;\n",
+            o(out, "    { const uint16_t dl_ = (cpu->flags_raw & MD_X86_FLAG_DF) != 0u ? (uint16_t)-%d : %du;\n",
               w16 ? 2 : 1, w16 ? 2 : 1);
             switch (op & 0xFEu) {
                 case 0xA4:
-                    o(out, "      md_x86_write%s(cpu, cpu->es, cpu->r[7], md_x86_read%s(cpu, %s, cpu->r[6]));\n", wd, wd, src);
+                    o(out, "      MD_W%s(cpu->es, cpu->r[7], md_x86_read%s(cpu, %s, cpu->r[6]));\n", wd, wd, src);
                     o(out, "      cpu->r[6] = (uint16_t)(cpu->r[6] + dl_); cpu->r[7] = (uint16_t)(cpu->r[7] + dl_);\n");
-                    o(out, "      MD_AOT_WCHK(); }\n");
+                    o(out, "      MD_AOT_WCHK_HERE(); }\n");
                     break;
                 case 0xA6:
-                    o(out, "      (void)md_x86_sub%s(cpu, md_x86_read%s(cpu, %s, cpu->r[6]), md_x86_read%s(cpu, cpu->es, cpu->r[7]));\n", wd, wd, src, wd);
+                    o(out, "      (void)MD_ALU%s(5u, md_x86_read%s(cpu, %s, cpu->r[6]), md_x86_read%s(cpu, cpu->es, cpu->r[7]));\n", wd, wd, src, wd);
                     o(out, "      cpu->r[6] = (uint16_t)(cpu->r[6] + dl_); cpu->r[7] = (uint16_t)(cpu->r[7] + dl_); }\n");
                     break;
                 case 0xAA:
-                    if (w16) o(out, "      md_x86_write16(cpu, cpu->es, cpu->r[7], cpu->r[0]);\n");
-                    else o(out, "      md_x86_write8(cpu, cpu->es, cpu->r[7], md_x86_get_reg8(cpu, 0u));\n");
-                    o(out, "      cpu->r[7] = (uint16_t)(cpu->r[7] + dl_);\n      MD_AOT_WCHK(); }\n");
+                    if (w16) o(out, "      MD_W16(cpu->es, cpu->r[7], cpu->r[0]);\n");
+                    else o(out, "      MD_W8(cpu->es, cpu->r[7], md_x86_get_reg8(cpu, 0u));\n");
+                    o(out, "      cpu->r[7] = (uint16_t)(cpu->r[7] + dl_);\n      MD_AOT_WCHK_HERE(); }\n");
                     break;
                 case 0xAC:
                     if (w16) o(out, "      cpu->r[0] = md_x86_read16(cpu, %s, cpu->r[6]);\n", src);
@@ -645,8 +714,8 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
                     o(out, "      cpu->r[6] = (uint16_t)(cpu->r[6] + dl_); }\n");
                     break;
                 default: /* AE SCAS */
-                    if (w16) o(out, "      (void)md_x86_sub16(cpu, cpu->r[0], md_x86_read16(cpu, cpu->es, cpu->r[7]));\n");
-                    else o(out, "      (void)md_x86_sub8(cpu, md_x86_get_reg8(cpu, 0u), md_x86_read8(cpu, cpu->es, cpu->r[7]));\n");
+                    if (w16) o(out, "      (void)MD_ALU16(5u, cpu->r[0], md_x86_read16(cpu, cpu->es, cpu->r[7]));\n");
+                    else o(out, "      (void)MD_ALU8(5u, md_x86_get_reg8(cpu, 0u), md_x86_read8(cpu, cpu->es, cpu->r[7]));\n");
                     o(out, "      cpu->r[7] = (uint16_t)(cpu->r[7] + dl_); }\n");
                     break;
             }
@@ -655,11 +724,11 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
 
         case 0xA8:
             TICK();
-            o(out, "    (void)md_x86_logic8(cpu, (uint8_t)(md_x86_get_reg8(cpu, 0u) & 0x%02Xu));\n", dr_u8(p, at + 1u));
+            o(out, "    (void)MD_ALU8(4u, 0xFFu, (uint8_t)(md_x86_get_reg8(cpu, 0u) & 0x%02Xu));\n", dr_u8(p, at + 1u));
             return DR_GEN_CONTINUE;
         case 0xA9:
             TICK();
-            o(out, "    (void)md_x86_logic16(cpu, (uint16_t)(cpu->r[0] & 0x%04Xu));\n", dr_u16(p, at + 1u));
+            o(out, "    (void)MD_ALU16(4u, 0xFFFFu, (uint16_t)(cpu->r[0] & 0x%04Xu));\n", dr_u16(p, at + 1u));
             return DR_GEN_CONTINUE;
 
         case 0xC2: case 0xC3:                    /* RET near */
@@ -675,6 +744,17 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
             if (op == 0xCAu) o(out, "    cpu->r[4] = (uint16_t)(cpu->r[4] + 0x%04Xu);\n", dr_u16(p, at + 1u));
             o(out, "    goto md_dispatch;\n");
             return DR_GEN_TERMINAL;
+
+        case 0x8F:                               /* POP r/m16 (M17b) */
+            dr_modrm(p, at + 1u, seg_ov, &m);
+            if (m.reg != 0u) return DR_GEN_HOLE;
+            /* Same order as the interpreter: EA, then pop, then store. 16-bit
+               addressing never uses SP, so the EA is unaffected by the pop. */
+            TICK(); OPEN(); dr_ea(out, &m);
+            o(out, "        const uint16_t v_ = md_x86_pop(cpu);\n");
+            dr_wr(out, &m, 1, "v_");
+            CLOSE();
+            return DR_GEN_CONTINUE;
 
         case 0xC4: case 0xC5:                    /* LES/LDS */
             dr_modrm(p, at + 1u, seg_ov, &m);
@@ -696,9 +776,30 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
             CLOSE();
             return DR_GEN_CONTINUE;
 
+        case 0xCF:                               /* IRET */
+            TICK();
+            o(out, "    cpu->ip = md_x86_pop(cpu);\n    cpu->cs = md_x86_pop(cpu);\n"
+                   "    md_x86_set_flags(cpu, (uint16_t)(md_x86_pop(cpu) | MD_X86_FLAG_ALWAYS1));\n"
+                   "    goto md_dispatch;\n");
+            return DR_GEN_TERMINAL;
+
+        case 0x9A:                               /* CALL ptr16:16 */
+            TICK();
+            o(out, "    MD_PUSH(cpu->cs);\n    MD_PUSH(0x%04Xu);\n"
+                   "    cpu->cs = 0x%04Xu;\n    cpu->ip = 0x%04Xu;\n    MD_AOT_WCHK_HERE();\n    goto md_dispatch;\n",
+              next, dr_u16(p, at + 3u), dr_u16(p, at + 1u));
+            return DR_GEN_TERMINAL;
+
+        case 0xEA:                               /* JMP ptr16:16 */
+            TICK();
+            o(out, "    cpu->cs = 0x%04Xu;\n    cpu->ip = 0x%04Xu;\n    goto md_dispatch;\n",
+              dr_u16(p, at + 3u), dr_u16(p, at + 1u));
+            return DR_GEN_TERMINAL;
+
         case 0xCD:                               /* INT imm8 -> DOS/BIOS */
             TICK();
-            o(out, "    (void)md_runtime_interrupt(runtime, 0x%02Xu);\n    goto md_dispatch;\n", dr_u8(p, at + 1u));
+            o(out, "    cpu->ip = 0x%04Xu;\n    MD_AOT_FLUSH();\n"
+                   "    (void)md_runtime_interrupt(runtime, 0x%02Xu);\n    goto md_dispatch;\n", next, dr_u8(p, at + 1u));
             return DR_GEN_TERMINAL;
 
         case 0xD0: case 0xD1: case 0xD2: case 0xD3: {   /* shifts/rotates */
@@ -707,7 +808,7 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
             dr_modrm(p, at + 1u, seg_ov, &m);
             TICK(); OPEN(); dr_ea(out, &m);
             dr_rd(a, sizeof(a), &m, w16);
-            snprintf(v, sizeof(v), "md_x86_shift%s(cpu, %uu, %s, %s)", w16 ? "16" : "8", m.reg, a, count);
+            snprintf(v, sizeof(v), "MD_SH%s(%uu, %s, %s)", w16 ? "16" : "8", m.reg, a, count);
             dr_wr(out, &m, w16, v);
             CLOSE();
             return DR_GEN_CONTINUE;
@@ -719,8 +820,8 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
             else {
                 o(out, "    cpu->r[1] = (uint16_t)(cpu->r[1] - 1u);\n");
                 if (op == 0xE2u) o(out, "    if (cpu->r[1] != 0u) {\n");
-                else if (op == 0xE1u) o(out, "    if (cpu->r[1] != 0u && (cpu->flags & MD_X86_FLAG_ZF) != 0u) {\n");
-                else o(out, "    if (cpu->r[1] != 0u && (cpu->flags & MD_X86_FLAG_ZF) == 0u) {\n");
+                else if (op == 0xE1u) o(out, "    if (cpu->r[1] != 0u && md_x86_zf(cpu)) {\n");
+                else o(out, "    if (cpu->r[1] != 0u && !md_x86_zf(cpu)) {\n");
             }
             dr_goto(out, p, d->target);
             o(out, "    }\n");
@@ -729,7 +830,7 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
 
         case 0xE8:                               /* CALL rel16 */
             TICK();
-            o(out, "    md_x86_push(cpu, 0x%04Xu);\n    cpu->ip = 0x%04Xu;\n    MD_AOT_WCHK();\n", next, d->target);
+            o(out, "    MD_PUSH(0x%04Xu);\n    cpu->ip = 0x%04Xu;\n    MD_AOT_WCHK_HERE();\n", next, d->target);
             dr_goto(out, p, d->target);
             return DR_GEN_TERMINAL;
 
@@ -740,29 +841,40 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
 
         case 0xF4:
             TICK();
-            o(out, "    runtime->stop_reason = MD_STOP_HALT;\n    return MD_STOP_HALT;\n");
+            o(out, "    cpu->ip = 0x%04Xu;\n    MD_AOT_FLUSH();\n"
+                   "    runtime->stop_reason = MD_STOP_HALT;\n    return MD_STOP_HALT;\n", next);
             return DR_GEN_TERMINAL;
 
-        case 0xF5: TICK(); o(out, "    cpu->flags ^= MD_X86_FLAG_CF;\n"); return DR_GEN_CONTINUE;
-        case 0xF8: TICK(); o(out, "    cpu->flags &= (uint16_t)~MD_X86_FLAG_CF;\n"); return DR_GEN_CONTINUE;
-        case 0xF9: TICK(); o(out, "    cpu->flags |= MD_X86_FLAG_CF;\n"); return DR_GEN_CONTINUE;
-        case 0xFA: TICK(); o(out, "    cpu->flags &= (uint16_t)~MD_X86_FLAG_IF;\n"); return DR_GEN_CONTINUE;
-        case 0xFB: TICK(); o(out, "    cpu->flags |= MD_X86_FLAG_IF;\n"); return DR_GEN_CONTINUE;
-        case 0xFC: TICK(); o(out, "    cpu->flags &= (uint16_t)~MD_X86_FLAG_DF;\n"); return DR_GEN_CONTINUE;
-        case 0xFD: TICK(); o(out, "    cpu->flags |= MD_X86_FLAG_DF;\n"); return DR_GEN_CONTINUE;
+        case 0xF5: TICK(); o(out, "    md_x86_update_flags(cpu, MD_X86_FLAG_CF, md_x86_cf(cpu) ? 0u : MD_X86_FLAG_CF);\n"); return DR_GEN_CONTINUE;
+        case 0xF8: TICK(); o(out, "    md_x86_update_flags(cpu, MD_X86_FLAG_CF, 0u);\n"); return DR_GEN_CONTINUE;
+        case 0xF9: TICK(); o(out, "    md_x86_update_flags(cpu, 0u, MD_X86_FLAG_CF);\n"); return DR_GEN_CONTINUE;
+        /* IF/DF are never lazy: the raw word is authoritative */
+        case 0xFA: TICK(); o(out, "    cpu->flags_raw &= (uint16_t)~MD_X86_FLAG_IF;\n"); return DR_GEN_CONTINUE;
+        case 0xFB: TICK(); o(out, "    cpu->flags_raw |= MD_X86_FLAG_IF;\n"); return DR_GEN_CONTINUE;
+        case 0xFC: TICK(); o(out, "    cpu->flags_raw &= (uint16_t)~MD_X86_FLAG_DF;\n"); return DR_GEN_CONTINUE;
+        case 0xFD: TICK(); o(out, "    cpu->flags_raw |= MD_X86_FLAG_DF;\n"); return DR_GEN_CONTINUE;
 
         case 0xF6: case 0xF7: {                  /* group 3: TEST/NOT/NEG only */
             char v[256];
             dr_modrm(p, at + 1u, seg_ov, &m);
-            if (m.reg != 0u && m.reg != 2u && m.reg != 3u) return DR_GEN_HOLE;   /* MUL/DIV... */
+            if (m.reg == 1u) return DR_GEN_HOLE;             /* undefined on 8086 */
+            if (m.reg >= 4u) {                               /* M18: MUL/IMUL/DIV/IDIV */
+                TICK(); OPEN(); dr_ea(out, &m);
+                dr_rd(a, sizeof(a), &m, w16);
+                o(out, "        md_interp_muldiv(runtime, 0x%02Xu, %uu, (uint16_t)%s, 0x%04Xu);\n",
+                  op, m.reg, a, ip);
+                CLOSE();
+                o(out, "    MD_AOT_STOPCHK_HERE();\n");   /* divide fault */
+                return DR_GEN_CONTINUE;
+            }
             TICK(); OPEN(); dr_ea(out, &m);
             dr_rd(a, sizeof(a), &m, w16);
             if (m.reg == 0u) {
-                if (w16) o(out, "        (void)md_x86_logic16(cpu, (uint16_t)(%s & 0x%04Xu));\n", a, dr_u16(p, at + 1u + m.length));
-                else o(out, "        (void)md_x86_logic8(cpu, (uint8_t)(%s & 0x%02Xu));\n", a, dr_u8(p, at + 1u + m.length));
+                if (w16) o(out, "        (void)MD_ALU16(4u, 0xFFFFu, (uint16_t)(%s & 0x%04Xu));\n", a, dr_u16(p, at + 1u + m.length));
+                else o(out, "        (void)MD_ALU8(4u, 0xFFu, (uint8_t)(%s & 0x%02Xu));\n", a, dr_u8(p, at + 1u + m.length));
             } else {
                 if (m.reg == 2u) snprintf(v, sizeof(v), "(uint%s_t)~%s", w16 ? "16" : "8", a);
-                else snprintf(v, sizeof(v), "md_x86_sub%s(cpu, 0u, %s)", w16 ? "16" : "8", a);
+                else snprintf(v, sizeof(v), "MD_ALU%s(5u, 0u, %s)", w16 ? "16" : "8", a);
                 dr_wr(out, &m, w16, v);
             }
             CLOSE();
@@ -776,10 +888,8 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
                 const int wide = op == 0xFFu;
                 TICK(); OPEN(); dr_ea(out, &m);
                 dr_rd(a, sizeof(a), &m, wide);
-                o(out, "        const uint16_t cf_ = cpu->flags & MD_X86_FLAG_CF;\n");
-                snprintf(v, sizeof(v), "md_x86_%s%s(cpu, %s, 1u)", m.reg == 0u ? "add" : "sub", wide ? "16" : "8", a);
+                snprintf(v, sizeof(v), "MD_INCDEC%s(%s, %d)", wide ? "16" : "8", a, m.reg == 0u ? 0 : 1);
                 o(out, "        const uint%s_t r_ = %s;\n", wide ? "16" : "8", v);
-                o(out, "        cpu->flags = (uint16_t)((cpu->flags & (uint16_t)~MD_X86_FLAG_CF) | cf_);\n");
                 dr_wr(out, &m, wide, "r_");
                 CLOSE();
                 return DR_GEN_CONTINUE;
@@ -789,17 +899,28 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
                 TICK(); OPEN(); dr_ea(out, &m);
                 dr_rd(a, sizeof(a), &m, 1);
                 o(out, "        const uint16_t t_ = %s;\n", a);
-                if (m.reg == 2u) o(out, "        md_x86_push(cpu, 0x%04Xu);\n", next);
+                if (m.reg == 2u) o(out, "        MD_PUSH(0x%04Xu);\n", next);
                 o(out, "        cpu->ip = t_;\n");
-                if (m.reg == 2u) o(out, "        MD_AOT_WCHK();\n");
+                if (m.reg == 2u) o(out, "        MD_AOT_WCHK_HERE();\n");
                 CLOSE();
+                o(out, "    goto md_dispatch;\n");
+                return DR_GEN_TERMINAL;
+            }
+            if ((m.reg == 3u || m.reg == 5u) && !m.is_reg) {   /* M18: far CALL/JMP m16:16 */
+                TICK(); OPEN(); dr_ea(out, &m);
+                o(out, "        const uint16_t tip_ = md_x86_read16(cpu, s_, o_);\n"
+                       "        const uint16_t tcs_ = md_x86_read16(cpu, s_, (uint16_t)(o_ + 2u));\n");
+                if (m.reg == 3u) o(out, "        MD_PUSH(cpu->cs);\n        MD_PUSH(0x%04Xu);\n", next);
+                o(out, "        cpu->cs = tcs_;\n        cpu->ip = tip_;\n");
+                CLOSE();
+                if (m.reg == 3u) o(out, "    MD_AOT_WCHK_HERE();\n");
                 o(out, "    goto md_dispatch;\n");
                 return DR_GEN_TERMINAL;
             }
             if (m.reg == 6u) {                   /* PUSH r/m16 */
                 TICK(); OPEN(); dr_ea(out, &m);
                 dr_rd(a, sizeof(a), &m, 1);
-                o(out, "        md_x86_push(cpu, %s);\n        MD_AOT_WCHK();\n", a);
+                o(out, "        MD_PUSH(%s);\n        MD_AOT_WCHK_HERE();\n", a);
                 CLOSE();
                 return DR_GEN_CONTINUE;
             }
@@ -815,6 +936,48 @@ static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
 }
 
 /* ------------------------------------------------------------------------ */
+
+static int dr_gen(DrProgram *p, uint16_t ip, FILE *file)
+{
+    DrOut out = { file, NULL, 0u, 0u };
+    return dr_gen_to(p, ip, &out);
+}
+
+/* Emit one instruction through a buffer, expanding MD_AOT_WCHK_HERE() into
+   the concrete store check: resume at `resume_ip` (or keep cpu->ip for
+   terminal instructions) and un-count the `left` instructions of this block
+   that will not run. */
+static int dr_gen_expand(DrProgram *p, uint16_t ip, FILE *f, uint16_t resume_ip, unsigned left)
+{
+    static char buf[16384];
+    DrOut out = { NULL, buf, 0u, sizeof(buf) };
+    const char *cur, *hit;
+    const char *mark = "MD_AOT_WCHK_HERE();";
+    const char *smark = "MD_AOT_STOPCHK_HERE();";
+    int k;
+    buf[0] = '\0';
+    k = dr_gen_to(p, ip, &out);
+    cur = buf;
+    for (;;) {
+        const char *h1 = strstr(cur, mark);
+        const char *h2 = strstr(cur, smark);
+        if (h1 == NULL && h2 == NULL) break;
+        if (h2 == NULL || (h1 != NULL && h1 < h2)) {
+            hit = h1;
+            fwrite(cur, 1u, (size_t)(hit - cur), f);
+            if (k == DR_GEN_CONTINUE) fprintf(f, "MD_AOT_WCHK(0x%04Xu, %uu);", resume_ip, left);
+            else fprintf(f, "MD_AOT_WCHK_T();");
+            cur = hit + strlen(mark);
+        } else {
+            hit = h2;
+            fwrite(cur, 1u, (size_t)(hit - cur), f);
+            fprintf(f, "MD_AOT_STOPCHK(0x%04Xu, %uu);", resume_ip, left);
+            cur = hit + strlen(smark);
+        }
+    }
+    fputs(cur, f);
+    return k;
+}
 
 static void dr_classify(DrProgram *p)
 {
@@ -841,6 +1004,23 @@ static void dr_classify(DrProgram *p)
 static int dr_is_entry(const DrProgram *p, uint32_t ip)
 {
     return p->block_start[ip] && p->reachable[ip] && p->kind[ip] != DR_GEN_HOLE;
+}
+
+/* End (exclusive) of the compiled instruction bytes of the block that
+   starts at `ip`, following exactly the walk the emitter uses (M17). */
+static uint32_t dr_block_end(const DrProgram *p, uint32_t ip)
+{
+    uint32_t cur = ip;
+    uint32_t end = ip;
+    for (;;) {
+        const MdDecodedInstruction *d = &p->dec[cur];
+        if (p->kind[cur] == DR_GEN_HOLE) break;
+        end = cur + d->length;
+        if (p->kind[cur] != DR_GEN_CONTINUE) break;
+        cur = d->next_ip;
+        if (!p->reachable[cur] || !dr_in_code(p, cur) || p->block_start[cur]) break;
+    }
+    return end > ip ? end : ip + 1u;
 }
 
 static void dr_make_guard(const char *symbol, char *guard, size_t n)
@@ -889,11 +1069,29 @@ static void dr_emit_bytes(FILE *f, const char *name, const uint8_t *data, size_t
     fprintf(f, "\n};\n\n");
 }
 
+/* Number of compiled instructions in the block starting at `ip` (the same
+   walk as dr_block_end; a trailing hole is not counted). */
+static unsigned dr_block_count(const DrProgram *p, uint32_t ip)
+{
+    uint32_t cur = ip;
+    unsigned n = 0;
+    for (;;) {
+        const MdDecodedInstruction *d = &p->dec[cur];
+        if (p->kind[cur] == DR_GEN_HOLE) break;
+        ++n;
+        if (p->kind[cur] != DR_GEN_CONTINUE) break;
+        cur = d->next_ip;
+        if (!p->reachable[cur] || !dr_in_code(p, cur) || p->block_start[cur]) break;
+    }
+    return n;
+}
+
 static int dr_emit_c(DrProgram *p, const DrOptions *opt, const char *header_name)
 {
     FILE *f = fopen(opt->output_c, "w");
     const char *s = opt->symbol;
     uint32_t ip, lo = DR_IP_SPACE, hi = 0;
+    size_t nentries = 0, k;
     if (f == NULL) return 0;
 
     for (ip = 0; ip < DR_IP_SPACE; ++ip) {
@@ -901,116 +1099,238 @@ static int dr_emit_c(DrProgram *p, const DrOptions *opt, const char *header_name
             if (ip < lo) lo = ip;
             if ((uint32_t)ip + p->dec[ip].length > hi) hi = (uint32_t)ip + p->dec[ip].length;
         }
+        if (dr_is_entry(p, ip)) ++nentries;
     }
-    if (lo == DR_IP_SPACE) { lo = DR_COM_BASE; hi = DR_COM_BASE; }
+    if (lo == DR_IP_SPACE) { lo = p->base; hi = p->base; }
 
-    fprintf(f, "/* Generated by dosrecomp v2. Do not hand-edit.\n"
-               " * %zu instructions: %zu compiled, %zu interpreter holes; %zu blocks, %zu entries. */\n",
+    fprintf(f, "/* Generated by dosrecomp v3. Do not hand-edit.\n"
+               " * %zu instructions: %zu compiled, %zu interpreter holes; %zu blocks, %zu entries.\n"
+               " * Define MD_AOT_COMPACT for small code (shared out-of-line helpers). */\n",
             p->inst_count, p->inst_count - p->hole_count, p->hole_count, p->block_count, p->entry_count);
     fprintf(f, "#include <string.h>\n#include \"microdos/block_cache.h\"\n#include \"microdos/ops.h\"\n"
                "#include \"microdos/runtime.h\"\n#include \"%s\"\n\n", header_name);
+
+    /* operation macros: inline (fast, big) or out-of-line (compact) */
+    fputs("#if defined(MD_AOT_COMPACT)\n"
+          "#define MD_W8(s_, o_, v_) md_aot_store8(cpu, (s_), (o_), (v_))\n"
+          "#define MD_W16(s_, o_, v_) md_aot_store16(cpu, (s_), (o_), (v_))\n"
+          "#define MD_PUSH(v_) md_aot_push(cpu, (v_))\n"
+          "#define MD_PUSHR(r_) md_aot_push_reg(cpu, (r_))\n"
+          "#define MD_ALU8(op_, a_, b_) md_aot_alu8(cpu, (op_), (a_), (b_))\n"
+          "#define MD_ALU16(op_, a_, b_) md_aot_alu16(cpu, (op_), (a_), (b_))\n"
+          "#define MD_SH8(op_, v_, c_) md_aot_shift8(cpu, (op_), (v_), (c_))\n"
+          "#define MD_SH16(op_, v_, c_) md_aot_shift16(cpu, (op_), (v_), (c_))\n"
+          "#define MD_INCDEC8(v_, d_) md_aot_incdec8(cpu, (v_), (d_))\n"
+          "#define MD_INCDEC16(v_, d_) md_aot_incdec16(cpu, (v_), (d_))\n"
+          "#define MD_COND(cc_) md_aot_condition(cpu, (cc_))\n"
+          "#define MD_CHUNKS(g_, a_, b_) md_aot_chunks_ok_ol((g_), (a_), (b_))\n"
+          "#else\n"
+          "#define MD_W8(s_, o_, v_) md_x86_write8(cpu, (s_), (o_), (v_))\n"
+          "#define MD_W16(s_, o_, v_) md_x86_write16(cpu, (s_), (o_), (v_))\n"
+          "#define MD_PUSH(v_) md_x86_push(cpu, (v_))\n"
+          "#define MD_PUSHR(r_) md_x86_push_reg(cpu, (r_))\n"
+          "#define MD_ALU8(op_, a_, b_) md_x86_alu8(cpu, (op_), (a_), (b_))\n"
+          "#define MD_ALU16(op_, a_, b_) md_x86_alu16(cpu, (op_), (a_), (b_))\n"
+          "#define MD_SH8(op_, v_, c_) md_x86_shift8(cpu, (op_), (v_), (c_))\n"
+          "#define MD_SH16(op_, v_, c_) md_x86_shift16(cpu, (op_), (v_), (c_))\n"
+          "#define MD_INCDEC8(v_, d_) ((d_) ? md_x86_dec8(cpu, (v_)) : md_x86_inc8(cpu, (v_)))\n"
+          "#define MD_INCDEC16(v_, d_) ((d_) ? md_x86_dec16(cpu, (v_)) : md_x86_inc16(cpu, (v_)))\n"
+          "#define MD_COND(cc_) md_x86_condition(cpu, (cc_))\n"
+          "#define MD_CHUNKS(g_, a_, b_) md_aot_chunks_ok((g_), (a_), (b_))\n"
+          "#endif\n\n", f);
+
+    fprintf(f, "#define MD_IMAGE_BASE 0x%04Xu\n\n", p->base);
     dr_emit_bytes(f, "md_image", p->image, p->image_size);
     dr_emit_bytes(f, "md_code_bits", p->code_bits, (p->image_size + 7u) / 8u);
 
-    fprintf(f,
-        "#define MD_AOT_SLOTS 4u\n"
-        "static MdAotGuard md_guard[MD_AOT_SLOTS];\n"
-        "static uint16_t md_guard_segment[MD_AOT_SLOTS];\n"
-        "static unsigned md_guard_next;\n\n"
-        "static int md_is_entry(uint16_t ip)\n{\n    switch (ip) {\n");
-    for (ip = 0; ip < DR_IP_SPACE; ++ip) if (dr_is_entry(p, ip)) fprintf(f, "        case 0x%04Xu:\n", ip);
-    fprintf(f, "            return 1;\n        default: return 0;\n    }\n}\n\n");
+    /* Compact dispatch (M17): sorted entry table + per-block chunk range.
+       Binary search gives a dense index; the body switches on that index. */
+    fprintf(f, "#define MD_NENTRIES %zuu\n", nentries);
+    fprintf(f, "static const uint16_t md_entry_ip[MD_NENTRIES] = {");
+    for (ip = 0, k = 0; ip < DR_IP_SPACE; ++ip) {
+        if (!dr_is_entry(p, ip)) continue;
+        fprintf(f, "%s0x%04Xu,", (k++ % 12u) ? " " : "\n    ", ip);
+    }
+    fprintf(f, "\n};\n\nstatic const uint16_t md_entry_range[MD_NENTRIES][2] = {");
+    for (ip = 0, k = 0; ip < DR_IP_SPACE; ++ip) {
+        if (!dr_is_entry(p, ip)) continue;
+        fprintf(f, "%s{0x%04Xu,0x%04Xu},", (k++ % 6u) ? " " : "\n    ",
+                (unsigned)(ip - p->base), (unsigned)(dr_block_end(p, ip) - 1u - p->base));
+    }
+    fprintf(f, "\n};\n\n");
+    /* M18: bucket index, one per 16 image bytes: md_bucket[b] = number of
+       entries whose image offset is below b*16 (entries are sorted), so a
+       lookup scans only the entries of one 16-byte bucket. */
+    {
+        const size_t nb = (p->image_size + 15u) / 16u;
+        uint32_t *bucket = (uint32_t *)calloc(nb + 1u, sizeof(uint32_t));
+        size_t b2;
+        uint32_t cnt = 0, e;
+        if (bucket == NULL) { fclose(f); return 0; }
+        for (b2 = 0; b2 <= nb; ++b2) {
+            const uint32_t lim = (uint32_t)(b2 * 16u);
+            bucket[b2] = 0u;
+            for (e = 0, cnt = 0; e < DR_IP_SPACE; ++e) {
+                if (dr_is_entry(p, e) && e - p->base < lim) ++cnt;
+            }
+            bucket[b2] = cnt;
+        }
+        /* self-check: every entry is found through its own bucket */
+        for (e = 0, cnt = 0; e < DR_IP_SPACE; ++e) {
+            if (!dr_is_entry(p, e)) continue;
+            {
+                const uint32_t bk = (e - p->base) >> 4;
+                if (!(bucket[bk] <= cnt && cnt < bucket[bk + 1u])) {
+                    fprintf(stderr, "dosrecomp: internal: bucket index wrong for %04X\n", (unsigned)e);
+                    exit(3);
+                }
+            }
+            ++cnt;
+        }
+        fprintf(f, "#define MD_NBUCKETS %zuu\nstatic const uint16_t md_bucket[MD_NBUCKETS + 1u] = {", nb);
+        for (b2 = 0; b2 <= nb; ++b2) fprintf(f, "%s%lu,", (b2 % 16u) ? " " : "\n    ", (unsigned long)bucket[b2]);
+        fprintf(f, "\n};\n\n");
+        free(bucket);
+    }
+    fputs("static int md_find(uint16_t ip)\n{\n"
+          "    const uint32_t off = (uint32_t)ip - MD_IMAGE_BASE;\n"
+          "    unsigned i, end;\n", f);
+    /* below-base check only when the base is non-zero (else always false) */
+    if (p->base != 0u) fputs("    if (ip < MD_IMAGE_BASE) return -1;\n", f);
+    fputs("    if ((off >> 4) >= MD_NBUCKETS) return -1;\n"
+          "    end = md_bucket[(off >> 4) + 1u];\n"
+          "    for (i = md_bucket[off >> 4]; i < end; ++i) {\n"
+          "        if (md_entry_ip[i] == ip) return (int)i;\n"
+          "    }\n    return -1;\n}\n\n"
+          "static int md_is_entry(uint16_t ip) { return md_find(ip) >= 0; }\n\n"
+          "/* The one per-block chunk check, shared by block labels, the resume\n"
+          "   predicate and block_ok(), so they can never disagree. */\n"
+          "static int md_block_chunks(const MdAotGuard *guard, uint16_t ip)\n{\n"
+          "    const int i = md_find(ip);\n"
+          "    return i >= 0 && MD_CHUNKS(guard, md_entry_range[i][0], md_entry_range[i][1]);\n}\n\n", f);
 
     fprintf(f,
-        "static MdAotGuard *md_slot(uint16_t segment, int create)\n{\n"
-        "    unsigned i;\n"
-        "    for (i = 0; i < MD_AOT_SLOTS; ++i)\n"
-        "        if (md_guard[i].code_bits != NULL && md_guard_segment[i] == segment) return &md_guard[i];\n"
-        "    if (!create) return NULL;\n"
-        "    i = md_guard_next++ %% MD_AOT_SLOTS;\n"
-        "    md_guard_segment[i] = segment;\n"
-        "    return &md_guard[i];\n}\n\n"
-        "static void md_arm(MdRuntime *runtime, MdAotGuard *guard, uint16_t segment)\n{\n"
-        "    guard->base = md_x86_linear(segment, 0x0100u);\n"
-        "    guard->size = (uint32_t)sizeof(md_image);\n"
-        "    guard->code_bits = md_code_bits;\n"
-        "    guard->valid = 1u;\n"
-        "    md_runtime_register_aot_guard(runtime, guard);\n"
-        "    md_runtime_mark_code_range(runtime, segment, 0x%04Xu, %uu);\n}\n\n",
-        lo, (unsigned)(hi - lo));
+        "static MdAotGuard *md_arm(MdRuntime *runtime, uint16_t segment)\n{\n"
+        "    MdAotGuard *guard = md_runtime_aot_attach(runtime, &%s_program, segment,\n"
+        "        md_x86_linear(segment, 0x%04Xu), (uint32_t)sizeof(md_image), md_code_bits);\n"
+        "    md_runtime_mark_code_range(runtime, segment, 0x%04Xu, %uu);\n"
+        "    return guard;\n}\n\n",
+        s, p->base, lo, (unsigned)(hi - lo));
 
-    fprintf(f,
-        "typedef struct MdResume { uint16_t segment; const MdAotGuard *guard; } MdResume;\n\n"
-        "static bool md_resume(const MdRuntime *runtime, void *user)\n{\n"
-        "    const MdResume *r = (const MdResume *)user;\n"
-        "    return r->guard->valid && runtime->cpu.cs == r->segment && md_is_entry(runtime->cpu.ip);\n}\n\n");
+    fputs("typedef struct MdResume { uint16_t segment; const MdAotGuard *guard; } MdResume;\n\n"
+          "static bool md_resume(const MdRuntime *runtime, void *user)\n{\n"
+          "    const MdResume *r = (const MdResume *)user;\n"
+          "    return r->guard->valid && runtime->cpu.cs == r->segment &&\n"
+          "           md_block_chunks(r->guard, runtime->cpu.ip);\n}\n\n", f);
 
     /* body */
-    fprintf(f,
-        "static MdStopReason md_body(MdRuntime *runtime, uint16_t segment, MdAotGuard *guard,\n"
-        "                            uint64_t instruction_budget, int attach)\n{\n"
-        "    MdX86 *cpu = &runtime->cpu;\n"
-        "    uint64_t remaining = instruction_budget;\n\n"
-        "#define MD_AOT_TICK(ip_, next_) do { \\\n"
-        "        if (remaining == 0u) { cpu->ip = (uint16_t)(ip_); \\\n"
-        "            if (attach) return MD_STOP_NONE; \\\n"
-        "            runtime->stop_reason = MD_STOP_BUDGET; return MD_STOP_BUDGET; } \\\n"
-        "        --remaining; ++runtime->instructions; ++runtime->aot_instructions; \\\n"
-        "        cpu->ip = (uint16_t)(next_); \\\n"
-        "    } while (0)\n"
-        "#define MD_AOT_WCHK() do { if (!guard->valid) goto md_fallback; } while (0)\n"
-        "#define MD_AOT_GOTO(ip_, label_) do { cpu->ip = (uint16_t)(ip_); goto label_; } while (0)\n\n"
-        "md_dispatch:\n"
-        "    if (runtime->stop_reason != MD_STOP_NONE) return runtime->stop_reason;\n"
-        "    if (!guard->valid || cpu->cs != segment) goto md_fallback;\n"
-        "    switch (cpu->ip) {\n");
-    for (ip = 0; ip < DR_IP_SPACE; ++ip) {
-        if (dr_is_entry(p, ip)) fprintf(f, "        case 0x%04Xu: goto md_block_%04X;\n", ip, ip);
+    fputs("static MdStopReason md_body(MdRuntime *runtime, uint16_t segment, MdAotGuard *guard,\n"
+          "                            uint64_t instruction_budget, int attach)\n{\n"
+          "    MdX86 *cpu = &runtime->cpu;\n"
+          "    uint32_t remaining = instruction_budget > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)instruction_budget;\n"
+          "    uint32_t done = 0u;             /* compiled instructions not yet flushed */\n"
+          "    uint32_t wep = guard->epoch;    /* compiled-byte store epoch seen */\n"
+          "    (void)wep;                      /* programs without stores never read it */\n\n"
+          "/* Per-block accounting (M17): the whole block's instruction count is\n"
+          "   charged on entry; exits in the middle give back what did not run. */\n"
+          "#define MD_AOT_FLUSH() do { runtime->instructions += done; runtime->aot_instructions += done; done = 0u; } while (0)\n"
+          "#define MD_AOT_BLOCK(ip_, o0_, o1_, n_) do { \\\n"
+          "        if (remaining < (n_) || !MD_CHUNKS(guard, (o0_), (o1_))) { cpu->ip = (uint16_t)(ip_); goto md_fallback; } \\\n"
+          "        remaining -= (n_); done += (n_); wep = guard->epoch; } while (0)\n"
+          "/* After an instruction's LAST effect: a store into a compiled byte hands\n"
+          "   over to the interpreter at the next instruction. */\n"
+          "#define MD_AOT_WCHK(next_, left_) do { if (guard->epoch != wep) { \\\n"
+          "        cpu->ip = (uint16_t)(next_); remaining += (left_); done -= (left_); goto md_fallback; } } while (0)\n"
+          "#define MD_AOT_WCHK_T() do { if (guard->epoch != wep) goto md_fallback; } while (0)\n"
+          "/* A shared-semantics helper stopped the machine (divide fault): stop\n"
+          "   exactly where the interpreter would, with the same count. */\n"
+          "#define MD_AOT_STOPCHK(next_, left_) do { if (runtime->stop_reason != MD_STOP_NONE) { \\\n"
+          "        cpu->ip = (uint16_t)(next_); remaining += (left_); done -= (left_); \\\n"
+          "        MD_AOT_FLUSH(); return runtime->stop_reason; } } while (0)\n"
+          "/* One non-compiled instruction, executed by the interpreter in place. */\n"
+          "#define MD_AOT_HOLE(ip_) do { \\\n"
+          "        cpu->ip = (uint16_t)(ip_); MD_AOT_FLUSH(); \\\n"
+          "        if (remaining == 0u) goto md_fallback; \\\n"
+          "        --remaining; (void)md_interp_step(runtime); \\\n"
+          "        if (runtime->stop_reason != MD_STOP_NONE) return runtime->stop_reason; } while (0)\n\n"
+          "md_dispatch:\n"
+          "    if (runtime->stop_reason != MD_STOP_NONE) { MD_AOT_FLUSH(); return runtime->stop_reason; }\n"
+          "    if (!guard->valid || cpu->cs != segment) goto md_fallback;\n"
+          "    wep = guard->epoch;\n"
+          "    switch (md_find(cpu->ip)) {\n", f);
+    for (ip = 0, k = 0; ip < DR_IP_SPACE; ++ip) {
+        if (!dr_is_entry(p, ip)) continue;
+        fprintf(f, "        case %zu: goto md_block_%04X;\n", k++, ip);
     }
-    fprintf(f,
-        "        default: goto md_fallback;\n    }\n\n"
-        "md_fallback:\n"
-        "    if (runtime->stop_reason != MD_STOP_NONE) return runtime->stop_reason;\n"
-        "    if (attach) return MD_STOP_NONE;\n"
-        "    if (runtime->block_cache != NULL) {\n"
-        "        MdResume resume;\n"
-        "        const uint64_t before = runtime->instructions;\n"
-        "        MdStopReason st;\n"
-        "        uint64_t used;\n"
-        "        resume.segment = segment; resume.guard = guard;\n"
-        "        st = md_interp_run_cached_until(runtime, runtime->block_cache, remaining, md_resume, &resume);\n"
-        "        used = runtime->instructions - before;\n"
-        "        if (used > remaining) { runtime->stop_reason = MD_STOP_FAULT; return MD_STOP_FAULT; }\n"
-        "        remaining -= used;\n"
-        "        if (st != MD_STOP_NONE) return st;\n"
-        "        goto md_dispatch;\n"
-        "    }\n"
-        "    if (remaining == 0u) { runtime->stop_reason = MD_STOP_BUDGET; return MD_STOP_BUDGET; }\n"
-        "    --remaining;\n"
-        "    (void)md_interp_step(runtime);\n"
-        "    goto md_dispatch;\n\n");
+    fputs("        default: goto md_fallback;\n    }\n\n"
+          "md_fallback:\n"
+          "    MD_AOT_FLUSH();\n"
+          "    if (runtime->stop_reason != MD_STOP_NONE) return runtime->stop_reason;\n"
+          "    if (attach) return MD_STOP_NONE;\n"
+          "    if (runtime->block_cache != NULL) {\n"
+          "        MdResume resume;\n"
+          "        const uint64_t before = runtime->instructions;\n"
+          "        MdStopReason st;\n"
+          "        uint64_t used;\n"
+          "        resume.segment = segment; resume.guard = guard;\n"
+          "        st = md_interp_run_cached_until(runtime, runtime->block_cache, remaining, md_resume, &resume);\n"
+          "        used = runtime->instructions - before;\n"
+          "        if (used > remaining) { runtime->stop_reason = MD_STOP_FAULT; return MD_STOP_FAULT; }\n"
+          "        remaining -= (uint32_t)used;\n"
+          "        if (st != MD_STOP_NONE) return st;\n"
+          "        goto md_dispatch;\n"
+          "    }\n"
+          "    if (remaining == 0u) { runtime->stop_reason = MD_STOP_BUDGET; return MD_STOP_BUDGET; }\n"
+          "    --remaining;\n"
+          "    (void)md_interp_step(runtime);\n"
+          "    goto md_dispatch;\n\n", f);
 
     for (ip = 0; ip < DR_IP_SPACE; ++ip) {
         uint32_t cur;
+        unsigned n, idx = 0;
         if (!dr_is_entry(p, ip)) continue;
-        fprintf(f, "md_block_%04X:\n", ip);
+        n = dr_block_count(p, ip);
+        fprintf(f, "md_block_%04X:\n    MD_AOT_BLOCK(0x%04Xu, 0x%04Xu, 0x%04Xu, %uu);\n", ip, ip,
+                (unsigned)(ip - p->base), (unsigned)(dr_block_end(p, ip) - 1u - p->base), n);
         cur = ip;
         for (;;) {
-            int k;
+            int kk;
             const MdDecodedInstruction *d = &p->dec[cur];
             unsigned i;
             fprintf(f, "    /* %04X:", (unsigned)cur);
             for (i = 0; i < d->length; ++i) fprintf(f, " %02X", dr_u8(p, cur + i));
             fprintf(f, " */\n");
             if (p->kind[cur] == DR_GEN_HOLE) {
-                fprintf(f, "    cpu->ip = 0x%04Xu; goto md_fallback; /* interpreter hole */\n", (unsigned)cur);
+                if (p->forced_hole[cur]) {
+                    /* --interp-at: explicit hand-off to the host/interpreter */
+                    fprintf(f, "    cpu->ip = 0x%04Xu; goto md_fallback; /* forced interpreter hole */\n", (unsigned)cur);
+                } else {
+                    /* M17b: run the one instruction in the interpreter right
+                       here and keep going in compiled code. */
+                    fprintf(f, "    MD_AOT_HOLE(0x%04Xu);   /* interpreter hole */\n", (unsigned)cur);
+                    if (dr_is_entry(p, d->next_ip)) {
+                        fprintf(f, "    if (cpu->cs == segment && cpu->ip == 0x%04Xu) goto md_block_%04X;\n",
+                                d->next_ip, d->next_ip);
+                    }
+                    fprintf(f, "    goto md_dispatch;\n");
+                }
                 break;
             }
-            k = dr_gen(p, (uint16_t)cur, f);
-            if (k != DR_GEN_CONTINUE) break;
+            ++idx;
+            g_dr_store_pending = 0;
+            kk = dr_gen_expand(p, (uint16_t)cur, f, d->next_ip, n - idx);
+            if (g_dr_store_pending) {
+                if (kk != DR_GEN_CONTINUE) {
+                    fprintf(stderr, "dosrecomp: internal: store in terminal instruction at %04X\n", (unsigned)cur);
+                    exit(3);
+                }
+                fprintf(f, "    MD_AOT_WCHK(0x%04Xu, %uu);\n", d->next_ip, n - idx);
+                g_dr_store_pending = 0;
+            }
+            if (kk != DR_GEN_CONTINUE) break;
             cur = d->next_ip;
             if (!p->reachable[cur] || !dr_in_code(p, cur)) {
-                fprintf(f, "    goto md_dispatch;\n");
+                fprintf(f, "    cpu->ip = 0x%04Xu; goto md_dispatch;\n", (unsigned)cur);
                 break;
             }
             if (p->block_start[cur]) {
@@ -1021,37 +1341,45 @@ static int dr_emit_c(DrProgram *p, const DrOptions *opt, const char *header_name
         }
         fprintf(f, "\n");
     }
-    fprintf(f, "#undef MD_AOT_TICK\n#undef MD_AOT_WCHK\n#undef MD_AOT_GOTO\n}\n\n");
+    fputs("#undef MD_AOT_FLUSH\n#undef MD_AOT_BLOCK\n#undef MD_AOT_WCHK\n#undef MD_AOT_WCHK_T\n#undef MD_AOT_HOLE\n#undef MD_AOT_STOPCHK\n}\n\n", f);
 
     /* public API */
     fprintf(f,
         "MdStopReason %s(MdRuntime *runtime, uint16_t segment, uint64_t instruction_budget)\n{\n"
-        "    MdAotGuard *guard = md_slot(segment, 1);\n"
-        "    md_runtime_load_com(runtime, md_image, sizeof(md_image), segment);\n"
-        "    md_arm(runtime, guard, segment);\n"
+        "    MdAotGuard *guard;\n"
+        "    %s\n"
+        "    guard = md_arm(runtime, segment);\n"
         "    runtime->cpu.ip = 0x%04Xu;\n"
         "    return md_body(runtime, segment, guard, instruction_budget, 0);\n}\n\n",
-        s, p->code_start);
+        s,
+        p->base == DR_COM_BASE
+            ? "md_runtime_load_com(runtime, md_image, sizeof(md_image), segment);"
+            : "md_runtime_load_raw(runtime, md_image, sizeof(md_image), segment, MD_IMAGE_BASE);",
+        p->code_start);
     fprintf(f,
         "static bool md_attach(MdRuntime *runtime, uint16_t segment)\n{\n"
-        "    const uint32_t base = md_x86_linear(segment, 0x0100u);\n"
+        "    const uint32_t base = md_x86_linear(segment, 0x%04Xu);\n"
         "    if (base + sizeof(md_image) > MD_X86_ADDRESS_SPACE) return false;\n"
         "    if (memcmp(runtime->cpu.memory + base, md_image, sizeof(md_image)) != 0) return false;\n"
-        "    md_arm(runtime, md_slot(segment, 1), segment);\n"
+        "    (void)md_arm(runtime, segment);\n"
         "    return true;\n}\n\n"
         "static bool md_ready(const MdRuntime *runtime, uint16_t segment)\n{\n"
-        "    const MdAotGuard *guard = md_slot(segment, 0);\n"
-        "    (void)runtime;\n"
-        "    return guard != NULL && guard->valid;\n}\n\n"
+        "    const int i = md_runtime_aot_find(runtime, &%s_program, segment);\n"
+        "    return i >= 0 && runtime->aot_slots[i].valid;\n}\n\n"
         "static bool md_entry(uint16_t ip) { return md_is_entry(ip) != 0; }\n\n"
+        "static bool md_block_ok(const MdRuntime *runtime, uint16_t segment, uint16_t ip)\n{\n"
+        "    const int i = md_runtime_aot_find(runtime, &%s_program, segment);\n"
+        "    return i >= 0 && runtime->aot_slots[i].valid && md_block_chunks(&runtime->aot_slots[i], ip);\n}\n\n"
         "static MdStopReason md_enter(MdRuntime *runtime, uint64_t budget)\n{\n"
-        "    MdAotGuard *guard = md_slot(runtime->cpu.cs, 0);\n"
-        "    if (guard == NULL || !guard->valid) return MD_STOP_NONE;\n"
-        "    return md_body(runtime, runtime->cpu.cs, guard, budget, 1);\n}\n\n"
+        "    const uint16_t cs = runtime->cpu.cs;\n"
+        "    const int i = md_runtime_aot_find(runtime, &%s_program, cs);\n"
+        "    if (i < 0 || !runtime->aot_slots[i].valid) return MD_STOP_NONE;\n"
+        "    md_runtime_aot_touch(runtime, i);\n"
+        "    return md_body(runtime, cs, &runtime->aot_slots[i], budget, 1);\n}\n\n"
         "const MdAotProgram %s_program = {\n"
         "    \"%s\", %zuu, %zuu, %zuu, %zuu,\n"
-        "    md_attach, md_ready, md_entry, md_enter\n};\n",
-        s, opt->program_name ? opt->program_name : s, p->image_size,
+        "    md_attach, md_ready, md_entry, md_block_ok, md_enter\n};\n",
+        p->base, s, s, s, s, opt->program_name ? opt->program_name : s, p->image_size,
         p->inst_count - p->hole_count, p->hole_count, p->entry_count);
 
     return fclose(f) == 0;
@@ -1095,6 +1423,7 @@ int main(int argc, char **argv)
     p->dec = (MdDecodedInstruction *)calloc(DR_IP_SPACE, sizeof(MdDecodedInstruction));
     p->code_bits = (uint8_t *)calloc((p->image_size + 7u) / 8u + 1u, 1u);
     if (p->dec == NULL || p->code_bits == NULL) return 2;
+    p->base = opt.base;
     p->code_start = opt.code_start;
     p->code_end = opt.code_end;
     for (i = 0; i < opt.interp_count; ++i) p->forced_hole[opt.interp_at[i]] = 1u;

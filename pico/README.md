@@ -4,6 +4,30 @@ Boots the released MS-DOS 2.0 kernel and COMMAND.COM on an RP2350 with 8 MiB
 PSRAM, with a USB serial console. DOS2TEST.COM is on the disk and runs as
 dosrecomp-compiled native code when you start it at `A>`.
 
+## Firmware variants (M18)
+
+`.\md.bat build pico` builds:
+
+| UF2 | Purpose |
+|---|---|
+| `microdos_pico.uf2` | **default** DOS: compiled kernel, code in SRAM, 300 MHz |
+| `microdos_pico_150.uf2` | the same at 150 MHz |
+| `microdos_pico_nokernel.uf2` | interpreted kernel at 300 MHz, for A/B |
+| `microdos_bench.uf2` / `_150` | benchmark matrix |
+
+The defaults follow the M15 measurements on DOS2TEST: code in SRAM was +33%
+over flash, and turning the decoded-block cache off was +60%.
+
+The benchmark firmwares print a table as soon as a terminal connects (any key
+reruns it). Rows: workload (`loop` registers only, `memloop` 32 KiB
+read-modify-write) x guest memory (SRAM, PSRAM) x engine (`step`, `threaded`,
+`cs-run` = the M16 DOS loop engine, `cache`, `aot`). Every row verifies the
+guest result (`ok`/`FAIL`).
+
+In the DOS firmwares, press **Ctrl+]** right before `DOS2TEST` and again right
+after it: the second report's "since previous Ctrl+]" block is DOS2TEST alone,
+with measured idle, console, input and disk time removed.
+
 ## Build
 
 Prerequisites (the same as microconsole/microrender): Pico SDK 2.3.0,
@@ -27,8 +51,7 @@ Output: `build-pico\out\microdos_pico.uf2`
    serial monitor, `python -m serial.tools.miniterm COMx 115200`). The
    firmware waits for the terminal before it boots DOS.
 4. Press Enter at the date and time prompts, then `DOS2TEST` at `A>`.
-5. Press **Ctrl+]** at any time for statistics (instructions, MIPS, AOT,
-   cache). It is not passed to DOS.
+5. Press **Ctrl+]** at any time for statistics. It is not passed to DOS.
 
 ## Memory layout
 
@@ -36,14 +59,16 @@ Output: `build-pico\out\microdos_pico.uf2`
 |---|---|
 | guest 1 MiB address space | PSRAM (uninitialised section, zeroed at boot) |
 | 360 KiB disk | flash image, copied to PSRAM at boot |
-| MSDOS.SYS, interpreter, compiled DOS2TEST | flash (XIP) |
-| runtime state, decoded-block cache | SRAM (~30 KB) |
+| MSDOS.SYS and disk blobs | flash (`.flashdata`, all variants) |
+| interpreter, cache, compiled DOS2TEST | SRAM in `microdos_pico*`, flash in `*_flash*` |
+| runtime state, decoded-block cache | SRAM |
 
 Disk writes go to the PSRAM copy and are **lost at reset** in this milestone.
 The clock starts at 1983-03-08 12:00; set it at the DOS prompts.
 
 ## What to report
 
-Everything the terminal prints from the banner through `A>`, the DOS2TEST
-result, and one Ctrl+] statistics block after DOS2TEST finishes. The MIPS
-figure is the first real RP2350 measurement for this project.
+1. Both benchmark tables (`microdos_bench_flash`, `microdos_bench_sram`).
+2. For each DOS firmware you try: Ctrl+] at `A>`, `DOS2TEST`, Ctrl+] again,
+   and the whole terminal output. DOS2TEST must still say 25/25 and
+   `attaches=2 enters=6959`.

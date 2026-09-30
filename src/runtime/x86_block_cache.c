@@ -341,7 +341,6 @@ void md_block_cache_clear_stats(MdBlockCache *cache)
 static void md_exec_decoded(MdRuntime *runtime, const MdDecodedOp *op)
 {
     MdX86 *cpu = &runtime->cpu;
-    const uint16_t old_cf = cpu->flags & MD_X86_FLAG_CF;
 
     cpu->ip = op->next_ip;
 
@@ -353,17 +352,14 @@ static void md_exec_decoded(MdRuntime *runtime, const MdDecodedOp *op)
             cpu->r[op->reg] = op->arg;
             break;
         case MD_DOP_INC_R16:
-            cpu->r[op->reg] = md_x86_add16(cpu, cpu->r[op->reg], 1u);
-            cpu->flags = (uint16_t)((cpu->flags & ~MD_X86_FLAG_CF) | old_cf);
+            cpu->r[op->reg] = md_x86_inc16(cpu, cpu->r[op->reg]);
             break;
         case MD_DOP_DEC_R16:
-            cpu->r[op->reg] = md_x86_sub16(cpu, cpu->r[op->reg], 1u);
-            cpu->flags = (uint16_t)((cpu->flags & ~MD_X86_FLAG_CF) | old_cf);
+            cpu->r[op->reg] = md_x86_dec16(cpu, cpu->r[op->reg]);
             break;
         case MD_DOP_DEC_JNZ:
-            cpu->r[op->reg] = md_x86_sub16(cpu, cpu->r[op->reg], 1u);
-            cpu->flags = (uint16_t)((cpu->flags & ~MD_X86_FLAG_CF) | old_cf);
-            if ((cpu->flags & MD_X86_FLAG_ZF) == 0u) cpu->ip = op->arg;
+            cpu->r[op->reg] = md_x86_dec16(cpu, cpu->r[op->reg]);
+            if (!md_x86_zf(cpu)) cpu->ip = op->arg;
             break;
         case MD_DOP_PUSH_R16:
             md_x86_push_reg(cpu, op->reg);
@@ -402,10 +398,10 @@ static void md_exec_decoded(MdRuntime *runtime, const MdDecodedOp *op)
             md_x86_write16(cpu, cpu->ds, op->arg, cpu->r[MD_X86_AX]);
             break;
         case MD_DOP_JZ:
-            if ((cpu->flags & MD_X86_FLAG_ZF) != 0u) cpu->ip = op->arg;
+            if (md_x86_zf(cpu)) cpu->ip = op->arg;
             break;
         case MD_DOP_JNZ:
-            if ((cpu->flags & MD_X86_FLAG_ZF) == 0u) cpu->ip = op->arg;
+            if (!md_x86_zf(cpu)) cpu->ip = op->arg;
             break;
         case MD_DOP_NOP:
             break;
@@ -436,11 +432,9 @@ static void md_exec_decoded(MdRuntime *runtime, const MdDecodedOp *op)
 static void md_exec_hot_dec_jnz(MdRuntime *runtime, const MdDecodedOp *op)
 {
     MdX86 *cpu = &runtime->cpu;
-    const uint16_t old_cf = cpu->flags & MD_X86_FLAG_CF;
 
-    cpu->r[op->reg] = md_x86_sub16(cpu, cpu->r[op->reg], 1u);
-    cpu->flags = (uint16_t)((cpu->flags & ~MD_X86_FLAG_CF) | old_cf);
-    cpu->ip = ((cpu->flags & MD_X86_FLAG_ZF) == 0u) ? op->arg : op->next_ip;
+    cpu->r[op->reg] = md_x86_dec16(cpu, cpu->r[op->reg]);
+    cpu->ip = !md_x86_zf(cpu) ? op->arg : op->next_ip;
 }
 
 MdStopReason md_interp_run_cached_until(MdRuntime *runtime, MdBlockCache *cache,
