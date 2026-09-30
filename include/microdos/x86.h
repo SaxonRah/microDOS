@@ -193,7 +193,7 @@ static inline void md_x86_flags_materialize(MdX86 *cpu)
     unsigned f;
     uint8_t p;
     if (op == MD_LAZY_NONE) return;
-    f = cpu->flags_raw & (uint16_t)~MD_X86_FLAGS_OSZAPC;
+    f = cpu->flags_raw & (0xFFFFu ^ MD_X86_FLAGS_OSZAPC);   /* no truncating cast (MSVC C4310) */
     if (md_x86_cf(cpu)) f |= 0x0001u;
     p = (uint8_t)cpu->lazy_res;
     p ^= (uint8_t)(p >> 4);

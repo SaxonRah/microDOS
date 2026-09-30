@@ -18,3 +18,4 @@ build-*/
 /build-disk/
 
 /logs/
+/third_party
