@@ -1,5 +1,14 @@
 #include "md_dos2_system.h"
 
+#ifdef MICRODOS_ENABLE_JIT
+#include "microdos/jit.h"
+#ifndef MICRODOS_SYSTEM_JIT_CODE_BYTES
+#define MICRODOS_SYSTEM_JIT_CODE_BYTES (24u * 1024u)
+#endif
+static uint8_t g_md_system_jit_code[MICRODOS_SYSTEM_JIT_CODE_BYTES] __attribute__((aligned(16)));
+static MdJit g_md_system_jit;
+#endif
+
 #include <string.h>
 
 #define MD_DOS2_KERNEL_SIZE 16690u
@@ -18,6 +27,11 @@ void md_dos2_system_init(MdDos2System *sys, uint8_t *memory, MdBlockCache *cache
     hooks.user = &sys->boot;
     md_runtime_init(&sys->runtime, memory, &hooks);
 
+#ifdef MICRODOS_ENABLE_JIT
+    md_jit_init(&g_md_system_jit, g_md_system_jit_code, sizeof(g_md_system_jit_code));
+    sys->jit = &g_md_system_jit;
+#endif
+
     sys->cache = cache;
     if (cache != NULL) {
         md_block_cache_init(cache);
@@ -32,6 +46,11 @@ void md_dos2_system_set_aot(MdDos2System *sys, const MdAotProgram *const *progra
     sys->aot_program_count = enabled ? count : 0u;
     sys->aot_enabled = enabled && (count != 0u || sys->kernel_program != NULL);
     if (!enabled) sys->kernel_program = NULL;
+}
+
+void md_dos2_system_set_jit(MdDos2System *sys, MdJit *jit)
+{
+    if (sys != NULL) sys->jit = jit;
 }
 
 bool md_dos2_system_start(MdDos2System *sys, const uint8_t *msdos_sys, size_t size)
@@ -107,7 +126,6 @@ static const MdAotProgram *md_aot_here(MdDos2System *sys)
         return sys->kernel_attached && sys->kernel_program->ready(rt, cs) ? sys->kernel_program : NULL;
     }
     if (cs == sys->boot.bios_segment) return NULL;
-    /* fast path: the program we entered last, at the same segment */
     if (sys->aot_last_program != NULL && sys->aot_last_segment == cs &&
         sys->aot_last_program->ready(rt, cs)) {
         return sys->aot_last_program;
@@ -157,17 +175,14 @@ MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
             (void)md_interp_run_cached_until(rt, sys->cache, left,
                                              sys->aot_enabled ? md_aot_stop : NULL, sys);
             if (rt->stop_reason == MD_STOP_BUDGET) {
-                rt->stop_reason = MD_STOP_NONE;       /* slice boundary, not a stop */
+                rt->stop_reason = MD_STOP_NONE;
                 break;
             }
             continue;
         }
 
         if (sys->aot_enabled) {
-            /* M18 cheap re-entry: in a segment holding a live attachment just
-               enter; enter() itself refuses when no compiled block can run at
-               CS:IP (not an entry, invalid chunk), and only then is one
-               instruction interpreted. No separate predicate/block_ok pass. */
+            /* Static AOT remains the highest-priority native tier. */
             const MdAotProgram *prog = md_aot_here(sys);
             if (prog != NULL) {
                 const uint64_t before = rt->instructions;
@@ -184,6 +199,8 @@ MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
                 }
                 if (st != MD_STOP_NONE) break;
                 if (rt->instructions == before) {
+                    /* Keep AOT hole/invalid-chunk behaviour conservative for
+                       now; M20 JIT is for segments with no static image. */
                     (void)md_interp_step(rt);
                     ++sys->attached_steps;
                 }
@@ -191,10 +208,44 @@ MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
             }
         }
 
-        /* M16: kernel, COMMAND.COM and non-compiled programs run on the
-           threaded interpreter. Compiled code can only become reachable
-           through a far transfer, INT or IRET, all of which change CS, so
-           returning on a CS change loses no AOT entry. */
+#ifdef MICRODOS_ENABLE_JIT
+        if (sys->jit != NULL && rt->cpu.cs == sys->boot.bios_segment) {
+            /* M20.2: the synthetic BIOS is a tiny INT/RETF trampoline layer,
+               not application code. Profiling showed it consumed most JIT
+               zero-progress sites and repeatedly polluted the 24 KiB arena.
+               Keep it on the canonical threaded path until its CS changes. */
+            const uint64_t before = rt->instructions;
+            (void)md_interp_run_until_cs_change(rt, left);
+            sys->bios_interpreted_instructions += rt->instructions - before;
+            sys->jit->bios_bypass_instructions += rt->instructions - before;
+            if (rt->stop_reason == MD_STOP_BUDGET) {
+                rt->stop_reason = MD_STOP_NONE;
+                break;
+            }
+            if (rt->stop_reason != MD_STOP_NONE) break;
+            continue;
+        }
+
+        if (sys->jit != NULL) {
+            /* M20.2: arbitrary/unrecognised application segments stay in the
+               native translator until a far transfer/INT/IRET changes CS.
+               Static kernel/DOS2TEST AOT still has first priority above. */
+            const uint64_t before = rt->instructions;
+            const uint64_t before_native = sys->jit->direct_instructions;
+            const uint64_t before_fallback = sys->jit->fallback_instructions;
+            const MdStopReason st = md_jit_run_until_cs_change(sys->jit, rt, left);
+            sys->jit_instructions += rt->instructions - before;
+            sys->jit_native_instructions += sys->jit->direct_instructions - before_native;
+            sys->jit_fallback_instructions += sys->jit->fallback_instructions - before_fallback;
+            if (st == MD_STOP_BUDGET) {
+                rt->stop_reason = MD_STOP_NONE;
+                break;
+            }
+            if (st != MD_STOP_NONE) break;
+            continue;
+        }
+#endif
+
         (void)md_interp_run_until_cs_change(rt, left);
         if (rt->stop_reason == MD_STOP_BUDGET) {
             rt->stop_reason = MD_STOP_NONE;

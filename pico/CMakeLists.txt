@@ -110,8 +110,9 @@ function(md_pico_common target code_in_sram)
 endfunction()
 
 # DOS firmware: name, code_in_sram, block_cache, sys_khz (0 = SDK default),
-# kernel_aot (1 = link the compiled MSDOS.SYS, M17)
-function(md_pico_dos target code_in_sram cache sys_khz kernel_aot)
+# kernel_aot (1 = link compiled MSDOS.SYS), jit (1 = runtime translator for
+# segments with no matching static AOT image).
+function(md_pico_dos target code_in_sram cache sys_khz kernel_aot jit)
     add_executable(${target}
         "${CMAKE_CURRENT_LIST_DIR}/microdos_pico.c"
         "${CMAKE_CURRENT_BINARY_DIR}/md_pico_blobs.S"
@@ -122,18 +123,34 @@ function(md_pico_dos target code_in_sram cache sys_khz kernel_aot)
     if(kernel_aot)
         target_sources(${target} PRIVATE "${MD_GENERATED}/msdos2_recomp.c")
     endif()
+    if(jit)
+        target_sources(${target} PRIVATE
+            "${MD_ROOT}/src/runtime/jit_thumb2.c"
+            "${MD_ROOT}/src/decode/x86_decode.c")
+    endif()
     md_pico_common(${target} ${code_in_sram})
     target_compile_definitions(${target} PRIVATE MICRODOS_PICO_CACHE=${cache}
                                MICRODOS_PICO_SYS_KHZ=${sys_khz}
-                               MICRODOS_PICO_KERNEL_AOT=${kernel_aot})
-    pico_set_program_name(${target} "microDOS")
+                               MICRODOS_PICO_KERNEL_AOT=${kernel_aot}
+                               MICRODOS_PICO_JIT=${jit})
+    if(jit)
+        target_compile_definitions(${target} PRIVATE MICRODOS_ENABLE_JIT=1 MD_JIT_BLOCK_SLOTS=64 MD_JIT_HOT_THRESHOLD=2 MD_JIT_HOTNESS_SLOTS=64 MICRODOS_SYSTEM_JIT_CODE_BYTES=24576)
+    endif()
+    if(jit)
+        pico_set_program_name(${target} "microDOS JIT")
+    else()
+        pico_set_program_name(${target} "microDOS")
+    endif()
 endfunction()
 
 # Benchmark firmware: name, code_in_sram, sys_khz
+# M19 adds the runtime Thumb translator plus the shared structural decoder.
 function(md_pico_bench target code_in_sram sys_khz)
     add_executable(${target}
         "${CMAKE_CURRENT_LIST_DIR}/microdos_bench.c"
         ${MD_RUNTIME_SOURCES}
+        "${MD_ROOT}/src/runtime/jit_thumb2.c"
+        "${MD_ROOT}/src/decode/x86_decode.c"
         "${MD_GENERATED}/loop_recomp.c"
         "${MD_GENERATED}/memloop_recomp.c")
     md_pico_common(${target} ${code_in_sram})
@@ -144,9 +161,12 @@ endfunction()
 # M16 defaults come from the M15 measurements: code in SRAM (+33% on DOS),
 # block cache off (+60% on DOS). The other variants stay for comparison.
 # M18: 300 MHz is the default (soak-tested); the compiled kernel stays on.
-# *_150 and *_nokernel are kept for comparison runs.
-md_pico_dos(microdos_pico          1 0 300000 1)   # default: SRAM, no cache, 300 MHz, kernel AOT
-md_pico_dos(microdos_pico_150      1 0 0      1)   # same at 150 MHz
-md_pico_dos(microdos_pico_nokernel 1 0 300000 0)   # interpreted kernel at 300 MHz (A/B)
+# M20.2: the proven M18 default stays unchanged. microdos_pico_jit is the profiling
+# full-DOS hybrid: static kernel/DOS2TEST AOT first, runtime JIT for COMMAND.COM
+# and arbitrary segments with no matching static image.
+md_pico_dos(microdos_pico          1 0 300000 1 0)   # proven M18 default, unchanged
+md_pico_dos(microdos_pico_150      1 0 0      1 0)   # rated-clock comparison
+md_pico_dos(microdos_pico_nokernel 1 0 300000 0 0)   # interpreted kernel A/B
+md_pico_dos(microdos_pico_jit      1 0 300000 1 1)   # M20.2: AOT kernel + hot runtime JIT apps
 md_pico_bench(microdos_bench     1 300000)
 md_pico_bench(microdos_bench_150 1 0)

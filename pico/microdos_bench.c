@@ -1,19 +1,28 @@
-/* microDOS RP2350 benchmark firmware (M15).
+/* microDOS RP2350 benchmark firmware (M15 -> M20.2).
  *
- * Separates the three costs that full-DOS numbers mix together:
- *   - where the ARM interpreter code runs (flash XIP vs SRAM: build variant)
+ * Separates the costs that full-DOS numbers mix together:
+ *   - where the ARM execution code runs (flash XIP vs SRAM: build variant)
  *   - where guest memory lives (SRAM vs PSRAM: both measured here)
- *   - which engine runs it (step, threaded interpreter, block cache, AOT)
+ *   - which engine runs it (step, threaded, CS-run, block cache, AOT, JIT)
+ *
+ * M20.2 keeps the resident/CFG fast paths and adds direct native control helpers.
+ * regionmix proves generic straight-line bodies; branchmix proves a forward CFG
+ * edge; callmix repeatedly crosses near CALL/RET boundaries with zero interpreter
+ * fallback once the blocks are translated.
  *
  * Workloads are loaded at segment 0, so every guest access stays inside
  * linear 0000-FFFF and a 64 KiB SRAM buffer is a complete guest for them.
  *   loop     CX=FFFF DEC/JNZ, register-only (131071 guest instructions)
  *   memloop  RMW over a 32 KiB window, stride 97 (229379 guest instructions)
+ *   regionmix generic resident-loop stress (294916 incl. HLT)
+ *   branchmix bounded-CFG proof with alternating forward JZ (212996 incl. HLT)
+ *   callmix  32768 near CALL/RET pairs (163843 incl. HLT)
  *
  * Every row checks that the guest produced the reference result, so a fast
  * wrong answer is reported as FAIL, not as a speedup.
  */
 #include "microdos/block_cache.h"
+#include "microdos/jit.h"
 #include "microdos/runtime.h"
 #include "loop_recomp.h"
 #include "memloop_recomp.h"
@@ -32,22 +41,75 @@
 #endif
 
 #define SRAM_GUEST_BYTES (64u * 1024u)
+#define MD_JIT_CODE_BYTES (32u * 1024u)
 
 static uint8_t __attribute__((aligned(16))) g_sram_guest[SRAM_GUEST_BYTES];
 static uint8_t __uninitialized_psram("md_bench_guest") __attribute__((aligned(16)))
     g_psram_guest[1u << 20];
 
+/* Executable SRAM arena. RP2350 SRAM is executable; the JIT backend issues
+ * DSB/ISB after filling a block before calling it through a Thumb pointer. */
+static uint8_t __attribute__((aligned(16))) g_jit_code[MD_JIT_CODE_BYTES];
+
 static MdRuntime g_rt;
 static MdBlockCache g_cache;
+static MdJit g_jit;
 
 static const uint8_t kLoop[] = { 0xB9, 0xFF, 0xFF, 0x49, 0x75, 0xFD, 0xF4 };
 static const uint8_t kMemloop[] = {
     0xB9,0x00,0x80, 0xBE,0x00,0x80, 0x8A,0x04, 0x04,0x03, 0x88,0x04,
-    0x83,0xC6,0x61, 0x81,0xCE,0x00,0x80, 0x49, 0x75,0xF0, 0xF4
+    0x83,0xC6,0x61, 0x81,0xCE,0x00,0x80, 0x49,0x75,0xF0, 0xF4
 };
 
-typedef enum { ENG_STEP, ENG_THREADED, ENG_CSRUN, ENG_CACHE, ENG_AOT } Engine;
-static const char *const kEngine[] = { "step", "threaded", "cs-run", "cache", "aot" };
+/* M20: not an AOT fixture.  It exists specifically to prove the generic
+ * resident compiler rather than the old exact loop/memloop recognizers. */
+static const uint8_t kRegionmix[] = {
+    0xB9,0x00,0x80,             /* mov cx,8000h */
+    0xBE,0x00,0x80,             /* mov si,8000h */
+    0xBB,0x34,0x12,             /* mov bx,1234h */
+    0x8A,0x04,                  /* mov al,[si] */
+    0x04,0x03,                  /* add al,3 */
+    0x81,0xF3,0x57,0x13,       /* xor bx,1357h */
+    0x83,0xC3,0x05,            /* add bx,5 */
+    0x88,0x04,                  /* mov [si],al */
+    0x83,0xC6,0x61,            /* add si,97 */
+    0x81,0xCE,0x00,0x80,       /* or si,8000h */
+    0x49,                       /* dec cx */
+    0x75,0xE9,                  /* jnz back to mov al,[si] */
+    0xF4                        /* hlt */
+};
+
+
+/* M20.1 bounded-CFG proof.  The forward JZ skips ADD BX,3 every other
+ * iteration, then both paths reconverge at OR BX,0 before DEC CX/JNZ. */
+static const uint8_t kBranchmix[] = {
+    0xB9,0x00,0x80,             /* mov cx,8000h */
+    0xB8,0x00,0x00,             /* mov ax,0 */
+    0xBB,0x00,0x00,             /* mov bx,0 */
+    0x83,0xF0,0x01,             /* xor ax,1 */
+    0x83,0xF8,0x00,             /* cmp ax,0 */
+    0x74,0x03,                  /* jz skip_add */
+    0x83,0xC3,0x03,             /* add bx,3 */
+    0x83,0xCB,0x00,             /* skip_add: or bx,0 (CF=0) */
+    0x49,                       /* dec cx */
+    0x75,0xEF,                  /* jnz back to xor ax,1 */
+    0xF4                        /* hlt */
+};
+
+/* M20.2 control-transfer proof. Every iteration executes CALL -> ADD BX,3 ->
+ * RET before DEC/JNZ. 32768 * 3 wraps BX to 8000h. */
+static const uint8_t kCallmix[] = {
+    0xB9,0x00,0x80,             /* mov cx,8000h */
+    0xBB,0x00,0x00,             /* mov bx,0 */
+    0xE8,0x04,0x00,             /* call sub */
+    0x49,                       /* dec cx */
+    0x75,0xFA,                  /* jnz call */
+    0xF4,                       /* hlt */
+    0x83,0xC3,0x03,             /* sub: add bx,3 */
+    0xC3                        /* ret */
+};
+typedef enum { ENG_STEP, ENG_THREADED, ENG_CSRUN, ENG_CACHE, ENG_AOT, ENG_JIT } Engine;
+static const char *const kEngine[] = { "step", "threaded", "cs-run", "cache", "aot", "jit" };
 
 #ifndef MICRODOS_PICO_SYS_KHZ
 #define MICRODOS_PICO_SYS_KHZ 0
@@ -67,7 +129,7 @@ static bool bench_set_clock(void)
 
 static void say(const char *fmt, ...)
 {
-    char line[200];
+    char line[220];
     va_list ap;
     size_t n;
     va_start(ap, fmt);
@@ -102,6 +164,8 @@ static uint64_t run_once(uint8_t *mem, int memloop, Engine eng, uint64_t *us, ui
         md_block_cache_init(&g_cache);
         md_runtime_set_block_cache(&g_rt, &g_cache);
     }
+    if (eng == ENG_JIT) md_jit_init(&g_jit, g_jit_code, sizeof(g_jit_code));
+
     if (eng != ENG_AOT) {
         if (memloop) md_runtime_load_com(&g_rt, kMemloop, sizeof(kMemloop), 0x0000u);
         else md_runtime_load_com(&g_rt, kLoop, sizeof(kLoop), 0x0000u);
@@ -126,12 +190,233 @@ static uint64_t run_once(uint8_t *mem, int memloop, Engine eng, uint64_t *us, ui
             st = memloop ? md_recomp_memloop(&g_rt, 0x0000u, 10000000u)
                          : md_recomp_loop(&g_rt, 0x0000u, 10000000u);
             break;
+        case ENG_JIT:
+            st = md_jit_run(&g_jit, &g_rt, 10000000u);
+            break;
     }
     t1 = time_us_64();
 
     *us = t1 - t0;
     *check = (st == MD_STOP_HALT) ? (memloop ? window_hash(mem) : g_rt.cpu.r[MD_X86_CX] + 1u) : 0u;
     return g_rt.instructions;
+}
+
+static uint32_t regionmix_check(const uint8_t *mem)
+{
+    uint32_t h = window_hash(mem);
+    h ^= ((uint32_t)g_rt.cpu.r[MD_X86_BX] << 16) | g_rt.cpu.r[MD_X86_AX];
+    h ^= ((uint32_t)g_rt.cpu.r[MD_X86_SI] << 1);
+    return h != 0u ? h : 1u;
+}
+
+static uint64_t run_regionmix_once(uint8_t *mem, Engine eng, uint64_t *us, uint32_t *check)
+{
+    MdHooks hooks;
+    MdStopReason st = MD_STOP_NONE;
+    uint64_t t0, t1;
+
+    memset(&hooks, 0, sizeof(hooks));
+    memset(mem, 0, SRAM_GUEST_BYTES);
+    md_runtime_init(&g_rt, mem, &hooks);
+    if (eng == ENG_CACHE) {
+        md_block_cache_init(&g_cache);
+        md_runtime_set_block_cache(&g_rt, &g_cache);
+    }
+    if (eng == ENG_JIT) md_jit_init(&g_jit, g_jit_code, sizeof(g_jit_code));
+    md_runtime_load_com(&g_rt, kRegionmix, sizeof(kRegionmix), 0x0000u);
+
+    t0 = time_us_64();
+    switch (eng) {
+        case ENG_STEP:
+            while (g_rt.stop_reason == MD_STOP_NONE) (void)md_interp_step(&g_rt);
+            st = g_rt.stop_reason;
+            break;
+        case ENG_THREADED: st = md_interp_run(&g_rt, 10000000u); break;
+        case ENG_CSRUN: st = md_interp_run_until_cs_change(&g_rt, 10000000u); break;
+        case ENG_CACHE: st = md_interp_run_cached(&g_rt, &g_cache, 10000000u); break;
+        case ENG_JIT: st = md_jit_run(&g_jit, &g_rt, 10000000u); break;
+        case ENG_AOT: break;              /* no static-AOT regionmix fixture yet */
+    }
+    t1 = time_us_64();
+    *us = t1 - t0;
+    *check = st == MD_STOP_HALT ? regionmix_check(mem) : 0u;
+    return g_rt.instructions;
+}
+
+static void print_jit_stats(void)
+{
+    say("[jit]   compile=%llu hit=%llu miss=%llu entry=%llu direct=%llu fallback=%llu invalid=%llu flush=%llu code=%lu B local-edges=%llu helper-sites=%llu\n",
+        (unsigned long long)g_jit.compiles,
+        (unsigned long long)g_jit.hits,
+        (unsigned long long)g_jit.misses,
+        (unsigned long long)g_jit.native_entries,
+        (unsigned long long)g_jit.direct_instructions,
+        (unsigned long long)g_jit.fallback_instructions,
+        (unsigned long long)g_jit.invalidations,
+        (unsigned long long)g_jit.flushes,
+        (unsigned long)g_jit.code_used,
+        (unsigned long long)g_jit.local_edges,
+        (unsigned long long)g_jit.helper_sites);
+    say("[jit]   resident-regions=%llu resident-entry=%llu resident-instr=%llu generic-regions=%llu generic-entry=%llu generic-instr=%llu\n",
+        (unsigned long long)g_jit.resident_regions,
+        (unsigned long long)g_jit.resident_entries,
+        (unsigned long long)g_jit.resident_instructions,
+        (unsigned long long)g_jit.generic_regions,
+        (unsigned long long)g_jit.generic_entries,
+        (unsigned long long)g_jit.generic_instructions);
+    say("[jit]   cfg-regions=%llu cfg-entry=%llu cfg-instr=%llu cfg-edges=%llu returns=%llu cs-exit=%llu control=%llu compile-fb=%llu budget-fb=%llu zero-fb=%llu cold-fb=%llu\n",
+        (unsigned long long)g_jit.cfg_regions,
+        (unsigned long long)g_jit.cfg_entries,
+        (unsigned long long)g_jit.cfg_instructions,
+        (unsigned long long)g_jit.cfg_internal_edges,
+        (unsigned long long)g_jit.native_returns,
+        (unsigned long long)g_jit.cs_change_exits,
+        (unsigned long long)g_jit.control_instructions,
+        (unsigned long long)g_jit.compile_fail_fallbacks,
+        (unsigned long long)g_jit.budget_fallbacks,
+        (unsigned long long)g_jit.zero_progress_fallbacks,
+        (unsigned long long)g_jit.cold_fallbacks);
+}
+
+static void bench_regionmix(void)
+{
+    static const char *const kGuest[] = { "SRAM ", "PSRAM" };
+    uint8_t *const guests[2] = { g_sram_guest, g_psram_guest };
+    int g, e;
+
+    say("[bench] regionmix has no static-AOT row; it is the M20 generic-region proof.\n");
+    for (g = 0; g < 2; ++g) {
+        uint32_t reference = 0u;
+        for (e = ENG_STEP; e <= ENG_JIT; ++e) {
+            uint64_t us_best = UINT64_MAX, instr = 0u;
+            uint32_t check = 0u;
+            int rep;
+            if (e == ENG_AOT) continue;
+            for (rep = 0; rep < 3; ++rep) {
+                uint64_t us;
+                instr = run_regionmix_once(guests[g], (Engine)e, &us, &check);
+                if (us < us_best) us_best = us;
+            }
+            if (reference == 0u) reference = check;
+            say("[bench] %-8s %-5s %-8s %9llu %10llu %9.3f  %s\n",
+                "regionmix", kGuest[g], kEngine[e],
+                (unsigned long long)instr, (unsigned long long)us_best,
+                us_best ? (double)instr / (double)us_best : 0.0,
+                (check != 0u && check == reference) ? "ok" : "FAIL");
+            if (e == ENG_JIT) print_jit_stats();
+        }
+    }
+}
+
+static uint32_t branchmix_check(void)
+{
+    uint32_t h = ((uint32_t)g_rt.cpu.r[MD_X86_BX] << 16) | g_rt.cpu.r[MD_X86_AX];
+    h ^= g_rt.cpu.r[MD_X86_CX];
+    return h != 0u ? h : 1u;
+}
+
+static uint64_t run_branchmix_once(uint8_t *mem, Engine eng, uint64_t *us, uint32_t *check)
+{
+    MdHooks hooks;
+    MdStopReason st = MD_STOP_NONE;
+    uint64_t t0, t1;
+    memset(&hooks, 0, sizeof(hooks));
+    memset(mem, 0, SRAM_GUEST_BYTES);
+    md_runtime_init(&g_rt, mem, &hooks);
+    if (eng == ENG_CACHE) { md_block_cache_init(&g_cache); md_runtime_set_block_cache(&g_rt, &g_cache); }
+    if (eng == ENG_JIT) md_jit_init(&g_jit, g_jit_code, sizeof(g_jit_code));
+    md_runtime_load_com(&g_rt, kBranchmix, sizeof(kBranchmix), 0x0000u);
+    t0 = time_us_64();
+    switch (eng) {
+        case ENG_STEP: while (g_rt.stop_reason == MD_STOP_NONE) (void)md_interp_step(&g_rt); st = g_rt.stop_reason; break;
+        case ENG_THREADED: st = md_interp_run(&g_rt, 10000000u); break;
+        case ENG_CSRUN: st = md_interp_run_until_cs_change(&g_rt, 10000000u); break;
+        case ENG_CACHE: st = md_interp_run_cached(&g_rt, &g_cache, 10000000u); break;
+        case ENG_JIT: st = md_jit_run(&g_jit, &g_rt, 10000000u); break;
+        case ENG_AOT: break;
+    }
+    t1 = time_us_64();
+    *us = t1 - t0;
+    *check = st == MD_STOP_HALT ? branchmix_check() : 0u;
+    return g_rt.instructions;
+}
+
+static void bench_branchmix(void)
+{
+    static const char *const kGuest[] = { "SRAM ", "PSRAM" };
+    uint8_t *const guests[2] = { g_sram_guest, g_psram_guest };
+    int g, e;
+    say("[bench] branchmix has no static-AOT row; it is the M20.1 bounded-CFG proof.\n");
+    for (g = 0; g < 2; ++g) {
+        uint32_t reference = 0u;
+        for (e = ENG_STEP; e <= ENG_JIT; ++e) {
+            uint64_t us_best = UINT64_MAX, instr = 0u;
+            uint32_t check = 0u;
+            int rep;
+            if (e == ENG_AOT) continue;
+            for (rep = 0; rep < 3; ++rep) {
+                uint64_t us;
+                instr = run_branchmix_once(guests[g], (Engine)e, &us, &check);
+                if (us < us_best) us_best = us;
+            }
+            if (reference == 0u) reference = check;
+            say("[bench] %-8s %-5s %-8s %9llu %10llu %9.3f  %s\n",
+                "branchmix", kGuest[g], kEngine[e],
+                (unsigned long long)instr, (unsigned long long)us_best,
+                us_best ? (double)instr / (double)us_best : 0.0,
+                (check != 0u && check == reference) ? "ok" : "FAIL");
+            if (e == ENG_JIT) print_jit_stats();
+        }
+    }
+}
+
+static uint32_t callmix_check(void)
+{
+    uint32_t h = ((uint32_t)g_rt.cpu.r[MD_X86_BX] << 16) | g_rt.cpu.r[MD_X86_CX];
+    h ^= g_rt.cpu.r[MD_X86_SP];
+    return h != 0u ? h : 1u;
+}
+
+static uint64_t run_callmix_once(uint8_t *mem, Engine eng, uint64_t *us, uint32_t *check)
+{
+    MdHooks hooks; MdStopReason st=MD_STOP_NONE; uint64_t t0,t1;
+    memset(&hooks,0,sizeof(hooks)); memset(mem,0,SRAM_GUEST_BYTES);
+    md_runtime_init(&g_rt,mem,&hooks);
+    if(eng==ENG_CACHE){md_block_cache_init(&g_cache);md_runtime_set_block_cache(&g_rt,&g_cache);}
+    if(eng==ENG_JIT)md_jit_init(&g_jit,g_jit_code,sizeof(g_jit_code));
+    md_runtime_load_com(&g_rt,kCallmix,sizeof(kCallmix),0x0000u);
+    t0=time_us_64();
+    switch(eng){
+        case ENG_STEP: while(g_rt.stop_reason==MD_STOP_NONE)(void)md_interp_step(&g_rt); st=g_rt.stop_reason; break;
+        case ENG_THREADED: st=md_interp_run(&g_rt,10000000u); break;
+        case ENG_CSRUN: st=md_interp_run_until_cs_change(&g_rt,10000000u); break;
+        case ENG_CACHE: st=md_interp_run_cached(&g_rt,&g_cache,10000000u); break;
+        case ENG_JIT: st=md_jit_run(&g_jit,&g_rt,10000000u); break;
+        case ENG_AOT: break;
+    }
+    t1=time_us_64(); *us=t1-t0; *check=st==MD_STOP_HALT?callmix_check():0u;
+    return g_rt.instructions;
+}
+
+static void bench_callmix(void)
+{
+    static const char *const kGuest[]={"SRAM ","PSRAM"};
+    uint8_t *const guests[2]={g_sram_guest,g_psram_guest};
+    int g,e;
+    say("[bench] callmix has no static-AOT row; it is the M20.2 CALL/RET proof.\n");
+    for(g=0;g<2;++g){
+        uint32_t reference=0u;
+        for(e=ENG_STEP;e<=ENG_JIT;++e){
+            uint64_t us_best=UINT64_MAX,instr=0u; uint32_t check=0u; int rep;
+            if(e==ENG_AOT)continue;
+            for(rep=0;rep<3;++rep){uint64_t us;instr=run_callmix_once(guests[g],(Engine)e,&us,&check);if(us<us_best)us_best=us;}
+            if(reference==0u)reference=check;
+            say("[bench] %-8s %-5s %-8s %9llu %10llu %9.3f  %s\n","callmix",kGuest[g],kEngine[e],
+                (unsigned long long)instr,(unsigned long long)us_best,us_best?(double)instr/(double)us_best:0.0,
+                (check!=0u&&check==reference)?"ok":"FAIL");
+            if(e==ENG_JIT)print_jit_stats();
+        }
+    }
 }
 
 static void bench(void)
@@ -141,16 +426,18 @@ static void bench(void)
     uint32_t reference[2] = { 0u, 0u };
     int g, w, e;
 
-    say("\n[bench] microDOS RP2350 benchmark: clk %lu MHz, code %s, psram %lu KiB\n",
+    say("\n[bench] microDOS RP2350 M20.2.1 benchmark: clk %lu MHz, code %s, psram %lu KiB\n",
         (unsigned long)(clock_get_hz(clk_sys) / 1000000u),
         MICRODOS_PICO_CODE_IN_SRAM ? "SRAM (copy_to_ram)" : "flash XIP",
         (unsigned long)(psram_get_size() / 1024u));
+    say("[bench] JIT arena: %u KiB executable SRAM; bounded CFG + resident regions + native CALL/RET/INT helpers\n",
+        (unsigned)(sizeof(g_jit_code) / 1024u));
     say("[bench] %-8s %-5s %-8s %9s %10s %9s  %s\n",
         "workload", "guest", "engine", "instr", "us", "MIPS", "result");
 
     for (w = 0; w < 2; ++w) {
         for (g = 0; g < 2; ++g) {
-            for (e = ENG_STEP; e <= ENG_AOT; ++e) {
+            for (e = ENG_STEP; e <= ENG_JIT; ++e) {
                 uint64_t us_best = UINT64_MAX, instr = 0u;
                 uint32_t check = 0u;
                 int rep;
@@ -165,9 +452,13 @@ static void bench(void)
                     (unsigned long long)instr, (unsigned long long)us_best,
                     us_best ? (double)instr / (double)us_best : 0.0,
                     (check != 0u && check == reference[w]) ? "ok" : "FAIL");
+                if (e == ENG_JIT) print_jit_stats();
             }
         }
     }
+    bench_regionmix();
+    bench_branchmix();
+    bench_callmix();
     say("[bench] done. Press any key to run again.\n");
 }
 
