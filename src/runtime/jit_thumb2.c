@@ -16,6 +16,12 @@ _Static_assert((MD_JIT_HOTNESS_SLOTS & (MD_JIT_HOTNESS_SLOTS - 1u)) == 0u,
 #define MD_JIT_CODE_ALIGN 4u
 #define MD_JIT_NATIVE_TMP 1536u
 
+#if MD_JIT_PROFILE
+#define MD_JIT_STAT(expr_) do { expr_; } while (0)
+#else
+#define MD_JIT_STAT(expr_) do { } while (0)
+#endif
+
 /* Generated functions use low ARM registers only:
  *   r4 = MdRuntime/MdX86 *, r5 = MdJitBlock *, r6 = retired, r7 = budget
  *   r0-r3 = temporaries
@@ -77,6 +83,11 @@ static void md_jit_record_site_at(MdJit *jit, const MdRuntime *runtime, unsigned
                                   uint16_t cs, uint16_t ip, uint8_t opcode,
                                   uint16_t dst_cs, uint16_t dst_ip)
 {
+#if !MD_JIT_PROFILE
+    (void)jit; (void)runtime; (void)reason; (void)cs; (void)ip;
+    (void)opcode; (void)dst_cs; (void)dst_ip;
+    return;
+#else
     MdJitHotSite *empty = NULL, *least = NULL;
     unsigned i;
     (void)runtime;
@@ -103,6 +114,7 @@ static void md_jit_record_site_at(MdJit *jit, const MdRuntime *runtime, unsigned
         least->reason = (uint8_t)reason;
         least->count = base + 1u;
     }
+#endif
 }
 
 static void md_jit_record_site(MdJit *jit, const MdRuntime *runtime, unsigned reason)
@@ -126,9 +138,13 @@ static void md_jit_record_transfer(MdJit *jit, const MdRuntime *runtime, unsigne
 
 static void md_jit_record_exit(MdJit *jit, const MdRuntime *runtime, unsigned reason)
 {
+#if MD_JIT_PROFILE
     if (jit == NULL || reason >= MD_JIT_EXIT_REASON_COUNT || reason == 0u) return;
     ++jit->exit_reason[reason];
     md_jit_record_site(jit, runtime, reason);
+#else
+    (void)jit; (void)runtime; (void)reason;
+#endif
 }
 
 static int md_jit_boundary(const MdDecodedInstruction *inst)
@@ -1068,6 +1084,48 @@ static int md_jit_install_native(MdJit *jit, MdJitBlock *block, const MdThumbBuf
 #else
     block->native = NULL;
 #endif
+    return 1;
+}
+
+/*
+ * M21 compact IR: emitted native code owns only the descriptors that a
+ * runtime helper will dereference by op index.  Resident/direct blocks drop
+ * their compile IR completely.  Host builds always retain descriptors because
+ * their differential/reference path executes MdJitOp rather than Thumb.
+ */
+static int md_jit_persist_ops(MdJit *jit, MdJitBlock *block)
+{
+    size_t at, bytes;
+    unsigned si;
+
+    if (jit == NULL || block == NULL || block->ops == NULL || block->op_count == 0u) return 0;
+
+    block->profile_ip = block->ip;
+    block->profile_opcode = block->ops[0].opcode;
+    if (block->direct_prefix_ops != 0u) {
+        si = (unsigned)block->direct_prefix_ops - 1u;
+        if (si < block->op_count) {
+            block->profile_ip = block->ops[si].ip;
+            block->profile_opcode = block->ops[si].opcode;
+        }
+    }
+
+#if !defined(__arm__) && !defined(__thumb__)
+    block->keep_ops = 1u;
+#endif
+
+    if (!block->keep_ops) {
+        block->ops = NULL;
+        return 1;
+    }
+
+    bytes = (size_t)block->op_count * sizeof(MdJitOp);
+    at = (jit->code_used + 3u) & ~(size_t)3u;
+    if (at + bytes > jit->code_size) return 0;
+
+    memcpy(jit->code + at, block->ops, bytes);
+    block->ops = (MdJitOp *)(void *)(jit->code + at);
+    jit->code_used = at + bytes;
     return 1;
 }
 
@@ -2344,6 +2402,7 @@ static int md_jit_emit_thumb(MdJit *jit, MdJitBlock *block)
             case MD_JIT_OP_INT:
             case MD_JIT_OP_IRET:
                 th_emit_control_one(&b, op, i);
+                block->keep_ops = 1u;
                 ++jit->helper_sites;
                 i = direct;
                 break;
@@ -2351,6 +2410,7 @@ static int md_jit_emit_thumb(MdJit *jit, MdJitBlock *block)
             case MD_JIT_OP_ALU_RR16:
             case MD_JIT_OP_ALU_RR8:
                 th_emit_sem_one(&b, i);
+                block->keep_ops = 1u;
                 ++jit->helper_sites;
                 if (op->kind != MD_JIT_OP_LODS)
                     cf = (op->aux == 1u || op->aux == 4u || op->aux == 6u) ? MD_JIT_CF_ZERO
@@ -2358,6 +2418,7 @@ static int md_jit_emit_thumb(MdJit *jit, MdJitBlock *block)
                 break;
             case MD_JIT_OP_LOOP:
                 if (!th_emit_loop(&b, block, i, op_native)) b.failed = 1;
+                block->keep_ops = 1u;
                 ++jit->helper_sites;
                 i = direct;
                 break;
@@ -2421,7 +2482,7 @@ static void md_jit_flush_code(MdJit *jit)
 {
     memset(jit->blocks, 0, sizeof(jit->blocks));
     jit->code_used = 0u;
-    ++jit->flushes;
+    MD_JIT_STAT(++jit->flushes);
 }
 
 static MdJitBlock *md_jit_compile(MdJit *jit, MdRuntime *runtime)
@@ -2444,6 +2505,7 @@ static MdJitBlock *md_jit_compile(MdJit *jit, MdRuntime *runtime)
     slot = md_jit_hash(cs, start_ip);
     block = &jit->blocks[slot];
     memset(block, 0, sizeof(*block));
+    block->ops = jit->compile_ops;
     block->materialize = md_jit_materialize;
     block->store8_slow = md_jit_store8_slow;
     block->exec_one = md_jit_exec_one;
@@ -2482,13 +2544,14 @@ static MdJitBlock *md_jit_compile(MdJit *jit, MdRuntime *runtime)
     block->page_gen0 = runtime->code_page_generation[block->page0];
     block->page_gen1 = runtime->code_page_generation[block->page1];
 
-    if (!md_jit_emit_thumb(jit, block)) {
+    if (!md_jit_emit_thumb(jit, block) || !md_jit_persist_ops(jit, block)) {
         /* Arena full: discard translations and compile this block into the
            fresh arena. Guest state/decoder metadata remain authoritative. */
         md_jit_flush_code(jit);
         slot = md_jit_hash(cs, start_ip);
         block = &jit->blocks[slot];
         memset(block, 0, sizeof(*block));
+        block->ops = jit->compile_ops;
         block->materialize = md_jit_materialize;
         block->store8_slow = md_jit_store8_slow;
         block->exec_one = md_jit_exec_one;
@@ -2515,11 +2578,11 @@ static MdJitBlock *md_jit_compile(MdJit *jit, MdRuntime *runtime)
         block->code_epoch = runtime->code_epoch;
         block->page_gen0 = runtime->code_page_generation[block->page0];
         block->page_gen1 = runtime->code_page_generation[block->page1];
-        if (!md_jit_emit_thumb(jit, block)) return NULL;
+        if (!md_jit_emit_thumb(jit, block) || !md_jit_persist_ops(jit, block)) return NULL;
     }
 
     block->valid = 1u;
-    ++jit->compiles;
+    MD_JIT_STAT(++jit->compiles);
     return block;
 }
 
@@ -2528,18 +2591,18 @@ static MdJitBlock *md_jit_get(MdJit *jit, MdRuntime *runtime)
     MdJitBlock *block;
     const unsigned slot = md_jit_hash(runtime->cpu.cs, runtime->cpu.ip);
 
-    ++jit->lookups;
+    MD_JIT_STAT(++jit->lookups);
     block = &jit->blocks[slot];
     if (block->valid && block->cs == runtime->cpu.cs && block->ip == runtime->cpu.ip) {
         if (md_jit_block_current(block, runtime)) {
-            ++jit->hits;
+            MD_JIT_STAT(++jit->hits);
             return block;
         }
         block->valid = 0u;
-        ++jit->invalidations;
+        MD_JIT_STAT(++jit->invalidations);
     }
 
-    ++jit->misses;
+    MD_JIT_STAT(++jit->misses);
     jit->last_lookup_cold = 0u;
     if (!md_jit_hot_ready(jit, runtime->cpu.cs, runtime->cpu.ip)) {
         jit->last_lookup_cold = 1u;
@@ -2605,7 +2668,7 @@ static MdStopReason md_jit_run_common(MdJit *jit, MdRuntime *runtime,
         uint8_t src_opcode;
 
         if (watch_cs && runtime->cpu.cs != cs0) {
-            ++jit->cs_change_exits;
+            MD_JIT_STAT(++jit->cs_change_exits);
             md_jit_record_exit(jit, runtime, MD_JIT_EXIT_CS_CHANGE);
             return MD_STOP_NONE;
         }
@@ -2619,18 +2682,18 @@ static MdStopReason md_jit_run_common(MdJit *jit, MdRuntime *runtime,
         if (block == NULL) {
             const uint16_t fcs = runtime->cpu.cs, fip = runtime->cpu.ip;
             const uint8_t fop = md_x86_read8(&runtime->cpu, fcs, fip);
-            ++jit->boundary_fallbacks;
-            ++jit->fallback_instructions;
+            MD_JIT_STAT(++jit->boundary_fallbacks);
+            MD_JIT_STAT(++jit->fallback_instructions);
             if (jit->last_lookup_cold) {
-                ++jit->cold_fallbacks;
+                MD_JIT_STAT(++jit->cold_fallbacks);
                 md_jit_record_exit(jit, runtime, MD_JIT_EXIT_COLD_FALLBACK);
             } else {
-                ++jit->compile_fail_fallbacks;
+                MD_JIT_STAT(++jit->compile_fail_fallbacks);
                 md_jit_record_exit(jit, runtime, MD_JIT_EXIT_COMPILE_FAIL);
             }
             (void)md_interp_step(runtime);
             if (watch_cs && runtime->cpu.cs != cs0) {
-                ++jit->cs_change_exits;
+                MD_JIT_STAT(++jit->cs_change_exits);
                 ++jit->exit_reason[MD_JIT_EXIT_CS_CHANGE];
                 md_jit_record_transfer(jit, runtime, MD_JIT_EXIT_CS_CHANGE, fcs, fip, fop);
                 return MD_STOP_NONE;
@@ -2639,15 +2702,8 @@ static MdStopReason md_jit_run_common(MdJit *jit, MdRuntime *runtime,
         }
 
         src_cs = runtime->cpu.cs;
-        src_ip = block->ip;
-        src_opcode = md_x86_read8(&runtime->cpu, src_cs, src_ip);
-        if (block->direct_prefix_ops != 0u) {
-            const unsigned si = (unsigned)block->direct_prefix_ops - 1u;
-            if (si < block->op_count) {
-                src_ip = block->ops[si].ip;
-                src_opcode = block->ops[si].opcode;
-            }
-        }
+        src_ip = block->profile_ip;
+        src_opcode = block->profile_opcode;
 
         /* First trip through a freshly discovered basic block needs enough
            budget for its statically straight-line prefix. Internal backedges
@@ -2655,31 +2711,31 @@ static MdStopReason md_jit_run_common(MdJit *jit, MdRuntime *runtime,
         if (left < block->op_count) {
             const uint16_t fcs = runtime->cpu.cs, fip = runtime->cpu.ip;
             const uint8_t fop = md_x86_read8(&runtime->cpu, fcs, fip);
-            ++jit->boundary_fallbacks;
-            ++jit->fallback_instructions;
-            ++jit->budget_fallbacks;
+            MD_JIT_STAT(++jit->boundary_fallbacks);
+            MD_JIT_STAT(++jit->fallback_instructions);
+            MD_JIT_STAT(++jit->budget_fallbacks);
             md_jit_record_exit(jit, runtime, MD_JIT_EXIT_BUDGET_FALLBACK);
             (void)md_interp_step(runtime);
             if (watch_cs && runtime->cpu.cs != cs0) {
-                ++jit->cs_change_exits; ++jit->exit_reason[MD_JIT_EXIT_CS_CHANGE];
+                MD_JIT_STAT(++jit->cs_change_exits); ++jit->exit_reason[MD_JIT_EXIT_CS_CHANGE];
                 md_jit_record_transfer(jit, runtime, MD_JIT_EXIT_CS_CHANGE, fcs, fip, fop);
                 return MD_STOP_NONE;
             }
             continue;
         }
 
-        ++jit->native_entries;
-        if (block->resident) ++jit->resident_entries;
-        if (block->generic_region) ++jit->generic_entries;
-        if (block->cfg_region) ++jit->cfg_entries;
+        MD_JIT_STAT(++jit->native_entries);
+        if (block->resident) MD_JIT_STAT(++jit->resident_entries);
+        if (block->generic_region) MD_JIT_STAT(++jit->generic_entries);
+        if (block->cfg_region) MD_JIT_STAT(++jit->cfg_entries);
 #if defined(__arm__) || defined(__thumb__)
         retired = md_jit_execute_block(runtime, block,
                     (uint32_t)(left > 0x7FFFFFFFu ? 0x7FFFFFFFu : left));
         runtime->instructions += retired;
-        jit->direct_instructions += retired;
-        if (block->resident) jit->resident_instructions += retired;
-        if (block->generic_region) jit->generic_instructions += retired;
-        if (block->cfg_region) jit->cfg_instructions += retired;
+        MD_JIT_STAT(jit->direct_instructions += retired);
+        if (block->resident) MD_JIT_STAT(jit->resident_instructions += retired);
+        if (block->generic_region) MD_JIT_STAT(jit->generic_instructions += retired);
+        if (block->cfg_region) MD_JIT_STAT(jit->cfg_instructions += retired);
 #else
         /* Host/reference md_jit_exec_one already updates the counters. */
         retired = md_jit_execute_block(runtime, block,
@@ -2688,13 +2744,13 @@ static MdStopReason md_jit_run_common(MdJit *jit, MdRuntime *runtime,
         if (retired == 0u && runtime->stop_reason == MD_STOP_NONE) {
             const uint16_t fcs = runtime->cpu.cs, fip = runtime->cpu.ip;
             const uint8_t fop = md_x86_read8(&runtime->cpu, fcs, fip);
-            ++jit->boundary_fallbacks;
-            ++jit->fallback_instructions;
-            ++jit->zero_progress_fallbacks;
+            MD_JIT_STAT(++jit->boundary_fallbacks);
+            MD_JIT_STAT(++jit->fallback_instructions);
+            MD_JIT_STAT(++jit->zero_progress_fallbacks);
             md_jit_record_exit(jit, runtime, MD_JIT_EXIT_ZERO_PROGRESS);
             (void)md_interp_step(runtime);
             if (watch_cs && runtime->cpu.cs != cs0) {
-                ++jit->cs_change_exits; ++jit->exit_reason[MD_JIT_EXIT_CS_CHANGE];
+                MD_JIT_STAT(++jit->cs_change_exits); ++jit->exit_reason[MD_JIT_EXIT_CS_CHANGE];
                 md_jit_record_transfer(jit, runtime, MD_JIT_EXIT_CS_CHANGE, fcs, fip, fop);
                 return MD_STOP_NONE;
             }
@@ -2702,17 +2758,18 @@ static MdStopReason md_jit_run_common(MdJit *jit, MdRuntime *runtime,
         }
 
         if (runtime->stop_reason != MD_STOP_NONE) {
-            ++jit->stop_exits;
+            MD_JIT_STAT(++jit->stop_exits);
             md_jit_record_exit(jit, runtime, MD_JIT_EXIT_STOP);
             break;
         }
         if (watch_cs && runtime->cpu.cs != cs0) {
-            ++jit->cs_change_exits;
+            MD_JIT_STAT(++jit->cs_change_exits);
             ++jit->exit_reason[MD_JIT_EXIT_CS_CHANGE];
             md_jit_record_transfer(jit, runtime, MD_JIT_EXIT_CS_CHANGE,
                                    src_cs, src_ip, src_opcode);
             return MD_STOP_NONE;
         }
+#if MD_JIT_PROFILE
         if (retired != 0u) {
             ++jit->native_returns;
             ++jit->exit_reason[MD_JIT_EXIT_NATIVE_RETURN];
@@ -2722,6 +2779,7 @@ static MdStopReason md_jit_run_common(MdJit *jit, MdRuntime *runtime,
             if ((jit->native_returns & 63u) == 0u)
                 md_jit_record_site(jit, runtime, MD_JIT_EXIT_NATIVE_RETURN);
         }
+#endif
     }
     return runtime->stop_reason;
 }

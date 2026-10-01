@@ -4,25 +4,30 @@ Boots the released MS-DOS 2.0 kernel and COMMAND.COM on an RP2350 with 8 MiB
 PSRAM, with a USB serial console. DOS2TEST.COM is on the disk and runs as
 dosrecomp-compiled native code when you start it at `A>`.
 
-## Firmware variants (M18 / M20.2 hybrid)
+## Firmware variants (M21 compact resident execution)
 
 `.\md.bat build pico` builds:
 
 | UF2 | Purpose |
 |---|---|
-| `microdos_pico.uf2` | **default** DOS: compiled kernel, code in SRAM, 300 MHz |
+| `microdos_pico.uf2` | DOS with compiled/AOT kernel, code in SRAM, 300 MHz reference |
 | `microdos_pico_150.uf2` | the same at 150 MHz |
-| `microdos_pico_nokernel.uf2` | interpreted kernel at 300 MHz, for A/B |
-| `microdos_pico_jit.uf2` | **M20.2 hybrid**: compiled DOS kernel + hot runtime JIT for COMMAND.COM/arbitrary programs |
-| `microdos_bench.uf2` / `_150` | benchmark matrix including resident/CFG regions and M20.2 CALL/RET proof |
+| `microdos_pico_nokernel.uf2` | canonical threaded kernel at 300 MHz |
+| `microdos_pico_region.uf2` | decoded-cache kernel with M21 resident C regions |
+| `microdos_pico_jitkernel.uf2` | runtime-JIT kernel, lean profiling |
+| `microdos_pico_jit.uf2` | compiled kernel + lean runtime JIT for COMMAND.COM/arbitrary programs |
+| `microdos_pico_jit_profile.uf2` | same hybrid with full M20/M21 JIT observability |
+| `microdos_bench.uf2` / `_150` | benchmark matrix including the M21 checksum convergence workload |
 
 The DOS defaults follow the M15 measurements on DOS2TEST: code in SRAM was
 +33% over flash, and turning the decoded-block cache off was +60%.
 
 The benchmark firmwares print a table as soon as a terminal connects (any key
-reruns it). Rows: workload (`loop` registers only, `memloop` 32 KiB
-read-modify-write) x guest memory (SRAM, PSRAM) x engine, followed by the
-M20 `regionmix` generic-region proof:
+reruns it). Rows include `loop`, `memloop`, and the M21 `checksum` workload
+(32 KiB sequential LODSW/ADD/LOOP) across guest SRAM/PSRAM and every engine,
+followed by the M20 region/CFG/control proofs.  `checksum` is the primary
+cross-tier convergence metric because it cannot be reduced to a register-only
+counted loop:
 
 ```text
 step

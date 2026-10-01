@@ -76,11 +76,15 @@ cmake -S "%MD_ROOT%\pico" -B "%MD_ROOT%\build-pico\out" -G Ninja "-DCMAKE_MAKE_P
 cmake --build "%MD_ROOT%\build-pico\out" || exit /b 1
 echo.
 echo Firmware in %MD_ROOT%\build-pico\out\ :
-echo   microdos_pico.uf2           DOS, compiled kernel, 300 MHz ^(default^)
-echo   microdos_pico_150.uf2       DOS, compiled kernel, 150 MHz
-echo   microdos_pico_nokernel.uf2  DOS, interpreted kernel, 300 MHz ^(A/B^)
-echo   microdos_bench.uf2          benchmark matrix, 300 MHz
-echo   microdos_bench_150.uf2      benchmark matrix, 150 MHz
+echo   microdos_pico.uf2             DOS, AOT kernel reference, 300 MHz
+echo   microdos_pico_150.uf2         DOS, AOT kernel reference, 150 MHz
+echo   microdos_pico_nokernel.uf2    DOS, canonical threaded kernel, 300 MHz
+echo   microdos_pico_region.uf2      DOS, resident decoded-cache kernel, 300 MHz
+echo   microdos_pico_jitkernel.uf2   DOS, runtime-JIT kernel, lean profiling, 300 MHz
+echo   microdos_pico_jit.uf2         DOS, AOT kernel + lean JIT apps, 300 MHz
+echo   microdos_pico_jit_profile.uf2 DOS, AOT kernel + profiled JIT apps, 300 MHz
+echo   microdos_bench.uf2            benchmark matrix incl. M21 checksum, 300 MHz
+echo   microdos_bench_150.uf2        benchmark matrix, 150 MHz
 echo Hold BOOTSEL while plugging in the Pico Plus 2, then copy a .uf2 to the RP2350 drive.
 exit /b 0
 

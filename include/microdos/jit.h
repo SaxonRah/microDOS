@@ -66,6 +66,13 @@ extern "C" {
 #define MD_JIT_HOT_THRESHOLD 1u
 #endif
 
+/* M21: full observability is the default for tests/benchmark/profile firmware.
+   Lean release firmware sets this to zero to remove hot-path 64-bit stats and
+   hot-site sampling.  Hotness admission itself is never compiled out. */
+#ifndef MD_JIT_PROFILE
+#define MD_JIT_PROFILE 1
+#endif
+
 typedef enum MdJitExitReason {
     MD_JIT_EXIT_NONE = 0,
     MD_JIT_EXIT_COMPILE_FAIL,
@@ -177,7 +184,11 @@ struct MdJitBlock {
     uint8_t generic_region;
     uint8_t cfg_region;
 
-    MdJitOp ops[MD_JIT_MAX_OPS];
+    /* M21: decoded IR is compile scratch unless emitted helpers require it. */
+    uint8_t keep_ops;
+    uint16_t profile_ip;
+    uint8_t profile_opcode;
+    MdJitOp *ops;
 };
 
 struct MdJit {
@@ -186,6 +197,8 @@ struct MdJit {
     size_t code_used;
 
     MdJitBlock blocks[MD_JIT_BLOCK_SLOTS];
+    /* One shared decode/IR workspace replaces ops[24] in every block slot. */
+    MdJitOp compile_ops[MD_JIT_MAX_OPS];
 
     uint64_t lookups;
     uint64_t hits;

@@ -13,6 +13,7 @@ add_library(microdos_runtime STATIC
     src/runtime/runtime.c
     src/runtime/x86_interp.c
     src/runtime/x86_block_cache.c
+    src/runtime/region.c
 )
 add_library(microdos::runtime ALIAS microdos_runtime)
 target_include_directories(microdos_runtime PUBLIC "${CMAKE_CURRENT_LIST_DIR}/include" PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/runtime")
@@ -85,6 +86,8 @@ md_recompile_com(loop md_recomp_loop tests/programs/loop.com 0x107)
 md_recompile_com(hybrid md_recomp_hybrid tests/programs/hybrid.com 0x109 --interp-at 0x105)
 md_recompile_com(selfmod md_recomp_selfmod tests/programs/selfmod.com 0x107)
 md_recompile_com(memloop md_recomp_memloop tests/programs/memloop.com 0x117)
+# M21 convergence fixture: 32 KiB LODSW/ADD/LOOP checksum.
+md_recompile_com(checksum md_recomp_checksum tests/programs/checksum.com 0x10f)
 md_recompile_com(xchgself md_recomp_xchgself tests/programs/xchgself.com 0x107)
 md_recompile_com(divfault md_recomp_divfault tests/programs/divfault.com 0x113)
 
@@ -129,7 +132,9 @@ if(MD_BUILD_HOST)
         target_compile_options(microdos_msdos2 PRIVATE -Wall -Wextra -Wpedantic $<$<CONFIG:Release>:-O3>)
     endif()
 
-    add_executable(microdos_bench src/host/bench.c "${MD_RECOMP_loop_C}" "${MD_RECOMP_loop_H}")
+    add_executable(microdos_bench src/host/bench.c
+        "${MD_RECOMP_loop_C}" "${MD_RECOMP_loop_H}"
+        "${MD_RECOMP_checksum_C}" "${MD_RECOMP_checksum_H}")
     target_link_libraries(microdos_bench PRIVATE microdos::runtime)
     target_include_directories(microdos_bench PRIVATE "${MD_GENERATED_DIR}")
 endif()
@@ -168,6 +173,20 @@ if(MD_BUILD_TESTS)
     target_link_libraries(microdos_jit_m203 PRIVATE microdos::runtime microdos::decode)
     target_include_directories(microdos_jit_m203 PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/runtime")
     add_test(NAME jit_m203 COMMAND microdos_jit_m203)
+
+    # M21 shared resident-region semantics.  This compares the O(1) DEC/JNZ
+    # region and resident LODSW/ADD/LOOP region against the canonical
+    # interpreter, including DF and the 20-bit physical wrap.
+    add_executable(microdos_region_tests tests/test_region.c)
+    target_link_libraries(microdos_region_tests PRIVATE microdos::runtime)
+    add_test(NAME region COMMAND microdos_region_tests)
+
+    # Generated AOT must produce the same checksum result/count/flags.
+    add_executable(microdos_region_aot_tests tests/test_region_aot.c
+        "${MD_RECOMP_checksum_C}" "${MD_RECOMP_checksum_H}")
+    target_link_libraries(microdos_region_aot_tests PRIVATE microdos::runtime)
+    target_include_directories(microdos_region_aot_tests PRIVATE "${MD_GENERATED_DIR}")
+    add_test(NAME region_aot COMMAND microdos_region_aot_tests)
 
     # M14 end-to-end: boot the released MS-DOS 2.0 through the portable
     # system loop (the code the Pico 2 runs) and pass DOS2TEST at A>.

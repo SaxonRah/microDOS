@@ -22,6 +22,12 @@ extern "C" {
 #define MD_BLOCK_MAX_OPS 16u
 #endif
 
+/* M21: benchmark/profile builds keep exact cache counters.  Lean Pico
+   resident-interpreter builds can compile the high-frequency accounting out. */
+#ifndef MD_CACHE_PROFILE
+#define MD_CACHE_PROFILE 1
+#endif
+
 #if (MD_BLOCK_CACHE_SLOTS == 0u) || ((MD_BLOCK_CACHE_SLOTS & (MD_BLOCK_CACHE_SLOTS - 1u)) != 0u)
 #error MD_BLOCK_CACHE_SLOTS must be a power of two
 #endif
@@ -53,7 +59,9 @@ typedef enum MdDecodedKind {
     MD_DOP_CALL,
     MD_DOP_JMP,
     MD_DOP_RET,
-    MD_DOP_HLT
+    MD_DOP_HLT,
+    /* M21 shared resident region; appended to preserve older enum values. */
+    MD_DOP_REGION_LODSW_ADD_DX_AX_LOOP
 } MdDecodedKind;
 
 typedef struct MdDecodedOp {
@@ -87,6 +95,8 @@ struct MdBlockCache {
     uint64_t decodes;
     uint64_t invalidations;
     uint64_t fallback_instructions;
+    uint64_t region_entries;
+    uint64_t region_instructions;
 };
 
 typedef bool (*MdCacheStopPredicate)(const MdRuntime *runtime, void *user);

@@ -360,7 +360,8 @@ static void test_loop_cache(uint8_t *memory)
     CHECK(cached.cpu.r[MD_X86_CX] == 0u);
     CHECK(cached.instructions == expected);
     CHECK(cache.fallback_instructions == 0u);
-    CHECK(cache.hits > cache.misses);
+    CHECK(cache.region_entries == 1u);
+    CHECK(cache.region_instructions == expected - 4u); /* MOV CX + first DEC/JNZ + HLT stay outside the resident region */
 
     memset(memory, 0, MD_X86_ADDRESS_SPACE);
     md_runtime_init(&aot, memory, &hooks);

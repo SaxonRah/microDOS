@@ -1,9 +1,10 @@
-/* microDOS RP2350 benchmark firmware (M15 -> M20.2).
+/* microDOS RP2350 benchmark firmware (M15 -> M21.1).
  *
  * Separates the costs that full-DOS numbers mix together:
  *   - where the ARM execution code runs (flash XIP vs SRAM: build variant)
  *   - where guest memory lives (SRAM vs PSRAM: both measured here)
  *   - which engine runs it (step, threaded, CS-run, block cache, AOT, JIT)
+ *   - JIT cold cost versus steady-state translated-block reuse (M21.1)
  *
  * M20.2 keeps the resident/CFG fast paths and adds direct native control helpers.
  * regionmix proves generic straight-line bodies; branchmix proves a forward CFG
@@ -26,6 +27,7 @@
 #include "microdos/runtime.h"
 #include "loop_recomp.h"
 #include "memloop_recomp.h"
+#include "checksum_recomp.h"
 
 #include "hardware/clocks.h"
 #include "hardware/psram.h"
@@ -59,6 +61,18 @@ static const uint8_t kLoop[] = { 0xB9, 0xFF, 0xFF, 0x49, 0x75, 0xFD, 0xF4 };
 static const uint8_t kMemloop[] = {
     0xB9,0x00,0x80, 0xBE,0x00,0x80, 0x8A,0x04, 0x04,0x03, 0x88,0x04,
     0x83,0xC6,0x61, 0x81,0xCE,0x00,0x80, 0x49,0x75,0xF0, 0xF4
+};
+
+/* M21 primary convergence workload: 32 KiB of real guest-memory traffic. */
+static const uint8_t kChecksum[] = {
+    0xBE,0x00,0x20,             /* mov si,2000h */
+    0xB9,0x00,0x40,             /* mov cx,4000h */
+    0x31,0xD2,                  /* xor dx,dx */
+    0xFC,                       /* cld */
+    0xAD,                       /* L: lodsw */
+    0x03,0xD0,                  /* add dx,ax */
+    0xE2,0xFB,                  /* loop L */
+    0xF4                        /* hlt */
 };
 
 /* M20: not an AOT fixture.  It exists specifically to prove the generic
@@ -109,7 +123,7 @@ static const uint8_t kCallmix[] = {
     0xC3                        /* ret */
 };
 typedef enum { ENG_STEP, ENG_THREADED, ENG_CSRUN, ENG_CACHE, ENG_AOT, ENG_JIT } Engine;
-static const char *const kEngine[] = { "step", "threaded", "cs-run", "cache", "aot", "jit" };
+static const char *const kEngine[] = { "step", "threaded", "cs-run", "cache", "aot", "jit-cold" };
 
 #ifndef MICRODOS_PICO_SYS_KHZ
 #define MICRODOS_PICO_SYS_KHZ 0
@@ -148,6 +162,137 @@ static uint32_t window_hash(const uint8_t *mem)
     uint32_t i;
     for (i = 0x8000u; i < 0x10000u; ++i) h = (h ^ mem[i]) * 16777619u;
     return h;
+}
+
+/* M21.1 warm-JIT measurement.
+ *
+ * The normal JIT rows deliberately include md_jit_init() + translation on
+ * every sample. For the warm row we prime once, then restore the exact
+ * post-load architectural/runtime state and the first 64 KiB of guest memory
+ * before each timed execution while keeping g_jit and its translated blocks.
+ *
+ * g_psram_guest is 1 MiB and benchmark guests use only its first 64 KiB, so
+ * the second 64 KiB is a safe untimed snapshot buffer for both SRAM and PSRAM
+ * guest runs.
+ */
+typedef void (*WarmPrepareFn)(uint8_t *mem);
+typedef uint32_t (*WarmCheckFn)(const uint8_t *mem);
+
+typedef struct WarmJitDelta {
+    uint64_t compiles;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t entries;
+    uint64_t direct;
+    uint64_t fallback;
+    uint64_t resident_entries;
+    uint64_t resident_instructions;
+} WarmJitDelta;
+
+static void warm_restore_runtime(const MdRuntime *snapshot, uint8_t *mem)
+{
+    g_rt = *snapshot;
+
+    /* md_runtime_init/reset normally establish these self-pointers. A struct
+       snapshot preserves their values, but rebind them explicitly so this
+       benchmark remains correct if the snapshot's storage ever changes. */
+    g_rt.cpu.memory = mem;
+    g_rt.cpu.code_page_generation = g_rt.code_page_generation;
+    g_rt.cpu.code_page_executable = g_rt.code_page_executable;
+    g_rt.cpu.code_write_epoch = &g_rt.code_write_epoch;
+    g_rt.cpu.aot_guards = g_rt.aot_slots;
+}
+
+static uint64_t run_jit_warm(uint8_t *mem,
+                             const uint8_t *image, size_t image_size,
+                             WarmPrepareFn prepare, WarmCheckFn check_fn,
+                             uint64_t *us_best, uint32_t *check,
+                             WarmJitDelta *delta)
+{
+    MdHooks hooks;
+    MdRuntime snapshot;
+    uint8_t *backup = g_psram_guest + SRAM_GUEST_BYTES;
+    MdStopReason st;
+    uint64_t c0, h0, m0, e0, d0, f0, re0, ri0;
+    uint64_t best = UINT64_MAX;
+    uint64_t best_instr = 0u;
+    uint32_t best_check = 0u;
+    int rep;
+
+    memset(&hooks, 0, sizeof(hooks));
+    memset(mem, 0, SRAM_GUEST_BYTES);
+    md_runtime_init(&g_rt, mem, &hooks);
+    md_jit_init(&g_jit, g_jit_code, sizeof(g_jit_code));
+    md_runtime_load_com(&g_rt, image, image_size, 0x0000u);
+    if (prepare != NULL) prepare(mem);
+
+    memcpy(backup, mem, SRAM_GUEST_BYTES);
+    snapshot = g_rt;
+
+    /* Untimed prime: translate every block reached by one complete run. */
+    st = md_jit_run(&g_jit, &g_rt, 10000000u);
+    if (st != MD_STOP_HALT || (check_fn != NULL && check_fn(mem) == 0u)) {
+        *us_best = 0u;
+        *check = 0u;
+        memset(delta, 0, sizeof(*delta));
+        return g_rt.instructions;
+    }
+
+    c0 = g_jit.compiles;
+    h0 = g_jit.hits;
+    m0 = g_jit.misses;
+    e0 = g_jit.native_entries;
+    d0 = g_jit.direct_instructions;
+    f0 = g_jit.fallback_instructions;
+    re0 = g_jit.resident_entries;
+    ri0 = g_jit.resident_instructions;
+
+    for (rep = 0; rep < 3; ++rep) {
+        uint64_t t0, t1, us;
+        uint32_t value;
+
+        memcpy(mem, backup, SRAM_GUEST_BYTES);
+        warm_restore_runtime(&snapshot, mem);
+
+        t0 = time_us_64();
+        st = md_jit_run(&g_jit, &g_rt, 10000000u);
+        t1 = time_us_64();
+
+        us = t1 - t0;
+        value = st == MD_STOP_HALT && check_fn != NULL ? check_fn(mem) : 0u;
+        if (us < best) {
+            best = us;
+            best_instr = g_rt.instructions;
+            best_check = value;
+        }
+    }
+
+    delta->compiles = g_jit.compiles - c0;
+    delta->hits = g_jit.hits - h0;
+    delta->misses = g_jit.misses - m0;
+    delta->entries = g_jit.native_entries - e0;
+    delta->direct = g_jit.direct_instructions - d0;
+    delta->fallback = g_jit.fallback_instructions - f0;
+    delta->resident_entries = g_jit.resident_entries - re0;
+    delta->resident_instructions = g_jit.resident_instructions - ri0;
+
+    *us_best = best;
+    *check = best_check;
+    return best_instr;
+}
+
+static void print_jit_warm_delta(const WarmJitDelta *d)
+{
+    say("[jit-warm] delta/3-runs: compile=%llu hit=%llu miss=%llu entry=%llu direct=%llu fallback=%llu resident-entry=%llu resident-instr=%llu code=%lu B\n",
+        (unsigned long long)d->compiles,
+        (unsigned long long)d->hits,
+        (unsigned long long)d->misses,
+        (unsigned long long)d->entries,
+        (unsigned long long)d->direct,
+        (unsigned long long)d->fallback,
+        (unsigned long long)d->resident_entries,
+        (unsigned long long)d->resident_instructions,
+        (unsigned long)g_jit.code_used);
 }
 
 /* One timed run. Returns guest instructions, fills us and the result check. */
@@ -199,6 +344,127 @@ static uint64_t run_once(uint8_t *mem, int memloop, Engine eng, uint64_t *us, ui
     *us = t1 - t0;
     *check = (st == MD_STOP_HALT) ? (memloop ? window_hash(mem) : g_rt.cpu.r[MD_X86_CX] + 1u) : 0u;
     return g_rt.instructions;
+}
+
+static uint32_t loop_warm_check(const uint8_t *mem)
+{
+    (void)mem;
+    return g_rt.cpu.r[MD_X86_CX] + 1u;
+}
+
+static uint32_t memloop_warm_check(const uint8_t *mem)
+{
+    return window_hash(mem);
+}
+
+
+static void print_jit_stats(void);
+
+static void checksum_fill(uint8_t *mem)
+{
+    uint32_t i;
+    for (i = 0u; i < 0x8000u; ++i)
+        mem[0x2000u + i] = (uint8_t)(i * 37u + 11u);
+}
+
+static uint32_t checksum_check(void)
+{
+    uint32_t h = ((uint32_t)g_rt.cpu.r[MD_X86_DX] << 16) |
+                 (uint32_t)g_rt.cpu.r[MD_X86_AX];
+    h ^= ((uint32_t)g_rt.cpu.r[MD_X86_SI] << 1);
+    h ^= g_rt.cpu.r[MD_X86_CX];
+    return h != 0u ? h : 1u;
+}
+
+static uint32_t checksum_warm_check(const uint8_t *mem)
+{
+    (void)mem;
+    return checksum_check();
+}
+
+static uint64_t run_checksum_once(uint8_t *mem, Engine eng, uint64_t *us, uint32_t *check)
+{
+    MdHooks hooks;
+    MdStopReason st = MD_STOP_NONE;
+    uint64_t t0, t1;
+
+    memset(&hooks, 0, sizeof(hooks));
+    memset(mem, 0, SRAM_GUEST_BYTES);
+    md_runtime_init(&g_rt, mem, &hooks);
+    if (eng == ENG_CACHE) {
+        md_block_cache_init(&g_cache);
+        md_runtime_set_block_cache(&g_rt, &g_cache);
+    }
+    if (eng == ENG_JIT) md_jit_init(&g_jit, g_jit_code, sizeof(g_jit_code));
+    if (eng != ENG_AOT) md_runtime_load_com(&g_rt, kChecksum, sizeof(kChecksum), 0x0000u);
+    checksum_fill(mem);
+
+    t0 = time_us_64();
+    switch (eng) {
+        case ENG_STEP:
+            while (g_rt.stop_reason == MD_STOP_NONE) (void)md_interp_step(&g_rt);
+            st = g_rt.stop_reason;
+            break;
+        case ENG_THREADED: st = md_interp_run(&g_rt, 10000000u); break;
+        case ENG_CSRUN: st = md_interp_run_until_cs_change(&g_rt, 10000000u); break;
+        case ENG_CACHE: st = md_interp_run_cached(&g_rt, &g_cache, 10000000u); break;
+        case ENG_AOT: st = md_recomp_checksum(&g_rt, 0x0000u, 10000000u); break;
+        case ENG_JIT: st = md_jit_run(&g_jit, &g_rt, 10000000u); break;
+    }
+    t1 = time_us_64();
+
+    *us = t1 - t0;
+    *check = st == MD_STOP_HALT ? checksum_check() : 0u;
+    return g_rt.instructions;
+}
+
+static void bench_checksum(void)
+{
+    static const char *const kGuest[] = { "SRAM ", "PSRAM" };
+    uint8_t *const guests[2] = { g_sram_guest, g_psram_guest };
+    uint32_t reference = 0u;
+    int g, e;
+
+    say("[bench] checksum is the M21 AOT/JIT/resident-interpreter convergence workload.\n");
+    for (g = 0; g < 2; ++g) {
+        for (e = ENG_STEP; e <= ENG_JIT; ++e) {
+            uint64_t us_best = UINT64_MAX, instr = 0u;
+            uint32_t check = 0u;
+            int rep;
+            for (rep = 0; rep < 3; ++rep) {
+                uint64_t us;
+                instr = run_checksum_once(guests[g], (Engine)e, &us, &check);
+                if (us < us_best) us_best = us;
+            }
+            if (reference == 0u) reference = check;
+            say("[bench] %-8s %-5s %-8s %9llu %10llu %9.3f  %s\n",
+                "checksum", kGuest[g], kEngine[e],
+                (unsigned long long)instr, (unsigned long long)us_best,
+                us_best ? (double)instr / (double)us_best : 0.0,
+                (check != 0u && check == reference) ? "ok" : "FAIL");
+            if (e == ENG_CACHE) {
+                say("[cache] region-entry=%llu region-instr=%llu\n",
+                    (unsigned long long)g_cache.region_entries,
+                    (unsigned long long)g_cache.region_instructions);
+            }
+            if (e == ENG_JIT) {
+                WarmJitDelta delta;
+                uint64_t warm_us;
+                uint32_t warm_check;
+                uint64_t warm_instr;
+                print_jit_stats();
+                warm_instr = run_jit_warm(guests[g], kChecksum, sizeof(kChecksum),
+                                          checksum_fill, checksum_warm_check,
+                                          &warm_us, &warm_check, &delta);
+                say("[bench] %-8s %-5s %-8s %9llu %10llu %9.3f  %s\n",
+                    "checksum", kGuest[g], "jit-warm",
+                    (unsigned long long)warm_instr, (unsigned long long)warm_us,
+                    warm_us ? (double)warm_instr / (double)warm_us : 0.0,
+                    (warm_check != 0u && warm_check == reference) ? "ok" : "FAIL");
+                print_jit_warm_delta(&delta);
+            }
+        }
+    }
 }
 
 static uint32_t regionmix_check(const uint8_t *mem)
@@ -303,7 +569,22 @@ static void bench_regionmix(void)
                 (unsigned long long)instr, (unsigned long long)us_best,
                 us_best ? (double)instr / (double)us_best : 0.0,
                 (check != 0u && check == reference) ? "ok" : "FAIL");
-            if (e == ENG_JIT) print_jit_stats();
+            if (e == ENG_JIT) {
+                WarmJitDelta delta;
+                uint64_t warm_us;
+                uint32_t warm_check;
+                uint64_t warm_instr;
+                print_jit_stats();
+                warm_instr = run_jit_warm(guests[g], kRegionmix, sizeof(kRegionmix),
+                                          NULL, regionmix_check,
+                                          &warm_us, &warm_check, &delta);
+                say("[bench] %-8s %-5s %-8s %9llu %10llu %9.3f  %s\n",
+                    "regionmix", kGuest[g], "jit-warm",
+                    (unsigned long long)warm_instr, (unsigned long long)warm_us,
+                    warm_us ? (double)warm_instr / (double)warm_us : 0.0,
+                    (warm_check != 0u && warm_check == reference) ? "ok" : "FAIL");
+                print_jit_warm_delta(&delta);
+            }
         }
     }
 }
@@ -313,6 +594,12 @@ static uint32_t branchmix_check(void)
     uint32_t h = ((uint32_t)g_rt.cpu.r[MD_X86_BX] << 16) | g_rt.cpu.r[MD_X86_AX];
     h ^= g_rt.cpu.r[MD_X86_CX];
     return h != 0u ? h : 1u;
+}
+
+static uint32_t branchmix_warm_check(const uint8_t *mem)
+{
+    (void)mem;
+    return branchmix_check();
 }
 
 static uint64_t run_branchmix_once(uint8_t *mem, Engine eng, uint64_t *us, uint32_t *check)
@@ -365,7 +652,22 @@ static void bench_branchmix(void)
                 (unsigned long long)instr, (unsigned long long)us_best,
                 us_best ? (double)instr / (double)us_best : 0.0,
                 (check != 0u && check == reference) ? "ok" : "FAIL");
-            if (e == ENG_JIT) print_jit_stats();
+            if (e == ENG_JIT) {
+                WarmJitDelta delta;
+                uint64_t warm_us;
+                uint32_t warm_check;
+                uint64_t warm_instr;
+                print_jit_stats();
+                warm_instr = run_jit_warm(guests[g], kBranchmix, sizeof(kBranchmix),
+                                          NULL, branchmix_warm_check,
+                                          &warm_us, &warm_check, &delta);
+                say("[bench] %-8s %-5s %-8s %9llu %10llu %9.3f  %s\n",
+                    "branchmix", kGuest[g], "jit-warm",
+                    (unsigned long long)warm_instr, (unsigned long long)warm_us,
+                    warm_us ? (double)warm_instr / (double)warm_us : 0.0,
+                    (warm_check != 0u && warm_check == reference) ? "ok" : "FAIL");
+                print_jit_warm_delta(&delta);
+            }
         }
     }
 }
@@ -375,6 +677,12 @@ static uint32_t callmix_check(void)
     uint32_t h = ((uint32_t)g_rt.cpu.r[MD_X86_BX] << 16) | g_rt.cpu.r[MD_X86_CX];
     h ^= g_rt.cpu.r[MD_X86_SP];
     return h != 0u ? h : 1u;
+}
+
+static uint32_t callmix_warm_check(const uint8_t *mem)
+{
+    (void)mem;
+    return callmix_check();
 }
 
 static uint64_t run_callmix_once(uint8_t *mem, Engine eng, uint64_t *us, uint32_t *check)
@@ -414,7 +722,17 @@ static void bench_callmix(void)
             say("[bench] %-8s %-5s %-8s %9llu %10llu %9.3f  %s\n","callmix",kGuest[g],kEngine[e],
                 (unsigned long long)instr,(unsigned long long)us_best,us_best?(double)instr/(double)us_best:0.0,
                 (check!=0u&&check==reference)?"ok":"FAIL");
-            if(e==ENG_JIT)print_jit_stats();
+            if(e==ENG_JIT){
+                WarmJitDelta delta; uint64_t warm_us,warm_instr; uint32_t warm_check;
+                print_jit_stats();
+                warm_instr=run_jit_warm(guests[g],kCallmix,sizeof(kCallmix),NULL,callmix_warm_check,
+                                       &warm_us,&warm_check,&delta);
+                say("[bench] %-8s %-5s %-8s %9llu %10llu %9.3f  %s\n","callmix",kGuest[g],"jit-warm",
+                    (unsigned long long)warm_instr,(unsigned long long)warm_us,
+                    warm_us?(double)warm_instr/(double)warm_us:0.0,
+                    (warm_check!=0u&&warm_check==reference)?"ok":"FAIL");
+                print_jit_warm_delta(&delta);
+            }
         }
     }
 }
@@ -426,12 +744,16 @@ static void bench(void)
     uint32_t reference[2] = { 0u, 0u };
     int g, w, e;
 
-    say("\n[bench] microDOS RP2350 M20.2.1 benchmark: clk %lu MHz, code %s, psram %lu KiB\n",
+    say("\n[bench] microDOS RP2350 M21 compact-resident benchmark: clk %lu MHz, code %s, psram %lu KiB\n",
         (unsigned long)(clock_get_hz(clk_sys) / 1000000u),
         MICRODOS_PICO_CODE_IN_SRAM ? "SRAM (copy_to_ram)" : "flash XIP",
         (unsigned long)(psram_get_size() / 1024u));
-    say("[bench] JIT arena: %u KiB executable SRAM; bounded CFG + resident regions + native CALL/RET/INT helpers\n",
+    say("[bench] JIT arena: %u KiB executable/descriptor SRAM\n",
         (unsigned)(sizeof(g_jit_code) / 1024u));
+    say("[bench] JIT timing: jit-cold rebuilds translations each sample; jit-warm primes once then reuses them\n");
+    say("[bench] state bytes: runtime=%u cache=%u jit=%u jit-block=%u jit-op=%u\n",
+        (unsigned)sizeof(MdRuntime), (unsigned)sizeof(MdBlockCache),
+        (unsigned)sizeof(MdJit), (unsigned)sizeof(MdJitBlock), (unsigned)sizeof(MdJitOp));
     say("[bench] %-8s %-5s %-8s %9s %10s %9s  %s\n",
         "workload", "guest", "engine", "instr", "us", "MIPS", "result");
 
@@ -452,10 +774,28 @@ static void bench(void)
                     (unsigned long long)instr, (unsigned long long)us_best,
                     us_best ? (double)instr / (double)us_best : 0.0,
                     (check != 0u && check == reference[w]) ? "ok" : "FAIL");
-                if (e == ENG_JIT) print_jit_stats();
+                if (e == ENG_JIT) {
+                    WarmJitDelta delta;
+                    uint64_t warm_us;
+                    uint32_t warm_check;
+                    uint64_t warm_instr;
+                    const uint8_t *image = w ? kMemloop : kLoop;
+                    const size_t image_size = w ? sizeof(kMemloop) : sizeof(kLoop);
+                    WarmCheckFn check_fn = w ? memloop_warm_check : loop_warm_check;
+                    print_jit_stats();
+                    warm_instr = run_jit_warm(guests[g], image, image_size, NULL, check_fn,
+                                              &warm_us, &warm_check, &delta);
+                    say("[bench] %-8s %-5s %-8s %9llu %10llu %9.3f  %s\n",
+                        w ? "memloop" : "loop", kGuest[g], "jit-warm",
+                        (unsigned long long)warm_instr, (unsigned long long)warm_us,
+                        warm_us ? (double)warm_instr / (double)warm_us : 0.0,
+                        (warm_check != 0u && warm_check == reference[w]) ? "ok" : "FAIL");
+                    print_jit_warm_delta(&delta);
+                }
             }
         }
     }
+    bench_checksum();
     bench_regionmix();
     bench_branchmix();
     bench_callmix();

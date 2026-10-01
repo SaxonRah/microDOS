@@ -63,7 +63,8 @@ set(MICRODOS_PICO_DISK "${MD_ROOT}/build-pico/pico_disk.img" CACHE FILEPATH "FAT
 
 set(MD_GENERATED "${MICRODOS_HOST_BUILD}/generated")
 foreach(req "${MD_GENERATED}/dos2test_recomp.c" "${MD_GENERATED}/msdos2_recomp.c" "${MD_GENERATED}/loop_recomp.c"
-            "${MD_GENERATED}/memloop_recomp.c" "${MICRODOS_PICO_KERNEL}" "${MICRODOS_PICO_DISK}")
+            "${MD_GENERATED}/memloop_recomp.c" "${MD_GENERATED}/checksum_recomp.c"
+            "${MICRODOS_PICO_KERNEL}" "${MICRODOS_PICO_DISK}")
     if(NOT EXISTS "${req}")
         message(FATAL_ERROR "microDOS Pico: missing ${req}\n"
                             "Run .\\md.bat build pico (it builds the host tools and disk first).")
@@ -84,7 +85,8 @@ set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/md_pico_blobs.S" PROPER
 set(MD_RUNTIME_SOURCES
     "${MD_ROOT}/src/runtime/runtime.c"
     "${MD_ROOT}/src/runtime/x86_interp.c"
-    "${MD_ROOT}/src/runtime/x86_block_cache.c")
+    "${MD_ROOT}/src/runtime/x86_block_cache.c"
+    "${MD_ROOT}/src/runtime/region.c")
 
 function(md_pico_common target code_in_sram)
     target_include_directories(${target} PRIVATE
@@ -106,7 +108,9 @@ function(md_pico_common target code_in_sram)
     pico_enable_stdio_usb(${target} 1)
     pico_enable_stdio_uart(${target} 0)
     pico_add_extra_outputs(${target})
-    target_link_options(${target} PRIVATE "-Wl,--print-memory-usage")
+    target_link_options(${target} PRIVATE
+        "-Wl,--print-memory-usage"
+        "-Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/${target}.map")
 endfunction()
 
 # DOS firmware: name, code_in_sram, block_cache, sys_khz (0 = SDK default),
@@ -152,7 +156,8 @@ function(md_pico_bench target code_in_sram sys_khz)
         "${MD_ROOT}/src/runtime/jit_thumb2.c"
         "${MD_ROOT}/src/decode/x86_decode.c"
         "${MD_GENERATED}/loop_recomp.c"
-        "${MD_GENERATED}/memloop_recomp.c")
+        "${MD_GENERATED}/memloop_recomp.c"
+        "${MD_GENERATED}/checksum_recomp.c")
     md_pico_common(${target} ${code_in_sram})
     target_compile_definitions(${target} PRIVATE MICRODOS_PICO_SYS_KHZ=${sys_khz})
     pico_set_program_name(${target} "microDOS bench")
@@ -164,9 +169,22 @@ endfunction()
 # M20.2: the proven M18 default stays unchanged. microdos_pico_jit is the profiling
 # full-DOS hybrid: static kernel/DOS2TEST AOT first, runtime JIT for COMMAND.COM
 # and arbitrary segments with no matching static image.
-md_pico_dos(microdos_pico          1 0 300000 1 0)   # proven M18 default, unchanged
+md_pico_dos(microdos_pico          1 0 300000 1 0)   # AOT kernel reference
 md_pico_dos(microdos_pico_150      1 0 0      1 0)   # rated-clock comparison
-md_pico_dos(microdos_pico_nokernel 1 0 300000 0 0)   # interpreted kernel A/B
-md_pico_dos(microdos_pico_jit      1 0 300000 1 1)   # M20.2: AOT kernel + hot runtime JIT apps
+md_pico_dos(microdos_pico_nokernel 1 0 300000 0 0)   # canonical threaded kernel A/B
+
+# M21 full-DOS convergence images.
+md_pico_dos(microdos_pico_region      1 1 300000 0 0) # decoded cache + resident C regions
+target_compile_definitions(microdos_pico_region PRIVATE MD_CACHE_PROFILE=0)
+
+md_pico_dos(microdos_pico_jitkernel   1 0 300000 0 1) # runtime JIT owns the DOS kernel
+target_compile_definitions(microdos_pico_jitkernel PRIVATE MD_JIT_PROFILE=0)
+
+md_pico_dos(microdos_pico_jit         1 0 300000 1 1) # AOT kernel + lean JIT applications
+target_compile_definitions(microdos_pico_jit PRIVATE MD_JIT_PROFILE=0)
+
+md_pico_dos(microdos_pico_jit_profile 1 0 300000 1 1) # same hybrid, full M20/M21 telemetry
+target_compile_definitions(microdos_pico_jit_profile PRIVATE MD_JIT_PROFILE=1)
+
 md_pico_bench(microdos_bench     1 300000)
 md_pico_bench(microdos_bench_150 1 0)

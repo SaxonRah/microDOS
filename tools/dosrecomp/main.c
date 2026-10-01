@@ -1086,6 +1086,45 @@ static unsigned dr_block_count(const DrProgram *p, uint32_t ip)
     return n;
 }
 
+/* M21 shared resident-region recognisers.  Keep these deliberately exact:
+   unsupported/general shapes continue through the normal generated blocks. */
+static int dr_region_dec_jnz(const DrProgram *p, uint16_t ip,
+                             unsigned *reg_out, uint16_t *exit_out)
+{
+    const MdDecodedInstruction *a, *b;
+    uint16_t j;
+    if (!p->reachable[ip] || p->kind[ip] == DR_GEN_HOLE) return 0;
+    a = &p->dec[ip];
+    if (a->prefix_count != 0u || dr_u8(p, ip) < 0x48u || dr_u8(p, ip) > 0x4Fu) return 0;
+    j = a->next_ip;
+    if (!p->reachable[j] || p->kind[j] == DR_GEN_HOLE) return 0;
+    b = &p->dec[j];
+    if (b->prefix_count != 0u || dr_u8(p, j) != 0x75u || b->target != ip) return 0;
+    *reg_out = dr_u8(p, ip) & 7u;
+    *exit_out = b->next_ip;
+    return 1;
+}
+
+static int dr_region_lodsw_add_loop(const DrProgram *p, uint16_t ip,
+                                    uint16_t *exit_out)
+{
+    const MdDecodedInstruction *a, *b, *c;
+    uint16_t p1, p2;
+    if (!p->reachable[ip] || p->kind[ip] == DR_GEN_HOLE) return 0;
+    a = &p->dec[ip];
+    if (a->prefix_count != 0u || dr_u8(p, ip) != 0xADu) return 0;
+    p1 = a->next_ip;
+    if (!p->reachable[p1] || p->kind[p1] == DR_GEN_HOLE) return 0;
+    b = &p->dec[p1];
+    if (b->prefix_count != 0u || dr_u8(p, p1) != 0x03u || dr_u8(p, p1 + 1u) != 0xD0u) return 0;
+    p2 = b->next_ip;
+    if (!p->reachable[p2] || p->kind[p2] == DR_GEN_HOLE) return 0;
+    c = &p->dec[p2];
+    if (c->prefix_count != 0u || dr_u8(p, p2) != 0xE2u || c->target != ip) return 0;
+    *exit_out = c->next_ip;
+    return 1;
+}
+
 static int dr_emit_c(DrProgram *p, const DrOptions *opt, const char *header_name)
 {
     FILE *f = fopen(opt->output_c, "w");
@@ -1108,7 +1147,7 @@ static int dr_emit_c(DrProgram *p, const DrOptions *opt, const char *header_name
                " * Define MD_AOT_COMPACT for small code (shared out-of-line helpers). */\n",
             p->inst_count, p->inst_count - p->hole_count, p->hole_count, p->block_count, p->entry_count);
     fprintf(f, "#include <string.h>\n#include \"microdos/block_cache.h\"\n#include \"microdos/ops.h\"\n"
-               "#include \"microdos/runtime.h\"\n#include \"%s\"\n\n", header_name);
+               "#include \"microdos/region.h\"\n#include \"microdos/runtime.h\"\n#include \"%s\"\n\n", header_name);
 
     /* operation macros: inline (fast, big) or out-of-line (compact) */
     fputs("#if defined(MD_AOT_COMPACT)\n"
@@ -1290,7 +1329,31 @@ static int dr_emit_c(DrProgram *p, const DrOptions *opt, const char *header_name
         unsigned n, idx = 0;
         if (!dr_is_entry(p, ip)) continue;
         n = dr_block_count(p, ip);
-        fprintf(f, "md_block_%04X:\n    MD_AOT_BLOCK(0x%04Xu, 0x%04Xu, 0x%04Xu, %uu);\n", ip, ip,
+        fprintf(f, "md_block_%04X:\n", ip);
+        {
+            unsigned rr;
+            uint16_t rex;
+            const unsigned o0 = (unsigned)(ip - p->base);
+            const unsigned o1 = (unsigned)(dr_block_end(p, ip) - 1u - p->base);
+            if (dr_region_dec_jnz(p, (uint16_t)ip, &rr, &rex)) {
+                fprintf(f,
+                    "    if (MD_CHUNKS(guard, 0x%04Xu, 0x%04Xu)) {\n"
+                    "        cpu->ip = 0x%04Xu;\n"
+                    "        const uint32_t r_ = md_region_try_dec_jnz(runtime, %uu, 0x%04Xu, 0x%04Xu, remaining);\n"
+                    "        if (r_ != 0u) { remaining -= r_; done += r_; cpu->ip = 0x%04Xu; goto md_dispatch; }\n"
+                    "    }\n",
+                    o0, o1, (unsigned)ip, rr, (unsigned)ip, rex, rex);
+            } else if (dr_region_lodsw_add_loop(p, (uint16_t)ip, &rex)) {
+                fprintf(f,
+                    "    if (MD_CHUNKS(guard, 0x%04Xu, 0x%04Xu)) {\n"
+                    "        cpu->ip = 0x%04Xu;\n"
+                    "        const uint32_t r_ = md_region_try_lodsw_add_dx_ax_loop(runtime, 0x%04Xu, 0x%04Xu, remaining);\n"
+                    "        if (r_ != 0u) { remaining -= r_; done += r_; cpu->ip = 0x%04Xu; goto md_dispatch; }\n"
+                    "    }\n",
+                    o0, o1, (unsigned)ip, (unsigned)ip, rex, rex);
+            }
+        }
+        fprintf(f, "    MD_AOT_BLOCK(0x%04Xu, 0x%04Xu, 0x%04Xu, %uu);\n", ip,
                 (unsigned)(ip - p->base), (unsigned)(dr_block_end(p, ip) - 1u - p->base), n);
         cur = ip;
         for (;;) {

@@ -1,7 +1,14 @@
 #include "microdos/block_cache.h"
 #include "microdos/ops.h"
+#include "microdos/region.h"
 
 #include <string.h>
+
+#if MD_CACHE_PROFILE
+#define MD_CACHE_STAT(expr_) do { expr_; } while (0)
+#else
+#define MD_CACHE_STAT(expr_) do { } while (0)
+#endif
 
 static unsigned md_cache_index(uint16_t cs, uint16_t ip)
 {
@@ -273,6 +280,30 @@ static MdDecodedBlock *md_decode_block(MdRuntime *runtime, MdBlockCache *cache,
     block->cs = cs;
     block->ip = ip;
 
+    /*
+     * M21 resident checksum region.  Recognise it only when the cache entry
+     * begins at the loop head; setup code before the loop remains canonical.
+     * This avoids inventing a variable-count MdDecodedOp inside an ordinary
+     * multi-op block.
+     */
+    if (md_peek8(&runtime->cpu, cs, ip) == 0xADu &&
+        md_peek8(&runtime->cpu, cs, (uint16_t)(ip + 1u)) == 0x03u &&
+        md_peek8(&runtime->cpu, cs, (uint16_t)(ip + 2u)) == 0xD0u &&
+        md_peek8(&runtime->cpu, cs, (uint16_t)(ip + 3u)) == 0xE2u &&
+        md_peek8(&runtime->cpu, cs, (uint16_t)(ip + 4u)) == 0xFBu) {
+        MdDecodedOp *op = &block->ops[0];
+        op->kind = MD_DOP_REGION_LODSW_ADD_DX_AX_LOOP;
+        op->opcode = 0xADu;
+        op->next_ip = (uint16_t)(ip + 5u);
+        op->arg = ip;
+        op->guest_count = 3u;
+        block->count = 1u;
+        block->guest_count = 3u;
+        md_snapshot_block_pages(runtime, block, cs, ip, 5u);
+        MD_CACHE_STAT(++cache->decodes);
+        return block;
+    }
+
     while (count < MD_BLOCK_MAX_OPS) {
         MdDecodedOp op;
         const int supported = md_decode_one(&runtime->cpu, cs, cursor, &op);
@@ -299,7 +330,7 @@ static MdDecodedBlock *md_decode_block(MdRuntime *runtime, MdBlockCache *cache,
     block->count = (uint8_t)count;
     block->guest_count = (uint8_t)guest_count;
     md_snapshot_block_pages(runtime, block, cs, ip, byte_count);
-    ++cache->decodes;
+    MD_CACHE_STAT(++cache->decodes);
     return block;
 }
 
@@ -312,15 +343,15 @@ static MdDecodedBlock *md_lookup_block(MdRuntime *runtime, MdBlockCache *cache)
 
     if (block->cs == cs && block->ip == ip && block->count != 0u) {
         if (md_block_pages_valid(runtime, block)) {
-            ++cache->hits;
+            MD_CACHE_STAT(++cache->hits);
             return block;
         }
         if (block->epoch == runtime->code_epoch) {
-            ++cache->invalidations;
+            MD_CACHE_STAT(++cache->invalidations);
         }
     }
 
-    ++cache->misses;
+    MD_CACHE_STAT(++cache->misses);
     return md_decode_block(runtime, cache, cs, ip);
 }
 
@@ -336,6 +367,8 @@ void md_block_cache_clear_stats(MdBlockCache *cache)
     cache->decodes = 0u;
     cache->invalidations = 0u;
     cache->fallback_instructions = 0u;
+    cache->region_entries = 0u;
+    cache->region_instructions = 0u;
 }
 
 static void md_exec_decoded(MdRuntime *runtime, const MdDecodedOp *op)
@@ -461,17 +494,54 @@ MdStopReason md_interp_run_cached_until(MdRuntime *runtime, MdBlockCache *cache,
 
         if (block->fallback) {
             --remaining;
-            ++cache->fallback_instructions;
+            MD_CACHE_STAT(++cache->fallback_instructions);
             (void)md_interp_step(runtime);
             block = NULL;
             continue;
         }
 
-        /* MSVC cannot use GCC's computed-goto interpreter. Keep the hottest
-           cached loop terminator out of the generic decoded-op switch too. */
+        /*
+         * M21 resident interpreted regions.  They are still interpretation:
+         * no native code is generated, but a proven loop executes with guest
+         * registers resident in C locals and one admission/accounting edge.
+         */
         if (block->count == 1u &&
-            block->ops[0].kind == MD_DOP_DEC_JNZ &&
-            remaining >= 2u) {
+            block->ops[0].kind == MD_DOP_REGION_LODSW_ADD_DX_AX_LOOP) {
+            const uint32_t retired = md_region_try_lodsw_add_dx_ax_loop(
+                runtime, block->ip, block->ops[0].next_ip,
+                remaining > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)remaining);
+            if (retired != 0u) {
+                remaining -= retired;
+                runtime->instructions += retired;
+                MD_CACHE_STAT(++cache->region_entries);
+                MD_CACHE_STAT(cache->region_instructions += retired);
+            } else {
+                --remaining;
+                (void)md_interp_step(runtime);
+                block = NULL;
+                continue;
+            }
+        } else if (block->count == 1u &&
+                   block->ops[0].kind == MD_DOP_DEC_JNZ &&
+                   block->ops[0].arg == block->ip) {
+            const uint32_t retired = md_region_try_dec_jnz(
+                runtime, block->ops[0].reg, block->ip, block->ops[0].next_ip,
+                remaining > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)remaining);
+            if (retired != 0u) {
+                remaining -= retired;
+                runtime->instructions += retired;
+                MD_CACHE_STAT(++cache->region_entries);
+                MD_CACHE_STAT(cache->region_instructions += retired);
+            } else {
+                --remaining;
+                (void)md_interp_step(runtime);
+                block = NULL;
+                continue;
+            }
+        /* Keep the old single-iteration fusion for non-self DEC/JNZ blocks. */
+        } else if (block->count == 1u &&
+                   block->ops[0].kind == MD_DOP_DEC_JNZ &&
+                   remaining >= 2u) {
             remaining -= 2u;
             runtime->instructions += 2u;
             md_exec_hot_dec_jnz(runtime, &block->ops[0]);
@@ -513,10 +583,10 @@ MdStopReason md_interp_run_cached_until(MdRuntime *runtime, MdBlockCache *cache,
            soon as control leaves and re-enters the cache. */
         if (block != NULL && runtime->cpu.cs == block->cs && runtime->cpu.ip == block->ip) {
             if (!block->may_write || md_block_pages_valid(runtime, block)) {
-                ++cache->hits;
+                MD_CACHE_STAT(++cache->hits);
                 continue;
             }
-            ++cache->invalidations;
+            MD_CACHE_STAT(++cache->invalidations);
         }
 
         block = NULL;

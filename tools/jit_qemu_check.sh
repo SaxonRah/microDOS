@@ -10,7 +10,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CC="${CC:-arm-linux-gnueabihf-gcc}"
 OUT="${OUT:-$ROOT/build-qemu}"
 mkdir -p "$OUT"
-SRCS="$ROOT/src/runtime/jit_thumb2.c $ROOT/src/runtime/runtime.c $ROOT/src/runtime/x86_interp.c $ROOT/src/runtime/x86_block_cache.c $ROOT/src/decode/x86_decode.c"
+SRCS="$ROOT/src/runtime/jit_thumb2.c $ROOT/src/runtime/runtime.c $ROOT/src/runtime/x86_interp.c $ROOT/src/runtime/x86_block_cache.c $ROOT/src/runtime/region.c $ROOT/src/decode/x86_decode.c"
 FLAGS="-std=c11 -O2 -Wall -Wextra -march=armv7-a+fp -mthumb -static -I$ROOT/include -I$ROOT/src/runtime"
 $CC $FLAGS "$ROOT/tests/test_jit_diff.c" $SRCS -o "$OUT/jit_diff_arm"
 # test_jit.c keeps its code buffer on the stack (executable SRAM on the
