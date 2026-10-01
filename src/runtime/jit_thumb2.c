@@ -1,4 +1,5 @@
 #include "microdos/jit.h"
+#include "microdos/ops.h"
 
 #include "microdos/decode.h"
 
@@ -226,6 +227,41 @@ static void md_jit_classify(const uint8_t *image, uint16_t image_base,
         return;
     }
 
+    /* M20.3: LODS, register-register 16-bit ALU, LOOP family. ADC/SBB are
+       left to the interpreter (carry-in through lazy state). */
+    if (opcode == 0xACu || opcode == 0xADu) {
+        op->kind = MD_JIT_OP_LODS;
+        op->aux = (uint8_t)((opcode & 1u) ? 2u : 1u);
+        return;
+    }
+    if (opcode <= 0x3Bu && ((opcode & 0x07u) == 0x01u || (opcode & 0x07u) == 0x03u) &&
+        inst->has_modrm && (inst->modrm >> 6) == 3u) {
+        const unsigned alu = (opcode >> 3) & 7u;
+        const unsigned mreg = (inst->modrm >> 3) & 7u, mrm = inst->modrm & 7u;
+        if (alu == 2u || alu == 3u) return;
+        op->kind = MD_JIT_OP_ALU_RR16;
+        op->aux = (uint8_t)alu;
+        op->reg = (uint8_t)((opcode & 2u) ? mreg : mrm);      /* destination */
+        op->imm = (uint16_t)((opcode & 2u) ? mrm : mreg);     /* source */
+        return;
+    }
+    if (opcode <= 0x3Au && ((opcode & 0x07u) == 0x00u || (opcode & 0x07u) == 0x02u) &&
+        inst->has_modrm && (inst->modrm >> 6) == 3u) {
+        const unsigned alu = (opcode >> 3) & 7u;
+        const unsigned mreg = (inst->modrm >> 3) & 7u, mrm = inst->modrm & 7u;
+        if (alu == 2u || alu == 3u) return;
+        op->kind = MD_JIT_OP_ALU_RR8;
+        op->aux = (uint8_t)alu;
+        op->reg = (uint8_t)((opcode & 2u) ? mreg : mrm);
+        op->imm = (uint16_t)((opcode & 2u) ? mrm : mreg);
+        return;
+    }
+    if (opcode >= 0xE0u && opcode <= 0xE3u) {
+        op->kind = MD_JIT_OP_LOOP;
+        op->aux = (uint8_t)(opcode & 3u);
+        return;
+    }
+
     if (opcode >= 0x70u && opcode <= 0x7Fu) {
         op->kind = MD_JIT_OP_JCC;
         op->aux = (uint8_t)(opcode & 0x0Fu);
@@ -258,6 +294,57 @@ static void md_jit_classify(const uint8_t *image, uint16_t image_base,
 }
 
 static int md_jit_block_current(const MdJitBlock *block, const MdRuntime *runtime);
+
+/* M20.3 shared semantics. They perform the instruction's effects only; the
+   caller retires it and sets IP (exec_one: C path; native code: r6). LODS
+   goes through the interpreter's own string implementation, the ALU through
+   the canonical lazy-flag helpers. */
+static void md_jit_sem_apply(MdRuntime *runtime, const MdJitOp *op)
+{
+    MdX86 *cpu = &runtime->cpu;
+    switch ((MdJitOpKind)op->kind) {
+        case MD_JIT_OP_LODS:
+            md_interp_string_op(runtime, op->opcode, 0u, 0u);
+            break;
+        case MD_JIT_OP_ALU_RR16: {
+            const uint16_t r = md_x86_alu16(cpu, op->aux, cpu->r[op->reg & 7u], cpu->r[op->imm & 7u]);
+            if (op->aux != 7u) cpu->r[op->reg & 7u] = r;            /* CMP: flags only */
+            break;
+        }
+        case MD_JIT_OP_ALU_RR8: {
+            const uint8_t r = md_x86_alu8(cpu, op->aux, md_x86_get_reg8(cpu, op->reg & 7u),
+                                          md_x86_get_reg8(cpu, op->imm & 7u));
+            if (op->aux != 7u) md_x86_set_reg8(cpu, op->reg & 7u, r);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+/* LOOP family: updates CX (not for JCXZ) and returns 1 if the branch is
+   taken. Flags are read, never written. */
+static int md_jit_loop_taken(MdRuntime *runtime, const MdJitOp *op)
+{
+    MdX86 *cpu = &runtime->cpu;
+    if (op->aux == 3u) return cpu->r[MD_X86_CX] == 0u;               /* JCXZ */
+    cpu->r[MD_X86_CX] = (uint16_t)(cpu->r[MD_X86_CX] - 1u);
+    if (cpu->r[MD_X86_CX] == 0u) return 0;
+    if (op->aux == 2u) return 1;                                     /* LOOP */
+    return op->aux == 1u ? md_x86_zf(cpu) != 0 : md_x86_zf(cpu) == 0; /* LOOPZ/NZ */
+}
+
+/* Native helpers (BLX targets). Same contract as md_jit_control_one: no
+   retirement, the generated code counts the instruction in r6. */
+static void md_jit_sem_one(MdRuntime *runtime, MdJitBlock *block, unsigned index)
+{
+    md_jit_sem_apply(runtime, &block->ops[index]);
+}
+
+static unsigned md_jit_loop_one(MdRuntime *runtime, MdJitBlock *block, unsigned index)
+{
+    return (unsigned)md_jit_loop_taken(runtime, &block->ops[index]);
+}
 
 /* Reference/host path. On RP2350 M19.1 does not call this for direct ops; it
  * exists to keep the predecoded representation independently executable and
@@ -405,6 +492,19 @@ static void md_jit_exec_one(MdRuntime *runtime, MdJitBlock *block, unsigned inde
             ++block->owner->direct_instructions;
             runtime->stop_reason = MD_STOP_HALT;
             break;
+        case MD_JIT_OP_LODS:
+        case MD_JIT_OP_ALU_RR16:
+        case MD_JIT_OP_ALU_RR8:
+            md_jit_sem_apply(runtime, op);
+            cpu->ip = op->next_ip;
+            ++runtime->instructions;
+            ++block->owner->direct_instructions;
+            break;
+        case MD_JIT_OP_LOOP:
+            cpu->ip = md_jit_loop_taken(runtime, op) ? op->target : op->next_ip;
+            ++runtime->instructions;
+            ++block->owner->direct_instructions;
+            break;
         case MD_JIT_OP_FALLBACK:
         default:
             ++block->owner->fallback_instructions;
@@ -493,11 +593,24 @@ static void th16(MdThumbBuf *b, uint16_t hw)
     b->bytes[b->at++] = (uint8_t)(hw >> 8);
 }
 
+/* Patch an already-emitted halfword. A placeholder created after the scratch
+   buffer filled up points at or past its end; patching it must not write
+   out of bounds (it used to overwrite MdThumbBuf.at/.failed on the stack). */
+static int th_patch16(MdThumbBuf *b, size_t at, uint16_t hw)
+{
+    if (b->failed || at + 2u > sizeof(b->bytes)) { b->failed = 1; return 0; }
+    b->bytes[at] = (uint8_t)hw;
+    b->bytes[at + 1u] = (uint8_t)(hw >> 8);
+    return 1;
+}
+
 static uint16_t th_mov(unsigned rd, unsigned rm) { return (uint16_t)(0x4600u | ((rm & 7u) << 3) | (rd & 7u)); }
 static uint16_t th_movs(unsigned rd, unsigned imm) { return (uint16_t)(0x2000u | ((rd & 7u) << 8) | (imm & 0xFFu)); }
 static uint16_t th_add_imm(unsigned rd, unsigned imm) { return (uint16_t)(0x3000u | ((rd & 7u) << 8) | (imm & 0xFFu)); }
 static uint16_t th_sub_imm(unsigned rd, unsigned imm) { return (uint16_t)(0x3800u | ((rd & 7u) << 8) | (imm & 0xFFu)); }
 static uint16_t th_cmp_imm(unsigned rn, unsigned imm) { return (uint16_t)(0x2800u | ((rn & 7u) << 8) | (imm & 0xFFu)); }
+/* MOV with high registers (T1 encoding, any of r0-r15). */
+static uint16_t th_mov_hi(unsigned rd, unsigned rm) { return (uint16_t)(0x4600u | ((rd & 8u) << 4) | ((rm & 15u) << 3) | (rd & 7u)); }
 static uint16_t th_cmp_reg(unsigned rn, unsigned rm) { return (uint16_t)(0x4280u | ((rm & 7u) << 3) | (rn & 7u)); }
 static uint16_t th_lsl_imm(unsigned rd, unsigned rm, unsigned imm) { return (uint16_t)(((imm & 31u) << 6) | ((rm & 7u) << 3) | (rd & 7u)); }
 static uint16_t th_lsr_imm(unsigned rd, unsigned rm, unsigned imm) { return (uint16_t)(0x0800u | ((imm & 31u) << 6) | ((rm & 7u) << 3) | (rd & 7u)); }
@@ -583,9 +696,7 @@ static int th_patch_bcond(MdThumbBuf *b, size_t at, unsigned cond, size_t target
     imm = delta / 2;
     if (imm < -128 || imm > 127) return 0;
     hw = (uint16_t)(0xD000u | ((cond & 0xFu) << 8) | ((uint8_t)imm));
-    b->bytes[at] = (uint8_t)hw;
-    b->bytes[at + 1u] = (uint8_t)(hw >> 8);
-    return 1;
+    return th_patch16(b, at, hw);
 }
 
 static int th_emit_b(MdThumbBuf *b, size_t target)
@@ -819,8 +930,7 @@ static void th_emit_mov_si_al(MdThumbBuf *b, const MdJitOp *op)
         imm = delta / 2;
         if (imm < -1024 || imm > 1023) { b->failed = 1; return; }
         hw = (uint16_t)(0xE000u | ((uint16_t)imm & 0x07FFu));
-        b->bytes[b_skip_slow] = (uint8_t)hw;
-        b->bytes[b_skip_slow + 1u] = (uint8_t)(hw >> 8);
+        (void)th_patch16(b, b_skip_slow, hw);
     }
 }
 
@@ -841,13 +951,28 @@ static int th_emit_jnz(MdThumbBuf *b, const MdJitBlock *block, unsigned index,
     prev = &block->ops[index - 1u];
     if (prev->kind != MD_JIT_OP_DEC_R16 && prev->kind != MD_JIT_OP_INC_R16) return 0;
     target_index = md_jit_find_op_ip(block, op->target);
-    if (target_index < 0 || (unsigned)target_index > index) return 0;
     roff = (unsigned)(offsetof(MdX86, r) + (size_t)prev->reg * 2u);
     if (!th_offset_ok_h(roff)) return 0;
 
     th16(b, th_ldrh(0u, 4u, roff));
     th16(b, th_cmp_imm(0u, 0u));
     beq_not_taken = th_emit_bcond_placeholder(b, 0u); /* BEQ */
+
+    if (target_index < 0 || (unsigned)target_index > index) {
+        /* M20.3: target outside this block (or forward): evaluate the
+           condition natively and leave through one of two exact exits.
+           Previously the JNZ was excluded from the block, which forced a
+           zero-progress interpreter step every time (callmix: 32768). */
+        th_store_ip(b, op->target);
+        th_return(b);
+        {
+            const size_t not_taken = b->at;
+            if (!th_patch_bcond(b, beq_not_taken, 0u, not_taken)) return 0;
+            th_store_ip(b, op->next_ip);
+            th_return(b);
+        }
+        return !b->failed;
+    }
 
     /* Exact budget for the next native trip around the backedge. */
     span = index - (unsigned)target_index + 1u;
@@ -1134,6 +1259,14 @@ static int md_jit_op_modifies_reg(const MdJitOp *op, unsigned reg)
             return reg == MD_X86_AX && op->aux != 7u;
         case MD_JIT_OP_MOV_AL_SI:
             return reg == MD_X86_AX;
+        case MD_JIT_OP_LODS:
+            return reg == MD_X86_AX || reg == MD_X86_SI;
+        case MD_JIT_OP_ALU_RR16:
+            return op->reg == (reg & 7u) && op->aux != 7u;
+        case MD_JIT_OP_ALU_RR8:
+            return ((op->reg & 3u) == (reg & 7u)) && reg < 4u && op->aux != 7u;
+        case MD_JIT_OP_LOOP:
+            return reg == MD_X86_CX && op->aux != 3u;
         default:
             return 0;
     }
@@ -1697,8 +1830,263 @@ static int md_jit_emit_resident_counted(MdJit *jit, MdJitBlock *block)
     return 1;
 }
 
+
+/* ---- M20.3 resident LODS/ALU/LOOP region ------------------------------
+ *
+ * Shape: [body ops...] + LOOP back to the first op, where the body is LODSB/
+ * LODSW (no prefix), 16-bit register ALU (ADD/SUB/AND/OR/XOR/CMP) and NOP,
+ * and contains at least one LODS. This is COMMAND.COM's transient checksum
+ * (LODSW / ADD DX,AX / LOOP) and the common "sum/scan a table" idiom.
+ *
+ * Registers: r0=AX, r6=CX, r7=SI resident; r1 = DS*16 (constant: nothing
+ * in the body writes DS); r5 = guest memory; r3 = retired; r12 = budget;
+ * r2 scratch. Other 8086 registers stay in MdX86 (one operand of each ALU
+ * op must be resident, so one scratch register suffices).
+ *
+ * Exactness:
+ * - the trip count is dynamic (CX at entry, including CX=0 -> 65536);
+ *   admission is per iteration: the region only starts an iteration whose
+ *   whole body fits the remaining budget, so it stops exactly at a loop head;
+ * - every memory byte address is ((DS<<4)+SI) mod 2^20, and LODSW's second
+ *   byte wraps independently (the interpreter's read16 physical wrap);
+ * - DF is read once at entry and selects one of two loop copies (+/- step);
+ * - flags: each ALU op stores its lazy operands/result; lazy_op is written
+ *   only on exit and only if at least one iteration ran. LODS/LOOP never
+ *   touch flags, so the architectural flags are exactly those of the last
+ *   ALU op executed (or unchanged if the body has none).
+ */
+static int md_jit_lods_reg(unsigned x86reg)
+{
+    switch (x86reg & 7u) {
+        case MD_X86_AX: return 0;
+        case MD_X86_CX: return 6;
+        case MD_X86_SI: return 7;
+        default: return -1;
+    }
+}
+
+static int th_emit_lods_alu(MdThumbBuf *b, const MdJitOp *op)
+{
+    const unsigned opoff = (unsigned)offsetof(MdX86, lazy_op);
+    const unsigned aoff = (unsigned)offsetof(MdX86, lazy_a);
+    const unsigned boff = (unsigned)offsetof(MdX86, lazy_b);
+    const unsigned roff = (unsigned)offsetof(MdX86, lazy_res);
+    const int rd = md_jit_lods_reg(op->reg), rs = md_jit_lods_reg(op->imm);
+    const unsigned doff = (unsigned)(offsetof(MdX86, r) + (op->reg & 7u) * 2u);
+    const unsigned soff = (unsigned)(offsetof(MdX86, r) + (op->imm & 7u) * 2u);
+    const unsigned alu = op->aux;
+    unsigned dst, src, res;
+
+    if (!th_offset_ok_h(aoff) || !th_offset_ok_h(boff) || !th_offset_ok_h(roff) ||
+        !th_offset_ok_h(doff) || !th_offset_ok_h(soff) || !th_offset_ok_b(opoff)) return 0;
+    if (rd < 0 && rs < 0 && (op->reg & 7u) != (op->imm & 7u)) return 0;
+
+    if (rd < 0 && rs < 0) {
+        /* same non-resident register on both sides (XOR DX,DX, SUB BX,BX...) */
+        th16(b, th_ldrh(2u, 4u, doff));
+        dst = 2u;
+        src = 2u;
+    } else if (rd >= 0) {
+        dst = (unsigned)rd;
+        if (rs >= 0) src = (unsigned)rs;
+        else { th16(b, th_ldrh(2u, 4u, soff)); src = 2u; }
+    } else {
+        th16(b, th_ldrh(2u, 4u, doff));
+        dst = 2u;
+        src = (unsigned)rs;
+    }
+    /* lazy a/b are the operands before the operation */
+    if (alu != 1u && alu != 4u && alu != 6u) {
+        th16(b, th_strh(dst, 4u, aoff));
+        th16(b, th_strh(src, 4u, boff));
+    }
+    if (alu == 7u) {                                   /* CMP: result in r2 only */
+        th16(b, th_sub_reg(2u, dst, src));
+        res = 2u;
+    } else {
+        switch (alu) {
+            case 0u: th16(b, th_add_reg(dst, dst, src)); break;
+            case 5u: th16(b, th_sub_reg(dst, dst, src)); break;
+            case 4u: th16(b, th_and_reg(dst, src)); break;
+            case 1u: th16(b, th_orr_reg(dst, src)); break;
+            case 6u: th16(b, th_eor_reg(dst, src)); break;
+            default: return 0;
+        }
+        if (dst != 2u) th16(b, th_uxth(dst, dst));
+        else th16(b, th_strh(2u, 4u, doff));           /* memory-resident destination */
+        res = dst;
+    }
+    th16(b, th_strh(res, 4u, roff));
+    /* lazy kind recorded per op: the flags are always those of the last ALU
+       op executed, wherever the region exits */
+    th16(b, th_movs(2u, alu == 0u ? MD_LAZY_ADD16
+                      : (alu == 5u || alu == 7u) ? MD_LAZY_SUB16 : MD_LAZY_LOGIC16));
+    th16(b, th_strb(2u, 4u, opoff));
+    return !b->failed;
+}
+
+static int th_emit_lods_read(MdThumbBuf *b, unsigned width, int backwards)
+{
+    th16(b, th_add_reg(2u, 1u, 7u));                  /* r2 = DS*16 + SI */
+    th16(b, th_lsl_imm(2u, 2u, 12u));
+    th16(b, th_lsr_imm(2u, 2u, 12u));                 /* mod 2^20 */
+    if (width == 1u) {
+        th16(b, th_ldrb_reg(2u, 5u, 2u));
+        th_resident_set_al_from_r2(b);
+    } else {
+        th16(b, th_ldrb_reg(0u, 5u, 2u));             /* AL; AX fully replaced */
+        th16(b, th_add_imm(2u, 1u));
+        th16(b, th_lsl_imm(2u, 2u, 12u));
+        th16(b, th_lsr_imm(2u, 2u, 12u));             /* second byte wraps too */
+        th16(b, th_ldrb_reg(2u, 5u, 2u));
+        th16(b, th_lsl_imm(2u, 2u, 8u));
+        th16(b, th_orr_reg(0u, 2u));
+    }
+    th16(b, backwards ? th_sub_imm(7u, width) : th_add_imm(7u, width));
+    th16(b, th_uxth(7u, 7u));
+    return !b->failed;
+}
+
+static void th_lods_store_regs(MdThumbBuf *b)
+{
+    th16(b, th_strh(0u, 4u, (unsigned)(offsetof(MdX86, r) + MD_X86_AX * 2u)));
+    th16(b, th_strh(6u, 4u, (unsigned)(offsetof(MdX86, r) + MD_X86_CX * 2u)));
+    th16(b, th_strh(7u, 4u, (unsigned)(offsetof(MdX86, r) + MD_X86_SI * 2u)));
+}
+
+static int th_emit_lods_op(MdThumbBuf *b, const MdJitOp *op, int backwards)
+{
+    if (op->kind == MD_JIT_OP_LODS) return th_emit_lods_read(b, op->aux, backwards);
+    if (op->kind == MD_JIT_OP_ALU_RR16) return th_emit_lods_alu(b, op);
+    return op->kind == MD_JIT_OP_NOP;
+}
+
+static int th_emit_lods_copy(MdThumbBuf *b, const MdJitBlock *block, int backwards,
+                             unsigned loop_start)
+{
+    const unsigned n = block->op_count;
+    const unsigned body = n - loop_start;           /* loop body incl. LOOP */
+    size_t top, blo_budget, bne_top, blo_prologue = 0u;
+    unsigned i;
+
+    if (loop_start != 0u) {
+        /* straight-line prologue, executed once, admitted on its own */
+        th16(b, th_mov_hi(2u, 12u));
+        th16(b, th_sub_reg(2u, 2u, 3u));
+        th16(b, th_cmp_imm(2u, loop_start));
+        blo_prologue = th_emit_bcond_placeholder(b, 3u);
+        th16(b, th_add_imm(3u, loop_start));
+        for (i = 0u; i < loop_start && !b->failed; ++i) {
+            if (!th_emit_lods_op(b, &block->ops[i], backwards)) return 0;
+        }
+    }
+
+    top = b->at;
+    th16(b, th_mov_hi(2u, 12u));                      /* r2 = budget */
+    th16(b, th_sub_reg(2u, 2u, 3u));                  /* remaining */
+    th16(b, th_cmp_imm(2u, body));
+    blo_budget = th_emit_bcond_placeholder(b, 3u);    /* BLO: iteration doesn't fit */
+    th16(b, th_add_imm(3u, body));                    /* whole iteration retires */
+
+    for (i = loop_start; i + 1u < n && !b->failed; ++i) {
+        if (!th_emit_lods_op(b, &block->ops[i], backwards)) return 0;
+    }
+    /* LOOP: CX-1; continue while non-zero (SUBS sets Z before the UXTH) */
+    th16(b, th_sub_imm(6u, 1u));
+    th16(b, th_uxth(6u, 6u));
+    bne_top = th_emit_bcond_placeholder(b, 1u);
+    if (!th_patch_bcond(b, bne_top, 1u, top)) return 0;
+
+    /* loop finished */
+    th_lods_store_regs(b);
+    th_store_ip(b, block->ops[n - 1u].next_ip);
+    th16(b, th_mov(0u, 3u));
+    th16(b, 0xBDF8u);                                 /* pop {r3-r7,pc} */
+
+    /* budget exit at the loop head (prologue already retired) */
+    if (!th_patch_bcond(b, blo_budget, 3u, b->at)) return 0;
+    th_lods_store_regs(b);
+    th_store_ip(b, block->ops[loop_start].ip);
+    th16(b, th_mov(0u, 3u));
+    th16(b, 0xBDF8u);
+
+    if (loop_start != 0u) {
+        /* prologue doesn't fit: nothing executed, nothing changed */
+        if (!th_patch_bcond(b, blo_prologue, 3u, b->at)) return 0;
+        th16(b, th_movs(0u, 0u));
+        th16(b, 0xBDF8u);
+    }
+    return !b->failed;
+}
+
+static int md_jit_emit_resident_lodsloop(MdJit *jit, MdJitBlock *block)
+{
+    MdThumbBuf b;
+    const unsigned n = block->op_count;
+    const MdJitOp *last;
+    const unsigned dsoff = (unsigned)offsetof(MdX86, ds);
+    const unsigned moff = (unsigned)offsetof(MdX86, memory);
+    const unsigned foff = (unsigned)offsetof(MdX86, flags_raw);
+    const unsigned opoff = (unsigned)offsetof(MdX86, lazy_op);
+    int has_lods = 0, li;
+    unsigned loop_start;
+    size_t bmi_back;
+    unsigned i;
+
+    if (n < 2u || n > 32u) return 0;
+    last = &block->ops[n - 1u];
+    if (last->kind != MD_JIT_OP_LOOP || last->aux != 2u) return 0;
+    li = md_jit_find_op_ip(block, last->target);
+    if (li < 0 || (unsigned)li >= n - 1u) return 0;
+    loop_start = (unsigned)li;
+    for (i = 0u; i + 1u < n; ++i) {
+        const MdJitOp *op = &block->ops[i];
+        if (op->kind == MD_JIT_OP_LODS) { if (i >= loop_start) has_lods = 1; continue; }
+        if (op->kind == MD_JIT_OP_NOP) continue;
+        if (op->kind != MD_JIT_OP_ALU_RR16) return 0;
+        if ((op->reg & 7u) == MD_X86_SP || (op->imm & 7u) == MD_X86_SP) return 0;
+        if (md_jit_lods_reg(op->reg) < 0 && md_jit_lods_reg(op->imm) < 0 &&
+            (op->reg & 7u) != (op->imm & 7u)) return 0;
+        if (op->aux == 2u || op->aux == 3u) return 0;
+    }
+    if (!has_lods) return 0;
+    if (!th_offset_ok_h(dsoff) || !th_offset_ok_w(moff) || !th_offset_ok_h(foff) ||
+        !th_offset_ok_b(opoff)) return 0;
+
+    memset(&b, 0, sizeof(b));
+    th16(&b, 0xB5F8u);                                /* push {r3-r7,lr} */
+    th16(&b, th_mov(4u, 0u));                         /* r4 = runtime */
+    th16(&b, th_mov_hi(12u, 2u));                     /* r12 = budget */
+    th16(&b, th_ldr(5u, 4u, moff));                   /* r5 = guest memory */
+    th16(&b, th_ldrh(1u, 4u, dsoff));
+    th16(&b, th_lsl_imm(1u, 1u, 4u));                 /* r1 = DS*16 */
+    th_resident_load_reg(&b, MD_X86_AX);
+    th_resident_load_reg(&b, MD_X86_CX);
+    th_resident_load_reg(&b, MD_X86_SI);
+    th16(&b, th_movs(3u, 0u));                        /* retired = 0 */
+    th16(&b, th_ldrh(2u, 4u, foff));
+    th16(&b, th_lsl_imm(2u, 2u, 21u));                /* DF (bit 10) -> N */
+    bmi_back = th_emit_bcond_placeholder(&b, 4u);     /* BMI */
+    if (!th_emit_lods_copy(&b, block, 0, loop_start)) return 0;
+    if (!th_patch_bcond(&b, bmi_back, 4u, b.at)) {
+        /* the forward copy is too long for a short branch: give up on the
+           resident form; the general emitter still handles the block */
+        return 0;
+    }
+    if (!th_emit_lods_copy(&b, block, 1, loop_start)) return 0;
+
+    if (b.failed || !md_jit_install_native(jit, block, &b)) return 0;
+    block->direct_prefix_ops = block->op_count;
+    block->local_edges = 1u;
+    block->resident = 1u;
+    ++jit->local_edges;
+    ++jit->resident_regions;
+    return 1;
+}
+
 static int md_jit_emit_resident(MdJit *jit, MdJitBlock *block)
 {
+    if (md_jit_emit_resident_lodsloop(jit, block)) return 1;   /* M20.3 */
     if (md_jit_is_resident_loop(block)) return md_jit_emit_resident_loop(jit, block);
     if (md_jit_is_resident_memloop(block)) return md_jit_emit_resident_memloop(jit, block);
     if (md_jit_emit_resident_cfg(jit, block)) return 1;
@@ -1722,6 +2110,56 @@ static void th_emit_control_one(MdThumbBuf *b, const MdJitOp *op, unsigned index
     th16(b, 0x4798u);                    /* blx r3 */
     th16(b, th_add_imm(6u, 1u));         /* control instruction retired */
     th_return(b);                        /* target/CS is now architectural */
+}
+
+/* M20.3: LODS / reg-reg ALU executed by the shared C semantics without
+   leaving the native block (no dispatcher round trip, no fallback). The
+   helper reads/writes architectural state in MdX86, which the general
+   emitter keeps current, and clobbers only r0-r3/r12. */
+static void th_emit_sem_one(MdThumbBuf *b, unsigned index)
+{
+    th16(b, th_mov(0u, 4u));             /* runtime */
+    th16(b, th_mov(1u, 5u));             /* block */
+    th16(b, th_movs(2u, index));
+    th_load_imm32(b, 3u, (uint32_t)(uintptr_t)&md_jit_sem_one);
+    th16(b, 0x4798u);                    /* blx r3 */
+    th16(b, th_add_imm(6u, 1u));         /* retired */
+}
+
+/* M20.3: LOOP/LOOPZ/LOOPNZ/JCXZ. The helper updates CX and returns taken;
+   an internal backward target becomes a native branch with the same exact
+   budget check as th_emit_jnz, otherwise the block exits at the precise
+   target or fallthrough IP. */
+static int th_emit_loop(MdThumbBuf *b, const MdJitBlock *block, unsigned index,
+                        const size_t *op_native)
+{
+    const MdJitOp *op = &block->ops[index];
+    const int ti = md_jit_find_op_ip(block, op->target);
+    size_t beq_not_taken;
+    th16(b, th_mov(0u, 4u));
+    th16(b, th_mov(1u, 5u));
+    th16(b, th_movs(2u, index));
+    th_load_imm32(b, 3u, (uint32_t)(uintptr_t)&md_jit_loop_one);
+    th16(b, 0x4798u);                    /* blx r3: r0 = taken */
+    th16(b, th_add_imm(6u, 1u));         /* LOOP itself retired */
+    th16(b, th_cmp_imm(0u, 0u));
+    beq_not_taken = th_emit_bcond_placeholder(b, 0u);
+    if (ti >= 0 && (unsigned)ti <= index) {
+        const unsigned span = index - (unsigned)ti + 1u;
+        size_t blo;
+        th16(b, th_mov(0u, 7u));
+        th16(b, th_sub_reg(0u, 0u, 6u)); /* remaining = budget - retired */
+        th16(b, th_cmp_imm(0u, span));
+        blo = th_emit_bcond_placeholder(b, 3u);
+        if (!th_emit_b(b, op_native[ti])) return 0;
+        if (!th_patch_bcond(b, blo, 3u, b->at)) return 0;
+    }
+    th_store_ip(b, op->target);
+    th_return(b);
+    if (!th_patch_bcond(b, beq_not_taken, 0u, b->at)) return 0;
+    th_store_ip(b, op->next_ip);
+    th_return(b);
+    return !b->failed;
 }
 
 static int md_jit_emit_thumb(MdJit *jit, MdJitBlock *block)
@@ -1772,10 +2210,19 @@ static int md_jit_emit_thumb(MdJit *jit, MdJitBlock *block)
                 else cf = MD_JIT_CF_LAZY_UNKNOWN;
                 break;
             case MD_JIT_OP_JCC:
+                /* JNZ after INC/DEC; internal back-edge or external exit
+                   (th_emit_jnz handles both). */
                 if (op->aux != 5u || i == 0u ||
                     (block->ops[i - 1u].kind != MD_JIT_OP_DEC_R16 &&
-                     block->ops[i - 1u].kind != MD_JIT_OP_INC_R16) ||
-                    md_jit_find_op_ip(block, op->target) < 0) ok = 0;
+                     block->ops[i - 1u].kind != MD_JIT_OP_INC_R16)) ok = 0;
+                break;
+            case MD_JIT_OP_LODS:
+            case MD_JIT_OP_LOOP:
+                break;                       /* helper-backed (M20.3) */
+            case MD_JIT_OP_ALU_RR16:
+            case MD_JIT_OP_ALU_RR8:
+                cf = (op->aux == 1u || op->aux == 4u || op->aux == 6u) ? MD_JIT_CF_ZERO
+                                                                     : MD_JIT_CF_LAZY_UNKNOWN;
                 break;
             case MD_JIT_OP_JMP:
                 if (md_jit_find_op_ip(block, op->target) < 0) {
@@ -1900,6 +2347,20 @@ static int md_jit_emit_thumb(MdJit *jit, MdJitBlock *block)
                 ++jit->helper_sites;
                 i = direct;
                 break;
+            case MD_JIT_OP_LODS:
+            case MD_JIT_OP_ALU_RR16:
+            case MD_JIT_OP_ALU_RR8:
+                th_emit_sem_one(&b, i);
+                ++jit->helper_sites;
+                if (op->kind != MD_JIT_OP_LODS)
+                    cf = (op->aux == 1u || op->aux == 4u || op->aux == 6u) ? MD_JIT_CF_ZERO
+                                                                         : MD_JIT_CF_LAZY_UNKNOWN;
+                break;
+            case MD_JIT_OP_LOOP:
+                if (!th_emit_loop(&b, block, i, op_native)) b.failed = 1;
+                ++jit->helper_sites;
+                i = direct;
+                break;
             case MD_JIT_OP_NOP:
                 th16(&b, th_add_imm(6u, 1u));
                 break;
@@ -1934,6 +2395,7 @@ static int md_jit_emit_thumb(MdJit *jit, MdJitBlock *block)
                    block->ops[direct - 1u].kind != MD_JIT_OP_RET_FAR_IMM &&
                    block->ops[direct - 1u].kind != MD_JIT_OP_INT &&
                    block->ops[direct - 1u].kind != MD_JIT_OP_IRET &&
+                   block->ops[direct - 1u].kind != MD_JIT_OP_LOOP &&
                    block->ops[direct - 1u].kind != MD_JIT_OP_HLT) {
             const uint16_t next = direct < block->op_count ? block->ops[direct].ip
                                                            : block->ops[direct - 1u].next_ip;

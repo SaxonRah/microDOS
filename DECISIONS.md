@@ -692,3 +692,21 @@ deliberately wrong overflow rule is caught by it.
 
 It held through a soak test with repeated DOS2TEST runs and a long idle at
 the prompt. `microdos_pico_150` remains for comparison.
+
+## 55. The JIT is validated as real Thumb-2 under QEMU before hardware
+
+Generated code used to be exercised only on the RP2350, so emitter bugs
+(M20.2's stale IP, M20.2.1's callmix fallback) were found one UF2 at a time.
+`tests/test_jit_diff.c` compares the JIT against the interpreter on every
+fixture; built for ARMv7-A Thumb-2 and run under qemu-arm
+(`tools/jit_qemu_check.sh`) it executes the emitted code itself and checks
+code shape too. The host build of the same test runs in ctest.
+
+## 56. JIT op coverage follows the full-DOS profile; semantics stay single-source
+
+M20.3 added LODS, register ALU and the LOOP family because the hardware
+profile named COMMAND.COM's checksum loop as the top fallback site. New JIT
+ops reuse the interpreter's implementations (string op, lazy-flag helpers)
+in their C path and native helpers; only the resident region re-expresses
+them in Thumb, and that region is pinned by differential fixtures with
+budget slicing plus planted-mutation checks.

@@ -115,7 +115,15 @@ typedef enum MdJitOpKind {
     MD_JIT_OP_INT,
     MD_JIT_OP_IRET,
     MD_JIT_OP_NOP,
-    MD_JIT_OP_HLT
+    MD_JIT_OP_HLT,
+    /* M20.3 (appended so earlier values are unchanged) */
+    MD_JIT_OP_LODS,         /* LODSB/LODSW, no prefix; aux = width 1/2 */
+    MD_JIT_OP_ALU_RR16,     /* 01/03/09/0B/21/23/29/2B/31/33/39/3B, mod=11;
+                               aux = ALU op, reg = dest, imm = src */
+    MD_JIT_OP_LOOP,         /* E0 LOOPNZ / E1 LOOPZ / E2 LOOP / E3 JCXZ;
+                               aux = opcode & 3 */
+    MD_JIT_OP_ALU_RR8       /* 00/02/08/0A/20/22/28/2A/30/32/38/3A, mod=11;
+                               aux = ALU op, reg = dest, imm = src (8-bit regs) */
 } MdJitOpKind;
 
 typedef struct MdJitOp {

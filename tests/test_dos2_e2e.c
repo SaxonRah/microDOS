@@ -18,6 +18,59 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef MICRODOS_ENABLE_JIT
+/* M20.4: the runtime JIT in the full DOS session. Built for ARM and run under
+   qemu-arm (tools/jit_qemu_check.sh) this executes the generated Thumb-2
+   with the Pico's exact JIT configuration and reports the same counters as
+   the firmware's [jit] block. */
+#include "microdos/jit.h"
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
+#ifndef MICRODOS_SYSTEM_JIT_CODE_BYTES
+#define MICRODOS_SYSTEM_JIT_CODE_BYTES (24u * 1024u)
+#endif
+static MdJit g_e2e_jit;
+
+static void e2e_attach_jit(MdDos2System *sys)
+{
+    uint8_t *code = NULL;
+#if defined(__linux__)
+    void *p = mmap(NULL, MICRODOS_SYSTEM_JIT_CODE_BYTES, PROT_READ | PROT_WRITE | PROT_EXEC,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p != MAP_FAILED) code = (uint8_t *)p;
+#endif
+    if (code == NULL) code = (uint8_t *)calloc(1u, MICRODOS_SYSTEM_JIT_CODE_BYTES);
+    md_jit_init(&g_e2e_jit, code, MICRODOS_SYSTEM_JIT_CODE_BYTES);
+    md_dos2_system_set_jit(sys, &g_e2e_jit);
+}
+
+static void e2e_report_jit(const MdDos2System *sys)
+{
+    const MdJit *j = &g_e2e_jit;
+    unsigned i;
+    printf("[jit] native=%llu fallback=%llu control=%llu compile=%llu hit=%llu miss=%llu invalid=%llu flush=%llu\n",
+           (unsigned long long)j->direct_instructions, (unsigned long long)j->fallback_instructions,
+           (unsigned long long)j->control_instructions, (unsigned long long)j->compiles,
+           (unsigned long long)j->hits, (unsigned long long)j->misses,
+           (unsigned long long)j->invalidations, (unsigned long long)j->flushes);
+    printf("[jit] fallback-reason zero=%llu cold=%llu budget=%llu compile=%llu  resident=%llu/%llu  code=%lu/%lu B  bios-bypass=%llu\n",
+           (unsigned long long)j->zero_progress_fallbacks, (unsigned long long)j->cold_fallbacks,
+           (unsigned long long)j->budget_fallbacks, (unsigned long long)j->compile_fail_fallbacks,
+           (unsigned long long)j->resident_regions, (unsigned long long)j->resident_instructions,
+           (unsigned long)j->code_used, (unsigned long)j->code_size,
+           (unsigned long long)j->bios_bypass_instructions);
+    printf("[jit] tiers: jit-owned=%llu jit-native=%llu jit-fallback=%llu\n",
+           (unsigned long long)sys->jit_instructions, (unsigned long long)sys->jit_native_instructions,
+           (unsigned long long)sys->jit_fallback_instructions);
+    for (i = 0; i < MD_JIT_HOT_SITES; ++i) {
+        const MdJitHotSite *h = &j->hot_sites[i];
+        if (h->count == 0u) continue;
+        printf("[jit]   %8llu  %04X:%04X op=%02X -> %04X:%04X  %s\n", (unsigned long long)h->count,
+               h->cs, h->ip, h->opcode, h->dst_cs, h->dst_ip, md_jit_exit_reason_name(h->reason));
+    }
+}
+#endif
 #include <string.h>
 #include <time.h>
 
@@ -367,6 +420,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "e2e: bad MSDOS.SYS\n");
         return 2;
     }
+#ifdef MICRODOS_ENABLE_JIT
+    e2e_attach_jit(&sys);
+#endif
     if (profile_out != NULL) {
         md_dos2_system_set_aot(&sys, programs, 1u, false);
         return e2e_profile(&sys, &e, kernel, kernel_size, profile_out);
@@ -415,6 +471,9 @@ int main(int argc, char **argv)
         return 1;
     }
     if (!aot && sys.runtime.aot_instructions != 0u) { fprintf(stderr, "[e2e] FAIL: AOT ran while disabled\n"); return 1; }
+#ifdef MICRODOS_ENABLE_JIT
+    e2e_report_jit(&sys);
+#endif
     puts("[e2e] PASS");
     return 0;
 }

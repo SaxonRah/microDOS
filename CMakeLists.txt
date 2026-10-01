@@ -153,6 +153,22 @@ if(MD_BUILD_TESTS)
     add_test(NAME dosprobe_selftest COMMAND dosprobe --selftest)
     add_test(NAME mkfat12_selftest COMMAND mkfat12 --selftest)
 
+    # Runtime JIT differential fixtures (M20.2.2/M20.3). On the host this checks the
+    # JIT's decode/region logic and C reference semantics against the
+    # interpreter; tools/jit_qemu_check.sh runs the same test as native
+    # Thumb-2 under qemu-arm, which also checks code shape (fallbacks,
+    # resident regions). test_jit.c is the M20.3 spec (LODS/LOOP
+    # resident regions); on the host its code-shape checks are skipped.
+    set(MD_JIT_TEST_SOURCES src/runtime/jit_thumb2.c)
+    add_executable(microdos_jit_diff tests/test_jit_diff.c ${MD_JIT_TEST_SOURCES})
+    target_link_libraries(microdos_jit_diff PRIVATE microdos::runtime microdos::decode)
+    target_include_directories(microdos_jit_diff PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/runtime")
+    add_test(NAME jit_diff COMMAND microdos_jit_diff)
+    add_executable(microdos_jit_m203 tests/test_jit.c ${MD_JIT_TEST_SOURCES})
+    target_link_libraries(microdos_jit_m203 PRIVATE microdos::runtime microdos::decode)
+    target_include_directories(microdos_jit_m203 PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/runtime")
+    add_test(NAME jit_m203 COMMAND microdos_jit_m203)
+
     # M14 end-to-end: boot the released MS-DOS 2.0 through the portable
     # system loop (the code the Pico 2 runs) and pass DOS2TEST at A>.
     # Needs the pinned Microsoft binaries (.\md.bat deps msdos).
