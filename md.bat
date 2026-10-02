@@ -67,11 +67,15 @@ if not exist "%MD_ROOT%\third_party\msdos\v2.0\bin\MSDOS.SYS" (
     echo ERROR: MS-DOS 2.0 binaries are missing. Run: .\md.bat deps msdos
     exit /b 1
 )
+if not exist "%MD_ROOT%\tests\dos2\MDSTRESS.COM" (
+    echo ERROR: MDSTRESS.COM is missing from tests\dos2.
+    exit /b 1
+)
 call "%MD_ROOT%\scripts\md_pico_env.bat" || exit /b 1
 if not exist "%MD_ROOT%\build-pico" mkdir "%MD_ROOT%\build-pico" || exit /b 1
 set "MKFAT_EXE=%MD_ROOT%\build-host\mkfat12.exe"
 if exist "%MD_ROOT%\build-host\Release\mkfat12.exe" set "MKFAT_EXE=%MD_ROOT%\build-host\Release\mkfat12.exe"
-"%MKFAT_EXE%" --command "%MD_ROOT%\third_party\msdos\v2.0\bin\COMMAND.COM" --add "%MD_ROOT%\tests\dos2\DOS2TEST.COM" DOS2TEST.COM --output "%MD_ROOT%\build-pico\pico_disk.img" || exit /b 1
+"%MKFAT_EXE%" --command "%MD_ROOT%\third_party\msdos\v2.0\bin\COMMAND.COM" --add "%MD_ROOT%\tests\dos2\DOS2TEST.COM" DOS2TEST.COM --add "%MD_ROOT%\tests\dos2\MDSTRESS.COM" MDSTRESS.COM --output "%MD_ROOT%\build-pico\pico_disk.img" || exit /b 1
 cmake -S "%MD_ROOT%\pico" -B "%MD_ROOT%\build-pico\out" -G Ninja "-DCMAKE_MAKE_PROGRAM=%NINJA_EXE%" "-DMICRODOS_HOST_BUILD=%MD_ROOT%\build-host" "-DMICRODOS_PICO_DISK=%MD_ROOT%\build-pico\pico_disk.img" || exit /b 1
 cmake --build "%MD_ROOT%\build-pico\out" || exit /b 1
 echo.
@@ -83,6 +87,8 @@ echo   microdos_pico_region.uf2      DOS, resident decoded-cache kernel, 300 MHz
 echo   microdos_pico_jitkernel.uf2   DOS, runtime-JIT kernel, lean profiling, 300 MHz
 echo   microdos_pico_jit.uf2         DOS, AOT kernel + lean JIT apps, 300 MHz
 echo   microdos_pico_jit_profile.uf2 DOS, AOT kernel + profiled JIT apps, 300 MHz
+echo   microdos_pico_g128_psram.uf2  DOS, 128 KiB guest in PSRAM, 300 MHz
+echo   microdos_pico_g128_sram.uf2   DOS, 128 KiB guest in SRAM, 300 MHz
 echo   microdos_bench.uf2            benchmark matrix incl. M21 checksum, 300 MHz
 echo   microdos_bench_150.uf2        benchmark matrix, 150 MHz
 echo Hold BOOTSEL while plugging in the Pico Plus 2, then copy a .uf2 to the RP2350 drive.
@@ -188,12 +194,17 @@ if not exist "%MD_ROOT%\third_party\msdos\v2.0\bin\COMMAND.COM" (
     echo Run: .\md.bat deps msdos
     exit /b 1
 )
+if not exist "%MD_ROOT%\tests\dos2\MDSTRESS.COM" (
+    echo ERROR: MDSTRESS.COM is missing from tests\dos2.
+    exit /b 1
+)
 if not exist "%MD_ROOT%\build-disk" mkdir "%MD_ROOT%\build-disk" || exit /b 1
 set "MKFAT_EXE=%MD_ROOT%\build-host\mkfat12.exe"
 if exist "%MD_ROOT%\build-host\Release\mkfat12.exe" set "MKFAT_EXE=%MD_ROOT%\build-host\Release\mkfat12.exe"
 set "MKFAT_EXTRA="
 if exist "%MD_ROOT%\tests\dos2\DOS2TEST.COM" set MKFAT_EXTRA=--add "%MD_ROOT%\tests\dos2\DOS2TEST.COM" DOS2TEST.COM
-"%MKFAT_EXE%" --command "%MD_ROOT%\third_party\msdos\v2.0\bin\COMMAND.COM" %MKFAT_EXTRA% --output "%MD_ROOT%\build-disk\msdos2.img"
+set "MKFAT_STRESS=--add "%MD_ROOT%\tests\dos2\MDSTRESS.COM" MDSTRESS.COM"
+"%MKFAT_EXE%" --command "%MD_ROOT%\third_party\msdos\v2.0\bin\COMMAND.COM" %MKFAT_EXTRA% %MKFAT_STRESS% --output "%MD_ROOT%\build-disk\msdos2.img"
 exit /b %ERRORLEVEL%
 
 
@@ -257,7 +268,7 @@ echo   .\md.bat test
 echo   .\md.bat bench [rounds]
 echo   .\md.bat recomp input.com name [code-end]
 echo   .\md.bat analyze [dos2^|msdos^|command]
-echo   .\md.bat image dos2          ^(rebuild/reset FAT12 image^)
+echo   .\md.bat image dos2          ^(rebuild/reset FAT12 image; includes DOS2TEST + MDSTRESS^)
 echo   .\md.bat boot msdos2 [budget]
 echo   .\md.bat clean [all]     ^(default preserves build-disk; all removes it^)
 echo.
@@ -267,6 +278,11 @@ echo   .\md.bat analyze dos2
 echo   .\md.bat boot msdos2
 echo   .\md.bat image dos2
 echo   .\md.bat run dos2
+echo.
+echo MDSTRESS:
+echo   A^>MDSTRESS       ^(automatic nine-phase engine stress workload^)
+echo   A^>MDSTRESS /S    ^(manual step mode^)
+echo   A^>MDSTRESS 1..9  ^(run exactly one profiling phase^)
 echo.
 echo dosrecomp example:
 echo   .\md.bat recomp tests\programs\hello.com hello 0x10c

@@ -24,6 +24,25 @@ _Static_assert((MD_JIT_HOTNESS_SLOTS & (MD_JIT_HOTNESS_SLOTS - 1u)) == 0u,
 #define MD_JIT_CODE_ALIGN 4u
 #define MD_JIT_NATIVE_TMP 1536u
 
+/*
+ * M22.0: if generated code cannot retire even one guest instruction, do not
+ * bounce straight back through lookup/dispatch after interpreting only one
+ * instruction.  Run a small canonical-interpreter burst, then give the JIT
+ * another chance.  This is deliberately local and bounded: cold admission,
+ * compile failures and exact budget fallbacks keep their existing behavior.
+ *
+ * MDSTRESS v2 showed zero-progress retry churn making the current JIT up to
+ * ~6.7x slower than the plain interpreter on control-heavy code.  Sixteen
+ * instructions is long enough to cross dense unsupported sequences while
+ * remaining short enough to return quickly to a hot native region.
+ */
+#ifndef MD_JIT_ZERO_ESCAPE_BURST
+#define MD_JIT_ZERO_ESCAPE_BURST 16u
+#endif
+#if MD_JIT_ZERO_ESCAPE_BURST < 1
+#error "MD_JIT_ZERO_ESCAPE_BURST must be at least 1"
+#endif
+
 #if MD_JIT_PROFILE
 #define MD_JIT_STAT(expr_) do { expr_; } while (0)
 #else
@@ -125,6 +144,7 @@ static void md_jit_record_site_at(MdJit *jit, const MdRuntime *runtime, unsigned
 #endif
 }
 
+#if MD_JIT_PROFILE
 static void md_jit_record_site(MdJit *jit, const MdRuntime *runtime, unsigned reason)
 {
     uint16_t cs, ip;
@@ -135,6 +155,7 @@ static void md_jit_record_site(MdJit *jit, const MdRuntime *runtime, unsigned re
     opcode = md_x86_read8(&runtime->cpu, cs, ip);
     md_jit_record_site_at(jit, runtime, reason, cs, ip, opcode, cs, ip);
 }
+#endif
 
 static void md_jit_record_transfer(MdJit *jit, const MdRuntime *runtime, unsigned reason,
                                    uint16_t src_cs, uint16_t src_ip, uint8_t opcode)
@@ -2648,6 +2669,13 @@ static uint32_t md_jit_execute_block(MdRuntime *runtime, MdJitBlock *block, uint
     uint32_t before = (uint32_t)runtime->instructions;
     for (i = 0u; i < block->op_count && runtime->stop_reason == MD_STOP_NONE; ++i) {
         if ((uint32_t)(runtime->instructions - before) >= budget) break;
+        /*
+         * Match the Thumb backend: an unsupported first op means native
+         * execution made zero progress.  Previously the host reference path
+         * interpreted MD_JIT_OP_FALLBACK inside exec_one(), so host tests
+         * could not exercise the zero-progress escape path at all.
+         */
+        if (block->ops[i].kind == MD_JIT_OP_FALLBACK) break;
         block->exec_one(runtime, block, i);
         if (runtime->cpu.ip != block->ops[i].next_ip) break;
     }
@@ -2750,18 +2778,56 @@ static MdStopReason md_jit_run_common(MdJit *jit, MdRuntime *runtime,
                     (uint32_t)(left > 0x7FFFFFFFu ? 0x7FFFFFFFu : left));
 #endif
         if (retired == 0u && runtime->stop_reason == MD_STOP_NONE) {
-            const uint16_t fcs = runtime->cpu.cs, fip = runtime->cpu.ip;
-            const uint8_t fop = md_x86_read8(&runtime->cpu, fcs, fip);
+            const uint32_t escape_budget =
+                left > (uint64_t)MD_JIT_ZERO_ESCAPE_BURST
+                    ? (uint32_t)MD_JIT_ZERO_ESCAPE_BURST
+                    : (uint32_t)left;
+            uint32_t escaped = 0u;
+
+            /*
+             * M22.0 "JIT must not hurt":
+             *
+             * A zero-progress native exit means the instruction at the
+             * current IP is outside the direct backend.  Interpreting one
+             * instruction and immediately retrying JIT lookup caused
+             * millions of native->C->interpreter->C->lookup transitions in
+             * MDSTRESS.  Stay in the canonical interpreter for a short,
+             * exact-budget burst instead.
+             *
+             * zero_progress_fallbacks remains an EXIT/event counter.
+             * fallback_instructions remains an INSTRUCTION counter and is
+             * therefore increased by every instruction retired by the burst.
+             */
             MD_JIT_STAT(++jit->boundary_fallbacks);
-            MD_JIT_STAT(++jit->fallback_instructions);
             MD_JIT_STAT(++jit->zero_progress_fallbacks);
             md_jit_record_exit(jit, runtime, MD_JIT_EXIT_ZERO_PROGRESS);
-            (void)md_interp_step(runtime);
-            if (watch_cs && runtime->cpu.cs != cs0) {
-                MD_JIT_STAT(++jit->cs_change_exits); ++jit->exit_reason[MD_JIT_EXIT_CS_CHANGE];
-                md_jit_record_transfer(jit, runtime, MD_JIT_EXIT_CS_CHANGE, fcs, fip, fop);
-                return MD_STOP_NONE;
+
+            while (escaped < escape_budget &&
+                   runtime->stop_reason == MD_STOP_NONE) {
+                const uint16_t fcs = runtime->cpu.cs;
+                const uint16_t fip = runtime->cpu.ip;
+                const uint8_t fop = md_x86_read8(&runtime->cpu, fcs, fip);
+                const uint64_t before_escape = runtime->instructions;
+                uint64_t delta;
+
+                (void)md_interp_step(runtime);
+                delta = runtime->instructions - before_escape;
+                if (delta == 0u) break;
+                escaped += (uint32_t)delta;
+
+                if (watch_cs && runtime->cpu.cs != cs0) {
+                    MD_JIT_STAT(jit->fallback_instructions += escaped);
+                    MD_JIT_STAT(++jit->cs_change_exits);
+#if MD_JIT_PROFILE
+                    ++jit->exit_reason[MD_JIT_EXIT_CS_CHANGE];
+#endif
+                    md_jit_record_transfer(jit, runtime, MD_JIT_EXIT_CS_CHANGE,
+                                           fcs, fip, fop);
+                    return MD_STOP_NONE;
+                }
             }
+
+            MD_JIT_STAT(jit->fallback_instructions += escaped);
             continue;
         }
 

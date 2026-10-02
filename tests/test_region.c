@@ -32,45 +32,75 @@ static int same_machine(const MdRuntime *a, const MdRuntime *b)
            arch_flags(&a->cpu) == arch_flags(&b->cpu);
 }
 
-static void test_dec_jnz(unsigned initial)
+static void setup_dec(MdRuntime *rt, uint8_t *mem, unsigned initial)
 {
     static const uint8_t code[] = { 0x49, 0x75, 0xFD, 0xF4 }; /* DEC CX; JNZ 0100; HLT */
+    MdHooks hooks = {0};
+
+    md_runtime_init(rt, mem, &hooks);
+    md_runtime_load_com(rt, code, sizeof(code), 0x1000u);
+    rt->cpu.r[MD_X86_CX] = (uint16_t)initial;
+    md_x86_set_flags(&rt->cpu,
+        (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF | MD_X86_FLAG_IF));
+}
+
+static void test_dec_jnz(unsigned initial)
+{
     uint8_t *ma = (uint8_t *)calloc(1u, MD_X86_ADDRESS_SPACE);
     uint8_t *mb = (uint8_t *)calloc(1u, MD_X86_ADDRESS_SPACE);
     MdRuntime a, b;
-    MdHooks hooks = {0};
-    uint32_t trips = initial != 0u ? initial : 65536u;
-    uint32_t retired = trips * 2u;
+    const uint32_t trips = initial != 0u ? initial : 65536u;
+    const uint32_t retired = trips * 2u;
     uint32_t got;
-    MdX86 before;
 
     CHECK(ma != NULL && mb != NULL);
     if (ma == NULL || mb == NULL) { free(ma); free(mb); return; }
 
-    md_runtime_init(&a, ma, &hooks);
-    md_runtime_load_com(&a, code, sizeof(code), 0x1000u);
-    a.cpu.r[MD_X86_CX] = (uint16_t)initial;
-    md_x86_set_flags(&a.cpu, (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF | MD_X86_FLAG_IF));
-
-    md_runtime_init(&b, mb, &hooks);
-    md_runtime_load_com(&b, code, sizeof(code), 0x1000u);
-    b.cpu.r[MD_X86_CX] = (uint16_t)initial;
-    md_x86_set_flags(&b.cpu, (uint16_t)(MD_X86_FLAG_ALWAYS1 | MD_X86_FLAG_CF | MD_X86_FLAG_IF));
+    setup_dec(&a, ma, initial);
+    setup_dec(&b, mb, initial);
 
     CHECK(md_interp_run(&a, retired) == MD_STOP_BUDGET);
     a.stop_reason = MD_STOP_NONE;
-
-    before = b.cpu;
-    got = md_region_try_dec_jnz(&b, MD_X86_CX, 0x0100u, 0x0103u, retired - 1u);
-    CHECK(got == 0u);
-    CHECK(memcmp(&before.r[0], &b.cpu.r[0], sizeof(before.r)) == 0);
-    CHECK(before.ip == b.cpu.ip);
-    CHECK(arch_flags(&before) == arch_flags(&b.cpu));
 
     got = md_region_try_dec_jnz(&b, MD_X86_CX, 0x0100u, 0x0103u, retired);
     CHECK(got == retired);
     CHECK(same_machine(&a, &b));
     CHECK(memcmp(ma, mb, MD_X86_ADDRESS_SPACE) == 0);
+
+    free(ma);
+    free(mb);
+}
+
+static void test_dec_partial(unsigned initial, uint32_t budget)
+{
+    uint8_t *ma = (uint8_t *)calloc(1u, MD_X86_ADDRESS_SPACE);
+    uint8_t *mb = (uint8_t *)calloc(1u, MD_X86_ADDRESS_SPACE);
+    MdRuntime a, b;
+    MdX86 before;
+    uint32_t got;
+
+    CHECK(ma != NULL && mb != NULL);
+    if (ma == NULL || mb == NULL) { free(ma); free(mb); return; }
+
+    setup_dec(&a, ma, initial);
+    setup_dec(&b, mb, initial);
+
+    /* Less than one whole DEC/JNZ iteration must be a true no-op. */
+    before = b.cpu;
+    got = md_region_try_dec_jnz(&b, MD_X86_CX, 0x0100u, 0x0103u, 1u);
+    CHECK(got == 0u);
+    CHECK(memcmp(before.r, b.cpu.r, sizeof(before.r)) == 0);
+    CHECK(before.ip == b.cpu.ip);
+    CHECK(arch_flags(&before) == arch_flags(&b.cpu));
+
+    CHECK(md_interp_run(&a, budget) == MD_STOP_BUDGET);
+    a.stop_reason = MD_STOP_NONE;
+
+    got = md_region_try_dec_jnz(&b, MD_X86_CX, 0x0100u, 0x0103u, budget);
+    CHECK(got == budget);
+    CHECK(b.cpu.ip == 0x0100u);       /* partial region remains at loop head */
+    CHECK(same_machine(&a, &b));
+    CHECK((arch_flags(&b.cpu) & MD_X86_FLAG_CF) != 0u); /* DEC preserved CF */
 
     free(ma);
     free(mb);
@@ -85,13 +115,28 @@ static void fill_words(MdRuntime *rt, uint16_t ds, uint16_t first, unsigned coun
     }
 }
 
-static void test_lodsw_loop(int backwards)
+static void setup_lodsw(MdRuntime *rt, uint8_t *mem, int backwards, unsigned count)
 {
     static const uint8_t code[] = { 0xAD, 0x03, 0xD0, 0xE2, 0xFB, 0xF4 };
+    MdHooks hooks = {0};
+
+    md_runtime_init(rt, mem, &hooks);
+    md_runtime_load_com(rt, code, sizeof(code), 0x1000u);
+    rt->cpu.ds = 0x2345u;
+    rt->cpu.r[MD_X86_CX] = (uint16_t)count;
+    rt->cpu.r[MD_X86_DX] = 0x8123u;
+    rt->cpu.r[MD_X86_SI] = backwards
+        ? (uint16_t)(0x0200u + (count - 1u) * 2u)
+        : 0x0200u;
+    if (backwards) rt->cpu.flags_raw |= MD_X86_FLAG_DF;
+    fill_words(rt, rt->cpu.ds, 0x0200u, count);
+}
+
+static void test_lodsw_loop(int backwards)
+{
     uint8_t *ma = (uint8_t *)calloc(1u, MD_X86_ADDRESS_SPACE);
     uint8_t *mb = (uint8_t *)calloc(1u, MD_X86_ADDRESS_SPACE);
     MdRuntime a, b;
-    MdHooks hooks = {0};
     const unsigned count = 64u;
     const uint32_t retired = count * 3u;
     uint32_t got;
@@ -99,29 +144,50 @@ static void test_lodsw_loop(int backwards)
     CHECK(ma != NULL && mb != NULL);
     if (ma == NULL || mb == NULL) { free(ma); free(mb); return; }
 
-    md_runtime_init(&a, ma, &hooks);
-    md_runtime_load_com(&a, code, sizeof(code), 0x1000u);
-    a.cpu.ds = 0x2345u;
-    a.cpu.r[MD_X86_CX] = count;
-    a.cpu.r[MD_X86_DX] = 0x8123u;
-    a.cpu.r[MD_X86_SI] = backwards ? 0x027Eu : 0x0200u;
-    if (backwards) a.cpu.flags_raw |= MD_X86_FLAG_DF;
-    fill_words(&a, a.cpu.ds, 0x0200u, count);
-
-    memcpy(mb, ma, MD_X86_ADDRESS_SPACE);
-    md_runtime_init(&b, mb, &hooks);
-    md_runtime_load_com(&b, code, sizeof(code), 0x1000u);
-    b.cpu.ds = a.cpu.ds;
-    b.cpu.r[MD_X86_CX] = count;
-    b.cpu.r[MD_X86_DX] = 0x8123u;
-    b.cpu.r[MD_X86_SI] = backwards ? 0x027Eu : 0x0200u;
-    if (backwards) b.cpu.flags_raw |= MD_X86_FLAG_DF;
+    setup_lodsw(&a, ma, backwards, count);
+    setup_lodsw(&b, mb, backwards, count);
 
     CHECK(md_interp_run(&a, retired) == MD_STOP_BUDGET);
     a.stop_reason = MD_STOP_NONE;
 
     got = md_region_try_lodsw_add_dx_ax_loop(&b, 0x0100u, 0x0105u, retired);
     CHECK(got == retired);
+    CHECK(same_machine(&a, &b));
+    CHECK(memcmp(ma, mb, MD_X86_ADDRESS_SPACE) == 0);
+
+    free(ma);
+    free(mb);
+}
+
+static void test_lodsw_partial(int backwards)
+{
+    uint8_t *ma = (uint8_t *)calloc(1u, MD_X86_ADDRESS_SPACE);
+    uint8_t *mb = (uint8_t *)calloc(1u, MD_X86_ADDRESS_SPACE);
+    MdRuntime a, b;
+    MdX86 before;
+    const unsigned count = 64u;
+    const uint32_t budget = 17u * 3u;
+    uint32_t got;
+
+    CHECK(ma != NULL && mb != NULL);
+    if (ma == NULL || mb == NULL) { free(ma); free(mb); return; }
+
+    setup_lodsw(&a, ma, backwards, count);
+    setup_lodsw(&b, mb, backwards, count);
+
+    before = b.cpu;
+    CHECK(md_region_try_lodsw_add_dx_ax_loop(&b, 0x0100u, 0x0105u, 2u) == 0u);
+    CHECK(memcmp(before.r, b.cpu.r, sizeof(before.r)) == 0);
+    CHECK(before.ip == b.cpu.ip);
+    CHECK(arch_flags(&before) == arch_flags(&b.cpu));
+
+    CHECK(md_interp_run(&a, budget) == MD_STOP_BUDGET);
+    a.stop_reason = MD_STOP_NONE;
+
+    got = md_region_try_lodsw_add_dx_ax_loop(&b, 0x0100u, 0x0105u, budget);
+    CHECK(got == budget);
+    CHECK(b.cpu.ip == 0x0100u);
+    CHECK(b.cpu.r[MD_X86_CX] == (uint16_t)(count - 17u));
     CHECK(same_machine(&a, &b));
     CHECK(memcmp(ma, mb, MD_X86_ADDRESS_SPACE) == 0);
 
@@ -172,7 +238,6 @@ static void test_lodsw_wrap(void)
     free(mb);
 }
 
-
 static void test_cached_checksum(void)
 {
     static const uint8_t code[] = {
@@ -217,9 +282,14 @@ int main(void)
     test_dec_jnz(1u);
     test_dec_jnz(123u);
     test_dec_jnz(0u);
+    test_dec_partial(123u, 10u);       /* five complete DEC/JNZ iterations */
+    test_dec_partial(0u, 14u);         /* proves CX=0 wrap on partial admission */
+
     test_lodsw_loop(0);
     test_lodsw_loop(1);
-    test_lodsw_wrap();
+    test_lodsw_partial(0);             /* exercises contiguous fast path */
+    test_lodsw_partial(1);             /* generic DF=1 path remains exact */
+    test_lodsw_wrap();                 /* generic physical-wrap path remains exact */
     test_cached_checksum();
 
     if (failures != 0) {

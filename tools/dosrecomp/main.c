@@ -1345,17 +1345,19 @@ static int dr_emit_c(DrProgram *p, const DrOptions *opt, const char *header_name
                     "    if (MD_CHUNKS(guard, 0x%04Xu, 0x%04Xu)) {\n"
                     "        cpu->ip = 0x%04Xu;\n"
                     "        const uint32_t r_ = md_region_try_dec_jnz(runtime, %uu, 0x%04Xu, 0x%04Xu, remaining);\n"
-                    "        if (r_ != 0u) { remaining -= r_; done += r_; cpu->ip = 0x%04Xu; goto md_dispatch; }\n"
+                    "        /* M21.1c: helper owns IP: entry on partial progress, exit on completion. */\n"
+                    "        if (r_ != 0u) { remaining -= r_; done += r_; goto md_dispatch; }\n"
                     "    }\n",
-                    o0, o1, (unsigned)ip, rr, (unsigned)ip, rex, rex);
+                    o0, o1, (unsigned)ip, rr, (unsigned)ip, rex);
             } else if (dr_region_lodsw_add_loop(p, (uint16_t)ip, &rex)) {
                 fprintf(f,
                     "    if (MD_CHUNKS(guard, 0x%04Xu, 0x%04Xu)) {\n"
                     "        cpu->ip = 0x%04Xu;\n"
                     "        const uint32_t r_ = md_region_try_lodsw_add_dx_ax_loop(runtime, 0x%04Xu, 0x%04Xu, remaining);\n"
-                    "        if (r_ != 0u) { remaining -= r_; done += r_; cpu->ip = 0x%04Xu; goto md_dispatch; }\n"
+                    "        /* M21.1c: helper owns IP: entry on partial progress, exit on completion. */\n"
+                    "        if (r_ != 0u) { remaining -= r_; done += r_; goto md_dispatch; }\n"
                     "    }\n",
-                    o0, o1, (unsigned)ip, (unsigned)ip, rex, rex);
+                    o0, o1, (unsigned)ip, (unsigned)ip, rex);
             }
         }
         fprintf(f, "    MD_AOT_BLOCK(0x%04Xu, 0x%04Xu, 0x%04Xu, %uu);\n", ip,

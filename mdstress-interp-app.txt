@@ -1,0 +1,462 @@
+
+microDOS for Pico 2 (Pimoroni Pico Plus 2)
+  clk_sys: 300 MHz (raised; PSRAM retimed)
+  psram:   8192 KiB (sdk available=1)
+  guest:   1024 KiB at 1105A000 (PSRAM, page check ok), DOS memory 640 KiB
+  disk:    360 KiB image copied from flash to PSRAM (writes are lost at reset)
+  kernel:  MSDOS.SYS 16690 bytes
+  aot:     MSDOS.SYS kernel (6099 compiled, 1 holes) attached
+  aot:     DOS2TEST.COM (1140 compiled, 0 holes)
+  config:  code SRAM (copy_to_ram), block cache OFF, runtime JIT OFF
+  keys:    Ctrl+] -> M20.2.1 tier/JIT statistics (boot + interval)
+
+MS-DOS version 2.00
+Copyright 1981,82,83 Microsoft Corp.
+
+Command v. 2.02
+Current date is Tue  3-08-1983
+Enter new date: 
+Current time is 12:00:00.00
+Enter new time: 
+
+A>
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT OFF, guest PSRAM
+[perf] --- since boot ---
+[perf] wall     0.165 s   in-guest-loop     0.165 s
+[perf] active   0.053 s   idle-sleep 0.109 s   console-out 0.001 s   input-wait 0.000 s   disk 0.002 s
+[perf] instructions 200000   active 3.780 MIPS
+[perf] tiers: static-aot 163480 (81.7%)   jit-native 0 (0.0%)   interpreted 36520 (18.3%)
+[perf] interpreted split: bios 0   other 36520
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 218
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.165 s   in-guest-loop     0.165 s
+[perf] active   0.053 s   idle-sleep 0.109 s   console-out 0.001 s   input-wait 0.000 s   disk 0.002 s
+[perf] instructions 200000   active 3.780 MIPS
+[perf] tiers: static-aot 163480 (81.7%)   jit-native 0 (0.0%)   interpreted 36520 (18.3%)
+[perf] interpreted split: bios 0   other 36520
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 218
+[perf] aot: kernel compiled 163480   non-kernel AOT 0   attached-segment steps 41
+[perf] aot: attaches=1 enters=2134 evictions=0   disk writes 0   CS:IP=1000:1028
+MDSTRESS 1
+
+microDOS ENGINE STRESS LAB v2
+Deterministic workload for interpreter/cache/AOT/JIT profiling.
+Modes: MDSTRESS | MDSTRESS /S | MDSTRESS 1..9
+[MDSTRESS] CS=0x14CB
+[MDSTRESS] single phase = 1
+
+[01/09] ALU + FLAGS + SHIFT MIXER
+
+MDSTRESS complete. deterministic checksum = 0xC40C
+Return to COMMAND.COM.
+
+A>
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT OFF, guest PSRAM
+[perf] --- since boot ---
+[perf] wall     2.512 s   in-guest-loop     2.508 s
+[perf] active   1.470 s   idle-sleep 1.032 s   console-out 0.003 s   input-wait 0.000 s   disk 0.002 s
+[perf] instructions 3400000   active 2.312 MIPS
+[perf] tiers: static-aot 581999 (17.1%)   jit-native 0 (0.0%)   interpreted 2818001 (82.9%)
+[perf] interpreted split: bios 0   other 2818001
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 2064
+[perf] --- since previous Ctrl+] ---
+[perf] wall     2.348 s   in-guest-loop     2.343 s
+[perf] active   1.418 s   idle-sleep 0.923 s   console-out 0.002 s   input-wait 0.000 s   disk 0.001 s
+[perf] instructions 3200000   active 2.257 MIPS
+[perf] tiers: static-aot 418519 (13.1%)   jit-native 0 (0.0%)   interpreted 2781481 (86.9%)
+[perf] interpreted split: bios 0   other 2781481
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1846
+[perf] aot: kernel compiled 581999   non-kernel AOT 0   attached-segment steps 45
+[perf] aot: attaches=1 enters=7935 evictions=0   disk writes 0   CS:IP=1000:059D
+
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT OFF, guest PSRAM
+[perf] --- since boot ---
+[perf] wall     3.244 s   in-guest-loop     3.235 s
+[perf] active   1.522 s   idle-sleep 1.708 s   console-out 0.003 s   input-wait 0.000 s   disk 0.002 s
+[perf] instructions 3600000   active 2.366 MIPS
+[perf] tiers: static-aot 776592 (21.6%)   jit-native 0 (0.0%)   interpreted 2823408 (78.4%)
+[perf] interpreted split: bios 0   other 2823408
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 3415
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.731 s   in-guest-loop     0.727 s
+[perf] active   0.051 s   idle-sleep 0.676 s   console-out 0.000 s   input-wait 0.000 s   disk 0.000 s
+[perf] instructions 200000   active 3.894 MIPS
+[perf] tiers: static-aot 194593 (97.3%)   jit-native 0 (0.0%)   interpreted 5407 (2.7%)
+[perf] interpreted split: bios 0   other 5407
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1351
+[perf] aot: kernel compiled 776592   non-kernel AOT 0   attached-segment steps 48
+[perf] aot: attaches=1 enters=10641 evictions=0   disk writes 0   CS:IP=1000:19BC
+MDSTRESS 2
+
+microDOS ENGINE STRESS LAB v2
+Deterministic workload for interpreter/cache/AOT/JIT profiling.
+Modes: MDSTRESS | MDSTRESS /S | MDSTRESS 1..9
+[MDSTRESS] CS=0x14CB
+[MDSTRESS] single phase = 2
+
+[02/09] MEMORY ADDRESS + STORE FABRIC
+
+MDSTRESS complete. deterministic checksum = 0xB957
+Return to COMMAND.COM.
+
+A>
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT OFF, guest PSRAM
+[perf] --- since boot ---
+[perf] wall     4.150 s   in-guest-loop     4.137 s
+[perf] active   1.851 s   idle-sleep 2.278 s   console-out 0.005 s   input-wait 0.000 s   disk 0.003 s
+[perf] instructions 4600000   active 2.485 MIPS
+[perf] tiers: static-aot 1094799 (23.8%)   jit-native 0 (0.0%)   interpreted 3505201 (76.2%)
+[perf] interpreted split: bios 0   other 3505201
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 4555
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.906 s   in-guest-loop     0.902 s
+[perf] active   0.329 s   idle-sleep 0.570 s   console-out 0.002 s   input-wait 0.000 s   disk 0.001 s
+[perf] instructions 1000000   active 3.037 MIPS
+[perf] tiers: static-aot 318207 (31.8%)   jit-native 0 (0.0%)   interpreted 681793 (68.2%)
+[perf] interpreted split: bios 0   other 681793
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1140
+[perf] aot: kernel compiled 1094799   non-kernel AOT 0   attached-segment steps 49
+[perf] aot: attaches=1 enters=15046 evictions=0   disk writes 0   CS:IP=1000:105A
+
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT OFF, guest PSRAM
+[perf] --- since boot ---
+[perf] wall     4.882 s   in-guest-loop     4.863 s
+[perf] active   1.902 s   idle-sleep 2.953 s   console-out 0.005 s   input-wait 0.000 s   disk 0.003 s
+[perf] instructions 4800000   active 2.523 MIPS
+[perf] tiers: static-aot 1289394 (26.9%)   jit-native 0 (0.0%)   interpreted 3510606 (73.1%)
+[perf] interpreted split: bios 0   other 3510606
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 5906
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.731 s   in-guest-loop     0.727 s
+[perf] active   0.051 s   idle-sleep 0.676 s   console-out 0.000 s   input-wait 0.000 s   disk 0.000 s
+[perf] instructions 200000   active 3.894 MIPS
+[perf] tiers: static-aot 194595 (97.3%)   jit-native 0 (0.0%)   interpreted 5405 (2.7%)
+[perf] interpreted split: bios 0   other 5405
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1351
+[perf] aot: kernel compiled 1289394   non-kernel AOT 0   attached-segment steps 50
+[perf] aot: attaches=1 enters=17750 evictions=0   disk writes 0   CS:IP=1000:383F
+MDSTRESS 3
+
+microDOS ENGINE STRESS LAB v2
+Deterministic workload for interpreter/cache/AOT/JIT profiling.
+Modes: MDSTRESS | MDSTRESS /S | MDSTRESS 1..9
+[MDSTRESS] CS=0x14CB
+[MDSTRESS] single phase = 3
+
+[03/09] REP STRING DMA / COMPARE / SCAN
+
+MDSTRESS complete. deterministic checksum = 0x3A57
+Return to COMMAND.COM.
+
+A>
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT OFF, guest PSRAM
+[perf] --- since boot ---
+[perf] wall     5.823 s   in-guest-loop     5.800 s
+[perf] active   2.082 s   idle-sleep 3.707 s   console-out 0.007 s   input-wait 0.000 s   disk 0.003 s
+[perf] instructions 5200000   active 2.497 MIPS
+[perf] tiers: static-aot 1661332 (31.9%)   jit-native 0 (0.0%)   interpreted 3538668 (68.1%)
+[perf] interpreted split: bios 0   other 3538668
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 7414
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.941 s   in-guest-loop     0.936 s
+[perf] active   0.180 s   idle-sleep 0.754 s   console-out 0.002 s   input-wait 0.000 s   disk 0.001 s
+[perf] instructions 400000   active 2.224 MIPS
+[perf] tiers: static-aot 371938 (93.0%)   jit-native 0 (0.0%)   interpreted 28062 (7.0%)
+[perf] interpreted split: bios 0   other 28062
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1508
+[perf] aot: kernel compiled 1661332   non-kernel AOT 0   attached-segment steps 54
+[perf] aot: attaches=1 enters=22905 evictions=0   disk writes 0   CS:IP=1000:3836
+
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT OFF, guest PSRAM
+[perf] --- since boot ---
+[perf] wall     6.554 s   in-guest-loop     6.527 s
+[perf] active   2.134 s   idle-sleep 4.383 s   console-out 0.007 s   input-wait 0.000 s   disk 0.003 s
+[perf] instructions 5400000   active 2.531 MIPS
+[perf] tiers: static-aot 1855928 (34.4%)   jit-native 0 (0.0%)   interpreted 3544072 (65.6%)
+[perf] interpreted split: bios 0   other 3544072
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 8765
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.731 s   in-guest-loop     0.727 s
+[perf] active   0.051 s   idle-sleep 0.676 s   console-out 0.000 s   input-wait 0.000 s   disk 0.000 s
+[perf] instructions 200000   active 3.895 MIPS
+[perf] tiers: static-aot 194596 (97.3%)   jit-native 0 (0.0%)   interpreted 5404 (2.7%)
+[perf] interpreted split: bios 0   other 5404
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1351
+[perf] aot: kernel compiled 1855928   non-kernel AOT 0   attached-segment steps 54
+[perf] aot: attaches=1 enters=25608 evictions=0   disk writes 0   CS:IP=1000:0694
+MDSTRESS 4
+
+microDOS ENGINE STRESS LAB v2
+Deterministic workload for interpreter/cache/AOT/JIT profiling.
+Modes: MDSTRESS | MDSTRESS /S | MDSTRESS 1..9
+[MDSTRESS] CS=0x14CB
+[MDSTRESS] single phase = 4
+
+[04/09] CALL/RET + STACK CONTROL GRAPH
+
+MDSTRESS complete. deterministic checksum = 0x0163
+Return to COMMAND.COM.
+
+A>
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT OFF, guest PSRAM
+[perf] --- since boot ---
+[perf] wall     8.652 s   in-guest-loop     8.620 s
+[perf] active   3.775 s   idle-sleep 4.831 s   console-out 0.009 s   input-wait 0.000 s   disk 0.004 s
+[perf] instructions 12000000   active 3.178 MIPS
+[perf] tiers: static-aot 2139424 (17.8%)   jit-native 0 (0.0%)   interpreted 9860576 (82.2%)
+[perf] interpreted split: bios 0   other 9860576
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 9662
+[perf] --- since previous Ctrl+] ---
+[perf] wall     2.098 s   in-guest-loop     2.093 s
+[perf] active   1.642 s   idle-sleep 0.449 s   console-out 0.002 s   input-wait 0.000 s   disk 0.001 s
+[perf] instructions 6600000   active 4.020 MIPS
+[perf] tiers: static-aot 283496 (4.3%)   jit-native 0 (0.0%)   interpreted 6316504 (95.7%)
+[perf] interpreted split: bios 0   other 6316504
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 897
+[perf] aot: kernel compiled 2139424   non-kernel AOT 0   attached-segment steps 57
+[perf] aot: attaches=1 enters=29533 evictions=0   disk writes 0   CS:IP=1000:19B0
+
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT OFF, guest PSRAM
+[perf] --- since boot ---
+[perf] wall     9.383 s   in-guest-loop     9.346 s
+[perf] active   3.827 s   idle-sleep 5.507 s   console-out 0.009 s   input-wait 0.000 s   disk 0.004 s
+[perf] instructions 12200000   active 3.188 MIPS
+[perf] tiers: static-aot 2334015 (19.1%)   jit-native 0 (0.0%)   interpreted 9865985 (80.9%)
+[perf] interpreted split: bios 0   other 9865985
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 11013
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.732 s   in-guest-loop     0.727 s
+[perf] active   0.051 s   idle-sleep 0.676 s   console-out 0.000 s   input-wait 0.000 s   disk 0.000 s
+[perf] instructions 200000   active 3.894 MIPS
+[perf] tiers: static-aot 194591 (97.3%)   jit-native 0 (0.0%)   interpreted 5409 (2.7%)
+[perf] interpreted split: bios 0   other 5409
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1351
+[perf] aot: kernel compiled 2334015   non-kernel AOT 0   attached-segment steps 62
+[perf] aot: attaches=1 enters=32241 evictions=0   disk writes 0   CS:IP=1000:1009
+MDSTRESS 5
+
+microDOS ENGINE STRESS LAB v2
+Deterministic workload for interpreter/cache/AOT/JIT profiling.
+Modes: MDSTRESS | MDSTRESS /S | MDSTRESS 1..9
+[MDSTRESS] CS=0x14CB
+[MDSTRESS] single phase = 5
+
+[05/09] INTEGER MUL/DIV + ROTATE PIPELINE
+
+MDSTRESS complete. deterministic checksum = 0xFE5A
+Return to COMMAND.COM.
+
+A>
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT OFF, guest PSRAM
+[perf] --- since boot ---
+[perf] wall    10.691 s   in-guest-loop    10.650 s
+[perf] active   4.537 s   idle-sleep 6.097 s   console-out 0.011 s   input-wait 0.000 s   disk 0.005 s
+[perf] instructions 13600000   active 2.997 MIPS
+[perf] tiers: static-aot 2659210 (19.6%)   jit-native 0 (0.0%)   interpreted 10940790 (80.4%)
+[perf] interpreted split: bios 0   other 10940790
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 12193
+[perf] --- since previous Ctrl+] ---
+[perf] wall     1.308 s   in-guest-loop     1.303 s
+[perf] active   0.711 s   idle-sleep 0.590 s   console-out 0.002 s   input-wait 0.000 s   disk 0.001 s
+[perf] instructions 1400000   active 1.970 MIPS
+[perf] tiers: static-aot 325195 (23.2%)   jit-native 0 (0.0%)   interpreted 1074805 (76.8%)
+[perf] interpreted split: bios 0   other 1074805
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1180
+[perf] aot: kernel compiled 2659210   non-kernel AOT 0   attached-segment steps 67
+[perf] aot: attaches=1 enters=36748 evictions=0   disk writes 0   CS:IP=1000:37E2
+
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT OFF, guest PSRAM
+[perf] --- since boot ---
+[perf] wall    11.423 s   in-guest-loop    11.376 s
+[perf] active   4.589 s   idle-sleep 6.772 s   console-out 0.011 s   input-wait 0.000 s   disk 0.005 s
+[perf] instructions 13800000   active 3.007 MIPS
+[perf] tiers: static-aot 2853791 (20.7%)   jit-native 0 (0.0%)   interpreted 10946209 (79.3%)
+[perf] interpreted split: bios 0   other 10946209
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 13544
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.732 s   in-guest-loop     0.727 s
+[perf] active   0.051 s   idle-sleep 0.676 s   console-out 0.000 s   input-wait 0.000 s   disk 0.000 s
+[perf] instructions 200000   active 3.893 MIPS
+[perf] tiers: static-aot 194581 (97.3%)   jit-native 0 (0.0%)   interpreted 5419 (2.7%)
+[perf] interpreted split: bios 0   other 5419
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1351
+[perf] aot: kernel compiled 2853791   non-kernel AOT 0   attached-segment steps 82
+[perf] aot: attaches=1 enters=39466 evictions=0   disk writes 0   CS:IP=1000:1028
+MDSTRESS 6
+
+microDOS ENGINE STRESS LAB v2
+Deterministic workload for interpreter/cache/AOT/JIT profiling.
+Modes: MDSTRESS | MDSTRESS /S | MDSTRESS 1..9
+[MDSTRESS] CS=0x14CB
+[MDSTRESS] single phase = 6
+
+[06/09] CONDITIONAL BRANCH / LFSR FABRIC
+
+MDSTRESS complete. deterministic checksum = 0xFA37
+Return to COMMAND.COM.
+
+A>
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT OFF, guest PSRAM
+[perf] --- since boot ---
+[perf] wall    13.261 s   in-guest-loop    13.210 s
+[perf] active   5.932 s   idle-sleep 7.261 s   console-out 0.013 s   input-wait 0.000 s   disk 0.005 s
+[perf] instructions 17200000   active 2.900 MIPS
+[perf] tiers: static-aot 3149486 (18.3%)   jit-native 0 (0.0%)   interpreted 14050514 (81.7%)
+[perf] interpreted split: bios 0   other 14050514
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 14521
+[perf] --- since previous Ctrl+] ---
+[perf] wall     1.839 s   in-guest-loop     1.834 s
+[perf] active   1.343 s   idle-sleep 0.489 s   console-out 0.002 s   input-wait 0.000 s   disk 0.001 s
+[perf] instructions 3400000   active 2.532 MIPS
+[perf] tiers: static-aot 295695 (8.7%)   jit-native 0 (0.0%)   interpreted 3104305 (91.3%)
+[perf] interpreted split: bios 0   other 3104305
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 977
+[perf] aot: kernel compiled 3149486   non-kernel AOT 0   attached-segment steps 88
+[perf] aot: attaches=1 enters=43564 evictions=0   disk writes 0   CS:IP=1000:19BB
+
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT OFF, guest PSRAM
+[perf] --- since boot ---
+[perf] wall    13.993 s   in-guest-loop    13.937 s
+[perf] active   5.983 s   idle-sleep 7.936 s   console-out 0.013 s   input-wait 0.000 s   disk 0.005 s
+[perf] instructions 17400000   active 2.908 MIPS
+[perf] tiers: static-aot 3344079 (19.2%)   jit-native 0 (0.0%)   interpreted 14055921 (80.8%)
+[perf] interpreted split: bios 0   other 14055921
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 15872
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.731 s   in-guest-loop     0.727 s
+[perf] active   0.051 s   idle-sleep 0.676 s   console-out 0.000 s   input-wait 0.000 s   disk 0.000 s
+[perf] instructions 200000   active 3.894 MIPS
+[perf] tiers: static-aot 194593 (97.3%)   jit-native 0 (0.0%)   interpreted 5407 (2.7%)
+[perf] interpreted split: bios 0   other 5407
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1351
+[perf] aot: kernel compiled 3344079   non-kernel AOT 0   attached-segment steps 91
+[perf] aot: attaches=1 enters=46270 evictions=0   disk writes 0   CS:IP=1000:112C
+MDSTRESS 7
+
+microDOS ENGINE STRESS LAB v2
+Deterministic workload for interpreter/cache/AOT/JIT profiling.
+Modes: MDSTRESS | MDSTRESS /S | MDSTRESS 1..9
+[MDSTRESS] CS=0x14CB
+[MDSTRESS] single phase = 7
+
+[07/09] RARE 8086 OPCODE COMPATIBILITY SWEEP
+
+MDSTRESS complete. deterministic checksum = 0xEC9A
+Return to COMMAND.COM.
+
+A>
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT OFF, guest PSRAM
+[perf] --- since boot ---
+[perf] wall    16.316 s   in-guest-loop    16.256 s
+[perf] active   7.785 s   idle-sleep 8.451 s   console-out 0.015 s   input-wait 0.000 s   disk 0.006 s
+[perf] instructions 21400000   active 2.749 MIPS
+[perf] tiers: static-aot 3648401 (17.0%)   jit-native 0 (0.0%)   interpreted 17751599 (83.0%)
+[perf] interpreted split: bios 0   other 17751599
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 16902
+[perf] --- since previous Ctrl+] ---
+[perf] wall     2.324 s   in-guest-loop     2.319 s
+[perf] active   1.802 s   idle-sleep 0.515 s   console-out 0.002 s   input-wait 0.000 s   disk 0.001 s
+[perf] instructions 4000000   active 2.220 MIPS
+[perf] tiers: static-aot 304322 (7.6%)   jit-native 0 (0.0%)   interpreted 3695678 (92.4%)
+[perf] interpreted split: bios 0   other 3695678
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1030
+[perf] aot: kernel compiled 3648401   non-kernel AOT 0   attached-segment steps 95
+[perf] aot: attaches=1 enters=50487 evictions=0   disk writes 0   CS:IP=1000:37E1
+
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT OFF, guest PSRAM
+[perf] --- since boot ---
+[perf] wall    17.048 s   in-guest-loop    16.983 s
+[perf] active   7.836 s   idle-sleep 9.127 s   console-out 0.015 s   input-wait 0.000 s   disk 0.006 s
+[perf] instructions 21600000   active 2.757 MIPS
+[perf] tiers: static-aot 3842982 (17.8%)   jit-native 0 (0.0%)   interpreted 17757018 (82.2%)
+[perf] interpreted split: bios 0   other 17757018
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 18253
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.732 s   in-guest-loop     0.727 s
+[perf] active   0.051 s   idle-sleep 0.676 s   console-out 0.000 s   input-wait 0.000 s   disk 0.000 s
+[perf] instructions 200000   active 3.893 MIPS
+[perf] tiers: static-aot 194581 (97.3%)   jit-native 0 (0.0%)   interpreted 5419 (2.7%)
+[perf] interpreted split: bios 0   other 5419
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1351
+[perf] aot: kernel compiled 3842982   non-kernel AOT 0   attached-segment steps 110
+[perf] aot: attaches=1 enters=53205 evictions=0   disk writes 0   CS:IP=1000:1024
+MDSTRESS 8
+
+microDOS ENGINE STRESS LAB v2
+Deterministic workload for interpreter/cache/AOT/JIT profiling.
+Modes: MDSTRESS | MDSTRESS /S | MDSTRESS 1..9
+[MDSTRESS] CS=0x14CB
+[MDSTRESS] single phase = 8
+
+[08/09] DOS INT 21h FILE + MEMORY SERVICE LOAD
+
+MDSTRESS complete. deterministic checksum = 0x1357
+Return to COMMAND.COM.
+
+A>
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT OFF, guest PSRAM
+[perf] --- since boot ---
+[perf] wall    17.734 s   in-guest-loop    17.664 s
+[perf] active   7.938 s   idle-sleep 9.700 s   console-out 0.017 s   input-wait 0.000 s   disk 0.010 s
+[perf] instructions 22000000   active 2.772 MIPS
+[perf] tiers: static-aot 4213070 (19.2%)   jit-native 0 (0.0%)   interpreted 17786930 (80.8%)
+[perf] interpreted split: bios 0   other 17786930
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 19399
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.686 s   in-guest-loop     0.681 s
+[perf] active   0.102 s   idle-sleep 0.573 s   console-out 0.002 s   input-wait 0.000 s   disk 0.004 s
+[perf] instructions 400000   active 3.925 MIPS
+[perf] tiers: static-aot 370088 (92.5%)   jit-native 0 (0.0%)   interpreted 29912 (7.5%)
+[perf] interpreted split: bios 0   other 29912
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1146
+[perf] aot: kernel compiled 4213070   non-kernel AOT 0   attached-segment steps 135
+[perf] aot: attaches=1 enters=57853 evictions=0   disk writes 71   CS:IP=1000:29AC
+
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT OFF, guest PSRAM
+[perf] --- since boot ---
+[perf] wall    18.465 s   in-guest-loop    18.391 s
+[perf] active   7.989 s   idle-sleep 10.375 s   console-out 0.017 s   input-wait 0.000 s   disk 0.010 s
+[perf] instructions 22200000   active 2.779 MIPS
+[perf] tiers: static-aot 4407666 (19.9%)   jit-native 0 (0.0%)   interpreted 17792334 (80.1%)
+[perf] interpreted split: bios 0   other 17792334
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 20750
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.731 s   in-guest-loop     0.727 s
+[perf] active   0.051 s   idle-sleep 0.676 s   console-out 0.000 s   input-wait 0.000 s   disk 0.000 s
+[perf] instructions 200000   active 3.894 MIPS
+[perf] tiers: static-aot 194596 (97.3%)   jit-native 0 (0.0%)   interpreted 5404 (2.7%)
+[perf] interpreted split: bios 0   other 5404
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1351
+[perf] aot: kernel compiled 4407666   non-kernel AOT 0   attached-segment steps 135
+[perf] aot: attaches=1 enters=60556 evictions=0   disk writes 71   CS:IP=1000:37F1
+MDSTRESS 9
+
+microDOS ENGINE STRESS LAB v2
+Deterministic workload for interpreter/cache/AOT/JIT profiling.
+Modes: MDSTRESS | MDSTRESS /S | MDSTRESS 1..9
+[MDSTRESS] CS=0x14CB
+[MDSTRESS] single phase = 9
+
+[09/09] SELF-MODIFYING CODE / CACHE INVALIDATION
+
+MDSTRESS complete. deterministic checksum = 0x1B57
+Return to COMMAND.COM.
+
+A>
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT OFF, guest PSRAM
+[perf] --- since boot ---
+[perf] wall    19.227 s   in-guest-loop    19.148 s
+[perf] active   8.093 s   idle-sleep 11.026 s   console-out 0.019 s   input-wait 0.000 s   disk 0.010 s
+[perf] instructions 22600000   active 2.793 MIPS
+[perf] tiers: static-aot 4752239 (21.0%)   jit-native 0 (0.0%)   interpreted 17847761 (79.0%)
+[perf] interpreted split: bios 0   other 17847761
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 22051
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.762 s   in-guest-loop     0.757 s
+[perf] active   0.104 s   idle-sleep 0.650 s   console-out 0.002 s   input-wait 0.000 s   disk 0.001 s
+[perf] instructions 400000   active 3.854 MIPS
+[perf] tiers: static-aot 344573 (86.1%)   jit-native 0 (0.0%)   interpreted 55427 (13.9%)
+[perf] interpreted split: bios 0   other 55427
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1301
+[perf] aot: kernel compiled 4752239   non-kernel AOT 0   attached-segment steps 135
+[perf] aot: attaches=1 enters=65330 evictions=0   disk writes 71   CS:IP=1000:37C8

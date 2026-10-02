@@ -1,0 +1,870 @@
+
+microDOS for Pico 2 (Pimoroni Pico Plus 2)
+  clk_sys: 300 MHz (raised; PSRAM retimed)
+  psram:   8192 KiB (sdk available=1)
+  guest:   1024 KiB at 1105A000 (PSRAM, page check ok), DOS memory 640 KiB
+  disk:    360 KiB image copied from flash to PSRAM (writes are lost at reset)
+  kernel:  MSDOS.SYS 16690 bytes
+  aot:     MSDOS.SYS kernel (6099 compiled, 1 holes) attached
+  aot:     DOS2TEST.COM (1140 compiled, 0 holes)
+  config:  code SRAM (copy_to_ram), block cache OFF, runtime JIT ON
+  keys:    Ctrl+] -> M20.2.1 tier/JIT statistics (boot + interval)
+
+MS-DOS version 2.00
+Copyright 1981,82,83 Microsoft Corp.
+
+Command v. 2.02
+Current date is Tue  3-08-1983
+Enter new date: 
+Current time is 12:00:00.00
+Enter new time: 
+
+A>
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT ON, guest PSRAM
+[perf] --- since boot ---
+[perf] wall     0.077 s   in-guest-loop     0.077 s
+[perf] active   0.048 s   idle-sleep 0.027 s   console-out 0.001 s   input-wait 0.000 s   disk 0.002 s
+[perf] instructions 200000   active 4.177 MIPS
+[perf] tiers: static-aot 163480 (81.7%)   jit-native 31305 (15.7%)   interpreted 5215 (2.6%)
+[perf] interpreted split: bios 4105   other 1110
+[perf] jit-owned 32374 (fallback interpreted 1069)   cache h/m/i/f 0/0/0/0   idle-sleeps 53
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.077 s   in-guest-loop     0.077 s
+[perf] active   0.048 s   idle-sleep 0.027 s   console-out 0.001 s   input-wait 0.000 s   disk 0.002 s
+[perf] instructions 200000   active 4.177 MIPS
+[perf] tiers: static-aot 163480 (81.7%)   jit-native 31305 (15.7%)   interpreted 5215 (2.6%)
+[perf] interpreted split: bios 4105   other 1110
+[perf] jit-owned 32374 (fallback interpreted 1069)   cache h/m/i/f 0/0/0/0   idle-sleeps 53
+[perf] aot: kernel compiled 163480   non-kernel AOT 0   attached-segment steps 41
+[perf] aot: attaches=1 enters=2134 evictions=0   disk writes 0   CS:IP=1000:1028
+[jit] --- since boot ---
+[jit] native=31305 fallback=1069 control=18 entry=74 compile=60 hit=14 miss=652 return=26 cs-exit=59 stop=0
+[jit] fallback-reason compile=0 budget=0 zero=33 cold=592   invalid=28 flush=0 boundary=625 bios-bypass=4105
+[jit] resident=2/31236 generic=0/0 cfg=0/0 cfg-edges=0   code=4386/24576 B
+[jit] exit histogram: zero=33 cold=592 return=26 cs-change=59
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~      86  9D1F:0217 op=BA -> 9D1F:0217  cold
+[jit]   ~      86  9D1F:021A op=B4 -> 9D1F:021A  cold
+[jit]   ~      86  9D1F:021C op=CD -> 9D1F:021C  cold
+[jit]   ~      86  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~      85  9D1F:01F1 op=83 -> 9D1F:01F1  cold
+[jit]   ~      85  9D1F:01F6 op=74 -> 9D1F:01F6  cold
+[jit]   ~      85  9D1F:0215 op=0E -> 9D1F:0215  cold
+[jit]   ~      85  9D1F:0216 op=1F -> 9D1F:0216  cold
+[jit] --- since previous Ctrl+] ---
+[jit] native=31305 fallback=1069 control=18 entry=74 compile=60 hit=14 miss=652 return=26 cs-exit=59 stop=0
+[jit] fallback-reason compile=0 budget=0 zero=33 cold=592   invalid=28 flush=0 boundary=625 bios-bypass=4105
+[jit] resident=2/31236 generic=0/0 cfg=0/0 cfg-edges=0   code=4386/24576 B
+[jit] exit histogram: zero=33 cold=592 return=26 cs-change=59
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~      86  9D1F:0217 op=BA -> 9D1F:0217  cold
+[jit]   ~      86  9D1F:021A op=B4 -> 9D1F:021A  cold
+[jit]   ~      86  9D1F:021C op=CD -> 9D1F:021C  cold
+[jit]   ~      86  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~      85  9D1F:01F1 op=83 -> 9D1F:01F1  cold
+[jit]   ~      85  9D1F:01F6 op=74 -> 9D1F:01F6  cold
+[jit]   ~      85  9D1F:0215 op=0E -> 9D1F:0215  cold
+[jit]   ~      85  9D1F:0216 op=1F -> 9D1F:0216  cold
+MDSTRESS 1
+
+microDOS ENGINE STRESS LAB v2
+Deterministic workload for interpreter/cache/AOT/JIT profiling.
+Modes: MDSTRESS | MDSTRESS /S | MDSTRESS 1..9
+[MDSTRESS] CS=0x14CB
+[MDSTRESS] single phase = 1
+
+[01/09] ALU + FLAGS + SHIFT MIXER
+
+MDSTRESS complete. deterministic checksum = 0xC40C
+Return to COMMAND.COM.
+
+A>
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT ON, guest PSRAM
+[perf] --- since boot ---
+[perf] wall     2.906 s   in-guest-loop     2.894 s
+[perf] active   2.533 s   idle-sleep 0.356 s   console-out 0.003 s   input-wait 0.000 s   disk 0.002 s
+[perf] instructions 3200000   active 1.263 MIPS
+[perf] tiers: static-aot 387407 (12.1%)   jit-native 138414 (4.3%)   interpreted 2674179 (83.6%)
+[perf] interpreted split: bios 10173   other 2664006
+[perf] jit-owned 2802375 (fallback interpreted 2663961)   cache h/m/i/f 0/0/0/0   idle-sleeps 712
+[perf] --- since previous Ctrl+] ---
+[perf] wall     2.829 s   in-guest-loop     2.817 s
+[perf] active   2.485 s   idle-sleep 0.330 s   console-out 0.002 s   input-wait 0.000 s   disk 0.001 s
+[perf] instructions 3000000   active 1.207 MIPS
+[perf] tiers: static-aot 223927 (7.5%)   jit-native 107109 (3.6%)   interpreted 2668964 (89.0%)
+[perf] interpreted split: bios 6068   other 2662896
+[perf] jit-owned 2770001 (fallback interpreted 2662892)   cache h/m/i/f 0/0/0/0   idle-sleeps 659
+[perf] aot: kernel compiled 387407   non-kernel AOT 0   attached-segment steps 45
+[perf] aot: attaches=1 enters=5230 evictions=0   disk writes 0   CS:IP=1000:104C
+[jit] --- since boot ---
+[jit] native=138414 fallback=2663961 control=53 entry=230008 compile=162 hit=229866 miss=1366 return=63541 cs-exit=118 stop=0
+[jit] fallback-reason compile=0 budget=20 zero=166431 cold=1204   invalid=83 flush=0 boundary=167655 bios-bypass=10173
+[jit] resident=3/46854 generic=0/0 cfg=0/0 cfg-edges=0   code=11806/24576 B
+[jit] exit histogram: budget=20 zero=166431 cold=1204 return=63541 cs-change=118
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~    9989  14CB:0243 op=D1 -> 14CB:0243  zero
+[jit]   ~     798  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~   50770  14CB:023B op=13 -> 14CB:023B  zero
+[jit]   ~   25382  14CB:0249 op=74 -> 14CB:0249  zero
+[jit]   ~   25527  14CB:0245 op=F7 -> 14CB:0245  zero
+[jit]   ~   35471  14CB:0241 op=D1 -> 14CB:0241  zero
+[jit]   ~     797  9D1F:021C op=CD -> 9D1F:021C  cold
+[jit]   ~   20031  14CB:024D op=75 -> 14CB:024D  zero
+[jit] --- since previous Ctrl+] ---
+[jit] native=107109 fallback=2662892 control=35 entry=229934 compile=102 hit=229852 miss=714 return=63515 cs-exit=59 stop=0
+[jit] fallback-reason compile=0 budget=20 zero=166398 cold=612   invalid=55 flush=0 boundary=167030 bios-bypass=6068
+[jit] resident=1/15618 generic=0/0 cfg=0/0 cfg-edges=0   code=11806/24576 B
+[jit] exit histogram: budget=20 zero=166398 cold=612 return=63515 cs-change=59
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~    9989  14CB:0243 op=D1 -> 14CB:0243  zero
+[jit]   ~     712  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~   50770  14CB:023B op=13 -> 14CB:023B  zero
+[jit]   ~   25382  14CB:0249 op=74 -> 14CB:0249  zero
+[jit]   ~   25527  14CB:0245 op=F7 -> 14CB:0245  zero
+[jit]   ~   35471  14CB:0241 op=D1 -> 14CB:0241  zero
+[jit]   ~     711  9D1F:021C op=CD -> 9D1F:021C  cold
+[jit]   ~   20031  14CB:024D op=75 -> 14CB:024D  zero
+
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT ON, guest PSRAM
+[perf] --- since boot ---
+[perf] wall     3.563 s   in-guest-loop     3.539 s
+[perf] active   2.584 s   idle-sleep 0.950 s   console-out 0.003 s   input-wait 0.000 s   disk 0.002 s
+[perf] instructions 3400000   active 1.316 MIPS
+[perf] tiers: static-aot 581999 (17.1%)   jit-native 138414 (4.1%)   interpreted 2679587 (78.8%)
+[perf] interpreted split: bios 15581   other 2664006
+[perf] jit-owned 2802375 (fallback interpreted 2663961)   cache h/m/i/f 0/0/0/0   idle-sleeps 1899
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.657 s   in-guest-loop     0.645 s
+[perf] active   0.051 s   idle-sleep 0.594 s   console-out 0.000 s   input-wait 0.000 s   disk 0.000 s
+[perf] instructions 200000   active 3.891 MIPS
+[perf] tiers: static-aot 194592 (97.3%)   jit-native 0 (0.0%)   interpreted 5408 (2.7%)
+[perf] interpreted split: bios 5408   other 0
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1187
+[perf] aot: kernel compiled 581999   non-kernel AOT 0   attached-segment steps 45
+[perf] aot: attaches=1 enters=7935 evictions=0   disk writes 0   CS:IP=1000:059D
+[jit] --- since boot ---
+[jit] native=138414 fallback=2663961 control=53 entry=230008 compile=162 hit=229866 miss=1366 return=63541 cs-exit=118 stop=0
+[jit] fallback-reason compile=0 budget=20 zero=166431 cold=1204   invalid=83 flush=0 boundary=167655 bios-bypass=15581
+[jit] resident=3/46854 generic=0/0 cfg=0/0 cfg-edges=0   code=11806/24576 B
+[jit] exit histogram: budget=20 zero=166431 cold=1204 return=63541 cs-change=118
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~    9989  14CB:0243 op=D1 -> 14CB:0243  zero
+[jit]   ~     798  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~   50770  14CB:023B op=13 -> 14CB:023B  zero
+[jit]   ~   25382  14CB:0249 op=74 -> 14CB:0249  zero
+[jit]   ~   25527  14CB:0245 op=F7 -> 14CB:0245  zero
+[jit]   ~   35471  14CB:0241 op=D1 -> 14CB:0241  zero
+[jit]   ~     797  9D1F:021C op=CD -> 9D1F:021C  cold
+[jit]   ~   20031  14CB:024D op=75 -> 14CB:024D  zero
+[jit] --- since previous Ctrl+] ---
+[jit] native=0 fallback=0 control=0 entry=0 compile=0 hit=0 miss=0 return=0 cs-exit=0 stop=0
+[jit] fallback-reason compile=0 budget=0 zero=0 cold=0   invalid=0 flush=0 boundary=0 bios-bypass=5408
+[jit] resident=0/0 generic=0/0 cfg=0/0 cfg-edges=0   code=11806/24576 B
+[jit] exit histogram:
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+MDSTRESS 2
+
+microDOS ENGINE STRESS LAB v2
+Deterministic workload for interpreter/cache/AOT/JIT profiling.
+Modes: MDSTRESS | MDSTRESS /S | MDSTRESS 1..9
+[MDSTRESS] CS=0x14CB
+[MDSTRESS] single phase = 2
+
+[02/09] MEMORY ADDRESS + STORE FABRIC
+
+MDSTRESS complete. deterministic checksum = 0xB957
+Return to COMMAND.COM.
+
+A>
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT ON, guest PSRAM
+[perf] --- since boot ---
+[perf] wall     4.751 s   in-guest-loop     4.718 s
+[perf] active   3.191 s   idle-sleep 1.519 s   console-out 0.005 s   input-wait 0.000 s   disk 0.003 s
+[perf] instructions 4400000   active 1.379 MIPS
+[perf] tiers: static-aot 900209 (20.5%)   jit-native 285606 (6.5%)   interpreted 3214185 (73.0%)
+[perf] interpreted split: bios 24269   other 3189916
+[perf] jit-owned 3475475 (fallback interpreted 3189869)   cache h/m/i/f 0/0/0/0   idle-sleeps 3038
+[perf] --- since previous Ctrl+] ---
+[perf] wall     1.188 s   in-guest-loop     1.179 s
+[perf] active   0.606 s   idle-sleep 0.570 s   console-out 0.002 s   input-wait 0.000 s   disk 0.001 s
+[perf] instructions 1000000   active 1.649 MIPS
+[perf] tiers: static-aot 318210 (31.8%)   jit-native 147192 (14.7%)   interpreted 534598 (53.5%)
+[perf] interpreted split: bios 8688   other 525910
+[perf] jit-owned 673100 (fallback interpreted 525908)   cache h/m/i/f 0/0/0/0   idle-sleeps 1139
+[perf] aot: kernel compiled 900209   non-kernel AOT 0   attached-segment steps 47
+[perf] aot: attaches=1 enters=12339 evictions=0   disk writes 0   CS:IP=1000:1002
+[jit] --- since boot ---
+[jit] native=285606 fallback=3189869 control=87 entry=312185 compile=259 hit=311947 miss=2032 return=112859 cs-exit=177 stop=0
+[jit] fallback-reason compile=0 budget=21 zero=199269 cold=1773   invalid=149 flush=0 boundary=201063 bios-bypass=24269
+[jit] resident=4/62472 generic=0/0 cfg=0/0 cfg-edges=0   code=18962/24576 B
+[jit] exit histogram: budget=21 zero=199269 cold=1773 return=112859 cs-change=177
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~   10614  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~   17539  14CB:0295 op=89 -> 14CB:0295  zero
+[jit]   ~   50770  14CB:023B op=13 -> 14CB:023B  zero
+[jit]   ~   25382  14CB:0249 op=74 -> 14CB:0249  zero
+[jit]   ~   25527  14CB:0245 op=F7 -> 14CB:0245  zero
+[jit]   ~   35471  14CB:0241 op=D1 -> 14CB:0241  zero
+[jit]   ~   17669  14CB:02A3 op=8B -> 14CB:02A3  zero
+[jit]   ~   20031  14CB:024D op=75 -> 14CB:024D  zero
+[jit] --- since previous Ctrl+] ---
+[jit] native=147192 fallback=525908 control=34 entry=82177 compile=97 hit=82081 miss=666 return=49318 cs-exit=59 stop=0
+[jit] fallback-reason compile=0 budget=1 zero=32838 cold=569   invalid=66 flush=0 boundary=33408 bios-bypass=8688
+[jit] resident=1/15618 generic=0/0 cfg=0/0 cfg-edges=0   code=18962/24576 B
+[jit] exit histogram: budget=1 zero=32838 cold=569 return=49318 cs-change=59
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~    9816  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~   17539  14CB:0295 op=89 -> 14CB:0295  zero
+[jit]   ~   17669  14CB:02A3 op=8B -> 14CB:02A3  zero
+
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT ON, guest PSRAM
+[perf] --- since boot ---
+[perf] wall     5.490 s   in-guest-loop     5.445 s
+[perf] active   3.242 s   idle-sleep 2.195 s   console-out 0.005 s   input-wait 0.000 s   disk 0.003 s
+[perf] instructions 4600000   active 1.419 MIPS
+[perf] tiers: static-aot 1094797 (23.8%)   jit-native 285606 (6.2%)   interpreted 3219597 (70.0%)
+[perf] interpreted split: bios 29677   other 3189920
+[perf] jit-owned 3475475 (fallback interpreted 3189869)   cache h/m/i/f 0/0/0/0   idle-sleeps 4390
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.738 s   in-guest-loop     0.727 s
+[perf] active   0.051 s   idle-sleep 0.676 s   console-out 0.000 s   input-wait 0.000 s   disk 0.000 s
+[perf] instructions 200000   active 3.893 MIPS
+[perf] tiers: static-aot 194588 (97.3%)   jit-native 0 (0.0%)   interpreted 5412 (2.7%)
+[perf] interpreted split: bios 5408   other 4
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1352
+[perf] aot: kernel compiled 1094797   non-kernel AOT 0   attached-segment steps 51
+[perf] aot: attaches=1 enters=15048 evictions=0   disk writes 0   CS:IP=1000:105A
+[jit] --- since boot ---
+[jit] native=285606 fallback=3189869 control=87 entry=312185 compile=259 hit=311947 miss=2032 return=112859 cs-exit=177 stop=0
+[jit] fallback-reason compile=0 budget=21 zero=199269 cold=1773   invalid=149 flush=0 boundary=201063 bios-bypass=29677
+[jit] resident=4/62472 generic=0/0 cfg=0/0 cfg-edges=0   code=18962/24576 B
+[jit] exit histogram: budget=21 zero=199269 cold=1773 return=112859 cs-change=177
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~   10614  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~   17539  14CB:0295 op=89 -> 14CB:0295  zero
+[jit]   ~   50770  14CB:023B op=13 -> 14CB:023B  zero
+[jit]   ~   25382  14CB:0249 op=74 -> 14CB:0249  zero
+[jit]   ~   25527  14CB:0245 op=F7 -> 14CB:0245  zero
+[jit]   ~   35471  14CB:0241 op=D1 -> 14CB:0241  zero
+[jit]   ~   17669  14CB:02A3 op=8B -> 14CB:02A3  zero
+[jit]   ~   20031  14CB:024D op=75 -> 14CB:024D  zero
+[jit] --- since previous Ctrl+] ---
+[jit] native=0 fallback=0 control=0 entry=0 compile=0 hit=0 miss=0 return=0 cs-exit=0 stop=0
+[jit] fallback-reason compile=0 budget=0 zero=0 cold=0   invalid=0 flush=0 boundary=0 bios-bypass=5408
+[jit] resident=0/0 generic=0/0 cfg=0/0 cfg-edges=0   code=18962/24576 B
+[jit] exit histogram:
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+MDSTRESS 3
+
+microDOS ENGINE STRESS LAB v2
+Deterministic workload for interpreter/cache/AOT/JIT profiling.
+Modes: MDSTRESS | MDSTRESS /S | MDSTRESS 1..9
+[MDSTRESS] CS=0x14CB
+[MDSTRESS] single phase = 3
+
+[03/09] REP STRING DMA / COMPARE / SCAN
+
+MDSTRESS complete. deterministic checksum = 0x3A57
+Return to COMMAND.COM.
+
+A>
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT ON, guest PSRAM
+[perf] --- since boot ---
+[perf] wall     6.435 s   in-guest-loop     6.381 s
+[perf] active   3.422 s   idle-sleep 2.949 s   console-out 0.007 s   input-wait 0.000 s   disk 0.003 s
+[perf] instructions 5000000   active 1.461 MIPS
+[perf] tiers: static-aot 1466741 (29.3%)   jit-native 301407 (6.0%)   interpreted 3231852 (64.6%)
+[perf] interpreted split: bios 39859   other 3191993
+[perf] jit-owned 3493349 (fallback interpreted 3191942)   cache h/m/i/f 0/0/0/0   idle-sleeps 5897
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.946 s   in-guest-loop     0.936 s
+[perf] active   0.180 s   idle-sleep 0.754 s   console-out 0.002 s   input-wait 0.000 s   disk 0.001 s
+[perf] instructions 400000   active 2.227 MIPS
+[perf] tiers: static-aot 371944 (93.0%)   jit-native 15801 (4.0%)   interpreted 12255 (3.1%)
+[perf] interpreted split: bios 10182   other 2073
+[perf] jit-owned 17874 (fallback interpreted 2073)   cache h/m/i/f 0/0/0/0   idle-sleeps 1507
+[perf] aot: kernel compiled 1466741   non-kernel AOT 0   attached-segment steps 51
+[perf] aot: attaches=1 enters=20198 evictions=0   disk writes 0   CS:IP=0800:0110
+[jit] --- since boot ---
+[jit] native=301407 fallback=3191942 control=122 entry=312387 compile=349 hit=312059 miss=2781 return=112948 cs-exit=236 stop=0
+[jit] fallback-reason compile=0 budget=21 zero=199360 cold=2432   invalid=210 flush=1 boundary=201813 bios-bypass=39859
+[jit] resident=5/78090 generic=0/0 cfg=0/0 cfg-edges=0   code=594/24576 B
+[jit] exit histogram: budget=21 zero=199360 cold=2432 return=112948 cs-change=236
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~   11424  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~   17539  14CB:0295 op=89 -> 14CB:0295  zero
+[jit]   ~   50770  14CB:023B op=13 -> 14CB:023B  zero
+[jit]   ~   25382  14CB:0249 op=74 -> 14CB:0249  zero
+[jit]   ~   25527  14CB:0245 op=F7 -> 14CB:0245  zero
+[jit]   ~   35471  14CB:0241 op=D1 -> 14CB:0241  zero
+[jit]   ~   17669  14CB:02A3 op=8B -> 14CB:02A3  zero
+[jit]   ~   20031  14CB:024D op=75 -> 14CB:024D  zero
+[jit] --- since previous Ctrl+] ---
+[jit] native=15801 fallback=2073 control=35 entry=202 compile=90 hit=112 miss=749 return=89 cs-exit=59 stop=0
+[jit] fallback-reason compile=0 budget=0 zero=91 cold=659   invalid=61 flush=1 boundary=750 bios-bypass=10182
+[jit] resident=1/15618 generic=0/0 cfg=0/0 cfg-edges=0   code=594/24576 B
+[jit] exit histogram: zero=91 cold=659 return=89 cs-change=59
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~     810  9D1F:021C op=CD -> 1000:058D  cs-change
+
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT ON, guest PSRAM
+[perf] --- since boot ---
+[perf] wall     7.173 s   in-guest-loop     7.108 s
+[perf] active   3.473 s   idle-sleep 3.625 s   console-out 0.007 s   input-wait 0.000 s   disk 0.003 s
+[perf] instructions 5200000   active 1.497 MIPS
+[perf] tiers: static-aot 1661335 (31.9%)   jit-native 301407 (5.8%)   interpreted 3237258 (62.3%)
+[perf] interpreted split: bios 45265   other 3191993
+[perf] jit-owned 3493349 (fallback interpreted 3191942)   cache h/m/i/f 0/0/0/0   idle-sleeps 7249
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.738 s   in-guest-loop     0.727 s
+[perf] active   0.051 s   idle-sleep 0.676 s   console-out 0.000 s   input-wait 0.000 s   disk 0.000 s
+[perf] instructions 200000   active 3.894 MIPS
+[perf] tiers: static-aot 194594 (97.3%)   jit-native 0 (0.0%)   interpreted 5406 (2.7%)
+[perf] interpreted split: bios 5406   other 0
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1352
+[perf] aot: kernel compiled 1661335   non-kernel AOT 0   attached-segment steps 51
+[perf] aot: attaches=1 enters=22901 evictions=0   disk writes 0   CS:IP=1000:3836
+[jit] --- since boot ---
+[jit] native=301407 fallback=3191942 control=122 entry=312387 compile=349 hit=312059 miss=2781 return=112948 cs-exit=236 stop=0
+[jit] fallback-reason compile=0 budget=21 zero=199360 cold=2432   invalid=210 flush=1 boundary=201813 bios-bypass=45265
+[jit] resident=5/78090 generic=0/0 cfg=0/0 cfg-edges=0   code=594/24576 B
+[jit] exit histogram: budget=21 zero=199360 cold=2432 return=112948 cs-change=236
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~   11424  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~   17539  14CB:0295 op=89 -> 14CB:0295  zero
+[jit]   ~   50770  14CB:023B op=13 -> 14CB:023B  zero
+[jit]   ~   25382  14CB:0249 op=74 -> 14CB:0249  zero
+[jit]   ~   25527  14CB:0245 op=F7 -> 14CB:0245  zero
+[jit]   ~   35471  14CB:0241 op=D1 -> 14CB:0241  zero
+[jit]   ~   17669  14CB:02A3 op=8B -> 14CB:02A3  zero
+[jit]   ~   20031  14CB:024D op=75 -> 14CB:024D  zero
+[jit] --- since previous Ctrl+] ---
+[jit] native=0 fallback=0 control=0 entry=0 compile=0 hit=0 miss=0 return=0 cs-exit=0 stop=0
+[jit] fallback-reason compile=0 budget=0 zero=0 cold=0   invalid=0 flush=0 boundary=0 bios-bypass=5406
+[jit] resident=0/0 generic=0/0 cfg=0/0 cfg-edges=0   code=594/24576 B
+[jit] exit histogram:
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+MDSTRESS 4
+
+microDOS ENGINE STRESS LAB v2
+Deterministic workload for interpreter/cache/AOT/JIT profiling.
+Modes: MDSTRESS | MDSTRESS /S | MDSTRESS 1..9
+[MDSTRESS] CS=0x14CB
+[MDSTRESS] single phase = 4
+
+[04/09] CALL/RET + STACK CONTROL GRAPH
+
+MDSTRESS complete. deterministic checksum = 0x0163
+Return to COMMAND.COM.
+
+A>
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT ON, guest PSRAM
+[perf] --- since boot ---
+[perf] wall    12.468 s   in-guest-loop    12.393 s
+[perf] active   8.307 s   idle-sleep 4.073 s   console-out 0.009 s   input-wait 0.000 s   disk 0.004 s
+[perf] instructions 11800000   active 1.420 MIPS
+[perf] tiers: static-aot 1944837 (16.5%)   jit-native 317184 (2.7%)   interpreted 9537979 (80.8%)
+[perf] interpreted split: bios 52990   other 9484989
+[perf] jit-owned 9802122 (fallback interpreted 9484938)   cache h/m/i/f 0/0/0/0   idle-sleeps 8145
+[perf] --- since previous Ctrl+] ---
+[perf] wall     5.295 s   in-guest-loop     5.285 s
+[perf] active   4.834 s   idle-sleep 0.448 s   console-out 0.002 s   input-wait 0.000 s   disk 0.001 s
+[perf] instructions 6600000   active 1.365 MIPS
+[perf] tiers: static-aot 283502 (4.3%)   jit-native 15777 (0.2%)   interpreted 6300721 (95.5%)
+[perf] interpreted split: bios 7725   other 6292996
+[perf] jit-owned 6308773 (fallback interpreted 6292996)   cache h/m/i/f 0/0/0/0   idle-sleeps 896
+[perf] aot: kernel compiled 1944837   non-kernel AOT 0   attached-segment steps 51
+[perf] aot: attaches=1 enters=26821 evictions=0   disk writes 0   CS:IP=0800:0102
+[jit] --- since boot ---
+[jit] native=317184 fallback=9484938 control=184 entry=705777 compile=453 hit=705345 miss=3606 return=113044 cs-exit=295 stop=0
+[jit] fallback-reason compile=0 budget=21 zero=592632 cold=3153   invalid=258 flush=1 boundary=595806 bios-bypass=52990
+[jit] resident=6/93708 generic=0/0 cfg=0/0 cfg-edges=0   code=7466/24576 B
+[jit] exit histogram: budget=21 zero=592632 cold=3153 return=113044 cs-change=295
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~  115378  14CB:015F op=50 -> 14CB:015F  zero
+[jit]   ~  115375  14CB:0165 op=5A -> 14CB:0165  zero
+[jit]   ~   50770  14CB:023B op=13 -> 14CB:023B  zero
+[jit]   ~   55050  14CB:0161 op=52 -> 14CB:0161  zero
+[jit]   ~   55050  14CB:0167 op=58 -> 14CB:0167  zero
+[jit]   ~   35824  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~  115370  14CB:0179 op=13 -> 14CB:0179  zero
+[jit]   ~   55050  14CB:017D op=D1 -> 14CB:017D  zero
+[jit] --- since previous Ctrl+] ---
+[jit] native=15777 fallback=6292996 control=62 entry=393390 compile=104 hit=393286 miss=825 return=96 cs-exit=59 stop=0
+[jit] fallback-reason compile=0 budget=0 zero=393272 cold=721   invalid=48 flush=0 boundary=393993 bios-bypass=7725
+[jit] resident=1/15618 generic=0/0 cfg=0/0 cfg-edges=0   code=7466/24576 B
+[jit] exit histogram: zero=393272 cold=721 return=96 cs-change=59
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~  115378  14CB:015F op=50 -> 14CB:015F  zero
+[jit]   ~  115375  14CB:0165 op=5A -> 14CB:0165  zero
+[jit]   ~   55050  14CB:0161 op=52 -> 14CB:0161  zero
+[jit]   ~   55050  14CB:0167 op=58 -> 14CB:0167  zero
+[jit]   ~   24400  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~  115370  14CB:0179 op=13 -> 14CB:0179  zero
+[jit]   ~   55050  14CB:017D op=D1 -> 14CB:017D  zero
+
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT ON, guest PSRAM
+[perf] --- since boot ---
+[perf] wall    13.207 s   in-guest-loop    13.121 s
+[perf] active   8.359 s   idle-sleep 4.749 s   console-out 0.009 s   input-wait 0.000 s   disk 0.004 s
+[perf] instructions 12000000   active 1.436 MIPS
+[perf] tiers: static-aot 2139427 (17.8%)   jit-native 317184 (2.6%)   interpreted 9543389 (79.5%)
+[perf] interpreted split: bios 58397   other 9484992
+[perf] jit-owned 9802122 (fallback interpreted 9484938)   cache h/m/i/f 0/0/0/0   idle-sleeps 9497
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.739 s   in-guest-loop     0.727 s
+[perf] active   0.051 s   idle-sleep 0.676 s   console-out 0.000 s   input-wait 0.000 s   disk 0.000 s
+[perf] instructions 200000   active 3.894 MIPS
+[perf] tiers: static-aot 194590 (97.3%)   jit-native 0 (0.0%)   interpreted 5410 (2.7%)
+[perf] interpreted split: bios 5407   other 3
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1352
+[perf] aot: kernel compiled 2139427   non-kernel AOT 0   attached-segment steps 54
+[perf] aot: attaches=1 enters=29528 evictions=0   disk writes 0   CS:IP=1000:19B0
+[jit] --- since boot ---
+[jit] native=317184 fallback=9484938 control=184 entry=705777 compile=453 hit=705345 miss=3606 return=113044 cs-exit=295 stop=0
+[jit] fallback-reason compile=0 budget=21 zero=592632 cold=3153   invalid=258 flush=1 boundary=595806 bios-bypass=58397
+[jit] resident=6/93708 generic=0/0 cfg=0/0 cfg-edges=0   code=7466/24576 B
+[jit] exit histogram: budget=21 zero=592632 cold=3153 return=113044 cs-change=295
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~  115378  14CB:015F op=50 -> 14CB:015F  zero
+[jit]   ~  115375  14CB:0165 op=5A -> 14CB:0165  zero
+[jit]   ~   50770  14CB:023B op=13 -> 14CB:023B  zero
+[jit]   ~   55050  14CB:0161 op=52 -> 14CB:0161  zero
+[jit]   ~   55050  14CB:0167 op=58 -> 14CB:0167  zero
+[jit]   ~   35824  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~  115370  14CB:0179 op=13 -> 14CB:0179  zero
+[jit]   ~   55050  14CB:017D op=D1 -> 14CB:017D  zero
+[jit] --- since previous Ctrl+] ---
+[jit] native=0 fallback=0 control=0 entry=0 compile=0 hit=0 miss=0 return=0 cs-exit=0 stop=0
+[jit] fallback-reason compile=0 budget=0 zero=0 cold=0   invalid=0 flush=0 boundary=0 bios-bypass=5407
+[jit] resident=0/0 generic=0/0 cfg=0/0 cfg-edges=0   code=7466/24576 B
+[jit] exit histogram:
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+MDSTRESS 5
+
+microDOS ENGINE STRESS LAB v2
+Deterministic workload for interpreter/cache/AOT/JIT profiling.
+Modes: MDSTRESS | MDSTRESS /S | MDSTRESS 1..9
+[MDSTRESS] CS=0x14CB
+[MDSTRESS] single phase = 5
+
+[05/09] INTEGER MUL/DIV + ROTATE PIPELINE
+
+MDSTRESS complete. deterministic checksum = 0xFE5A
+Return to COMMAND.COM.
+
+A>
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT ON, guest PSRAM
+[perf] --- since boot ---
+[perf] wall    14.943 s   in-guest-loop    14.847 s
+[perf] active   9.493 s   idle-sleep 5.339 s   console-out 0.011 s   input-wait 0.000 s   disk 0.005 s
+[perf] instructions 13400000   active 1.412 MIPS
+[perf] tiers: static-aot 2464620 (18.4%)   jit-native 332933 (2.5%)   interpreted 10602447 (79.1%)
+[perf] interpreted split: bios 67285   other 10535162
+[perf] jit-owned 10868034 (fallback interpreted 10535101)   cache h/m/i/f 0/0/0/0   idle-sleeps 10677
+[perf] --- since previous Ctrl+] ---
+[perf] wall     1.737 s   in-guest-loop     1.727 s
+[perf] active   1.134 s   idle-sleep 0.590 s   console-out 0.002 s   input-wait 0.000 s   disk 0.001 s
+[perf] instructions 1400000   active 1.234 MIPS
+[perf] tiers: static-aot 325193 (23.2%)   jit-native 15749 (1.1%)   interpreted 1059058 (75.6%)
+[perf] interpreted split: bios 8888   other 1050170
+[perf] jit-owned 1065912 (fallback interpreted 1050163)   cache h/m/i/f 0/0/0/0   idle-sleeps 1180
+[perf] aot: kernel compiled 2464620   non-kernel AOT 0   attached-segment steps 61
+[perf] aot: attaches=1 enters=34037 evictions=0   disk writes 0   CS:IP=1000:0689
+[jit] --- since boot ---
+[jit] native=332933 fallback=10535101 control=220 entry=771463 compile=548 hit=770936 miss=4348 return=113110 cs-exit=354 stop=0
+[jit] fallback-reason compile=0 budget=21 zero=658230 cold=3800   invalid=321 flush=1 boundary=662051 bios-bypass=67285
+[jit] resident=7/109326 generic=0/0 cfg=0/0 cfg-edges=0   code=14148/24576 B
+[jit] exit histogram: budget=21 zero=658230 cold=3800 return=113110 cs-change=354
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~  115378  14CB:015F op=50 -> 14CB:015F  zero
+[jit]   ~  115375  14CB:0165 op=5A -> 14CB:0165  zero
+[jit]   ~   64250  14CB:03A0 op=D1 -> 14CB:03A0  zero
+[jit]   ~   55383  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~   63242  14CB:0399 op=F7 -> 14CB:0399  zero
+[jit]   ~   74364  14CB:0397 op=F7 -> 14CB:0397  zero
+[jit]   ~  115370  14CB:0179 op=13 -> 14CB:0179  zero
+[jit]   ~   60810  14CB:03A2 op=D1 -> 14CB:03A2  zero
+[jit] --- since previous Ctrl+] ---
+[jit] native=15749 fallback=1050163 control=36 entry=65686 compile=95 hit=65591 miss=742 return=66 cs-exit=59 stop=0
+[jit] fallback-reason compile=0 budget=0 zero=65598 cold=647   invalid=63 flush=0 boundary=66245 bios-bypass=8888
+[jit] resident=1/15618 generic=0/0 cfg=0/0 cfg-edges=0   code=14148/24576 B
+[jit] exit histogram: zero=65598 cold=647 return=66 cs-change=59
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~   64250  14CB:03A0 op=D1 -> 14CB:03A0  zero
+[jit]   ~   19559  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~   63242  14CB:0399 op=F7 -> 14CB:0399  zero
+[jit]   ~   74364  14CB:0397 op=F7 -> 14CB:0397  zero
+[jit]   ~   60810  14CB:03A2 op=D1 -> 14CB:03A2  zero
+
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT ON, guest PSRAM
+[perf] --- since boot ---
+[perf] wall    15.682 s   in-guest-loop    15.574 s
+[perf] active   9.544 s   idle-sleep 6.014 s   console-out 0.011 s   input-wait 0.000 s   disk 0.005 s
+[perf] instructions 13600000   active 1.425 MIPS
+[perf] tiers: static-aot 2659209 (19.6%)   jit-native 332933 (2.4%)   interpreted 10607858 (78.0%)
+[perf] interpreted split: bios 72689   other 10535169
+[perf] jit-owned 10868034 (fallback interpreted 10535101)   cache h/m/i/f 0/0/0/0   idle-sleeps 12028
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.738 s   in-guest-loop     0.727 s
+[perf] active   0.051 s   idle-sleep 0.676 s   console-out 0.000 s   input-wait 0.000 s   disk 0.000 s
+[perf] instructions 200000   active 3.893 MIPS
+[perf] tiers: static-aot 194589 (97.3%)   jit-native 0 (0.0%)   interpreted 5411 (2.7%)
+[perf] interpreted split: bios 5404   other 7
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1351
+[perf] aot: kernel compiled 2659209   non-kernel AOT 0   attached-segment steps 68
+[perf] aot: attaches=1 enters=36747 evictions=0   disk writes 0   CS:IP=1000:37E2
+[jit] --- since boot ---
+[jit] native=332933 fallback=10535101 control=220 entry=771463 compile=548 hit=770936 miss=4348 return=113110 cs-exit=354 stop=0
+[jit] fallback-reason compile=0 budget=21 zero=658230 cold=3800   invalid=321 flush=1 boundary=662051 bios-bypass=72689
+[jit] resident=7/109326 generic=0/0 cfg=0/0 cfg-edges=0   code=14148/24576 B
+[jit] exit histogram: budget=21 zero=658230 cold=3800 return=113110 cs-change=354
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~  115378  14CB:015F op=50 -> 14CB:015F  zero
+[jit]   ~  115375  14CB:0165 op=5A -> 14CB:0165  zero
+[jit]   ~   64250  14CB:03A0 op=D1 -> 14CB:03A0  zero
+[jit]   ~   55383  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~   63242  14CB:0399 op=F7 -> 14CB:0399  zero
+[jit]   ~   74364  14CB:0397 op=F7 -> 14CB:0397  zero
+[jit]   ~  115370  14CB:0179 op=13 -> 14CB:0179  zero
+[jit]   ~   60810  14CB:03A2 op=D1 -> 14CB:03A2  zero
+[jit] --- since previous Ctrl+] ---
+[jit] native=0 fallback=0 control=0 entry=0 compile=0 hit=0 miss=0 return=0 cs-exit=0 stop=0
+[jit] fallback-reason compile=0 budget=0 zero=0 cold=0   invalid=0 flush=0 boundary=0 bios-bypass=5404
+[jit] resident=0/0 generic=0/0 cfg=0/0 cfg-edges=0   code=14148/24576 B
+[jit] exit histogram:
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+MDSTRESS 6
+
+microDOS ENGINE STRESS LAB v2
+Deterministic workload for interpreter/cache/AOT/JIT profiling.
+Modes: MDSTRESS | MDSTRESS /S | MDSTRESS 1..9
+[MDSTRESS] CS=0x14CB
+[MDSTRESS] single phase = 6
+
+[06/09] CONDITIONAL BRANCH / LFSR FABRIC
+
+MDSTRESS complete. deterministic checksum = 0xFA37
+Return to COMMAND.COM.
+
+A>
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT ON, guest PSRAM
+[perf] --- since boot ---
+[perf] wall    18.860 s   in-guest-loop    18.742 s
+[perf] active  12.222 s   idle-sleep 6.503 s   console-out 0.013 s   input-wait 0.000 s   disk 0.005 s
+[perf] instructions 17000000   active 1.391 MIPS
+[perf] tiers: static-aot 2954903 (17.4%)   jit-native 478709 (2.8%)   interpreted 13566388 (79.8%)
+[perf] interpreted split: bios 80757   other 13485631
+[perf] jit-owned 13964265 (fallback interpreted 13485556)   cache h/m/i/f 0/0/0/0   idle-sleeps 13005
+[perf] --- since previous Ctrl+] ---
+[perf] wall     3.178 s   in-guest-loop     3.168 s
+[perf] active   2.677 s   idle-sleep 0.489 s   console-out 0.002 s   input-wait 0.000 s   disk 0.001 s
+[perf] instructions 3400000   active 1.270 MIPS
+[perf] tiers: static-aot 295694 (8.7%)   jit-native 145776 (4.3%)   interpreted 2958530 (87.0%)
+[perf] interpreted split: bios 8068   other 2950462
+[perf] jit-owned 3096231 (fallback interpreted 2950455)   cache h/m/i/f 0/0/0/0   idle-sleeps 977
+[perf] aot: kernel compiled 2954903   non-kernel AOT 0   attached-segment steps 75
+[perf] aot: attaches=1 enters=40846 evictions=0   disk writes 0   CS:IP=1000:29BD
+[jit] --- since boot ---
+[jit] native=478709 fallback=13485556 control=252 entry=1050245 compile=644 hit=1049630 miss=5113 return=207506 cs-exit=413 stop=0
+[jit] fallback-reason compile=0 budget=29 zero=842596 cold=4469   invalid=378 flush=1 boundary=847094 bios-bypass=80757
+[jit] resident=8/124944 generic=0/0 cfg=0/0 cfg-edges=0   code=20350/24576 B
+[jit] exit histogram: budget=29 zero=842596 cold=4469 return=207506 cs-change=413
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~  115378  14CB:015F op=50 -> 14CB:015F  zero
+[jit]   ~  115375  14CB:0165 op=5A -> 14CB:0165  zero
+[jit]   ~   93138  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~   93137  9D1F:021A op=B4 -> 9D1F:021A  cold
+[jit]   ~  108174  14CB:03FB op=72 -> 14CB:03FB  zero
+[jit]   ~   93137  9D1F:021C op=CD -> 9D1F:021C  cold
+[jit]   ~  115370  14CB:0179 op=13 -> 14CB:0179  zero
+[jit]   ~  117040  14CB:03E8 op=A9 -> 14CB:03E8  zero
+[jit] --- since previous Ctrl+] ---
+[jit] native=145776 fallback=2950455 control=32 entry=278782 compile=96 hit=278694 miss=765 return=94396 cs-exit=59 stop=0
+[jit] fallback-reason compile=0 budget=8 zero=184366 cold=669   invalid=57 flush=0 boundary=185043 bios-bypass=8068
+[jit] resident=1/15618 generic=0/0 cfg=0/0 cfg-edges=0   code=20350/24576 B
+[jit] exit histogram: budget=8 zero=184366 cold=669 return=94396 cs-change=59
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~   37755  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~   93137  9D1F:021A op=B4 -> 9D1F:021A  cold
+[jit]   ~  108174  14CB:03FB op=72 -> 14CB:03FB  zero
+[jit]   ~   93137  9D1F:021C op=CD -> 9D1F:021C  cold
+[jit]   ~  117040  14CB:03E8 op=A9 -> 14CB:03E8  zero
+
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT ON, guest PSRAM
+[perf] --- since boot ---
+[perf] wall    19.598 s   in-guest-loop    19.469 s
+[perf] active  12.273 s   idle-sleep 7.178 s   console-out 0.013 s   input-wait 0.000 s   disk 0.005 s
+[perf] instructions 17200000   active 1.401 MIPS
+[perf] tiers: static-aot 3149497 (18.3%)   jit-native 478709 (2.8%)   interpreted 13571794 (78.9%)
+[perf] interpreted split: bios 86161   other 13485633
+[perf] jit-owned 13964265 (fallback interpreted 13485556)   cache h/m/i/f 0/0/0/0   idle-sleeps 14356
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.738 s   in-guest-loop     0.727 s
+[perf] active   0.051 s   idle-sleep 0.676 s   console-out 0.000 s   input-wait 0.000 s   disk 0.000 s
+[perf] instructions 200000   active 3.894 MIPS
+[perf] tiers: static-aot 194594 (97.3%)   jit-native 0 (0.0%)   interpreted 5406 (2.7%)
+[perf] interpreted split: bios 5404   other 2
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1351
+[perf] aot: kernel compiled 3149497   non-kernel AOT 0   attached-segment steps 77
+[perf] aot: attaches=1 enters=43551 evictions=0   disk writes 0   CS:IP=1000:19BB
+[jit] --- since boot ---
+[jit] native=478709 fallback=13485556 control=252 entry=1050245 compile=644 hit=1049630 miss=5113 return=207506 cs-exit=413 stop=0
+[jit] fallback-reason compile=0 budget=29 zero=842596 cold=4469   invalid=378 flush=1 boundary=847094 bios-bypass=86161
+[jit] resident=8/124944 generic=0/0 cfg=0/0 cfg-edges=0   code=20350/24576 B
+[jit] exit histogram: budget=29 zero=842596 cold=4469 return=207506 cs-change=413
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~  115378  14CB:015F op=50 -> 14CB:015F  zero
+[jit]   ~  115375  14CB:0165 op=5A -> 14CB:0165  zero
+[jit]   ~   93138  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~   93137  9D1F:021A op=B4 -> 9D1F:021A  cold
+[jit]   ~  108174  14CB:03FB op=72 -> 14CB:03FB  zero
+[jit]   ~   93137  9D1F:021C op=CD -> 9D1F:021C  cold
+[jit]   ~  115370  14CB:0179 op=13 -> 14CB:0179  zero
+[jit]   ~  117040  14CB:03E8 op=A9 -> 14CB:03E8  zero
+[jit] --- since previous Ctrl+] ---
+[jit] native=0 fallback=0 control=0 entry=0 compile=0 hit=0 miss=0 return=0 cs-exit=0 stop=0
+[jit] fallback-reason compile=0 budget=0 zero=0 cold=0   invalid=0 flush=0 boundary=0 bios-bypass=5404
+[jit] resident=0/0 generic=0/0 cfg=0/0 cfg-edges=0   code=20350/24576 B
+[jit] exit histogram:
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+MDSTRESS 7
+
+microDOS ENGINE STRESS LAB v2
+Deterministic workload for interpreter/cache/AOT/JIT profiling.
+Modes: MDSTRESS | MDSTRESS /S | MDSTRESS 1..9
+[MDSTRESS] CS=0x14CB
+[MDSTRESS] single phase = 7
+
+[07/09] RARE 8086 OPCODE COMPATIBILITY SWEEP
+
+MDSTRESS complete. deterministic checksum = 0xEC9A
+Return to COMMAND.COM.
+
+A>
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT ON, guest PSRAM
+[perf] --- since boot ---
+[perf] wall    23.257 s   in-guest-loop    23.118 s
+[perf] active  15.404 s   idle-sleep 7.693 s   console-out 0.015 s   input-wait 0.000 s   disk 0.006 s
+[perf] instructions 21200000   active 1.376 MIPS
+[perf] tiers: static-aot 3453817 (16.3%)   jit-native 569355 (2.7%)   interpreted 17176828 (81.0%)
+[perf] interpreted split: bios 94473   other 17082355
+[perf] jit-owned 17651627 (fallback interpreted 17082272)   cache h/m/i/f 0/0/0/0   idle-sleeps 15386
+[perf] --- since previous Ctrl+] ---
+[perf] wall     3.658 s   in-guest-loop     3.649 s
+[perf] active   3.131 s   idle-sleep 0.515 s   console-out 0.002 s   input-wait 0.000 s   disk 0.001 s
+[perf] instructions 4000000   active 1.278 MIPS
+[perf] tiers: static-aot 304320 (7.6%)   jit-native 90646 (2.3%)   interpreted 3605034 (90.1%)
+[perf] interpreted split: bios 8312   other 3596722
+[perf] jit-owned 3687362 (fallback interpreted 3596716)   cache h/m/i/f 0/0/0/0   idle-sleeps 1030
+[perf] aot: kernel compiled 3453817   non-kernel AOT 0   attached-segment steps 83
+[perf] aot: attaches=1 enters=47771 evictions=0   disk writes 0   CS:IP=1000:0688
+[jit] --- since boot ---
+[jit] native=569355 fallback=17082272 control=286 entry=1312525 compile=747 hit=1311858 miss=5925 return=245013 cs-exit=472 stop=0
+[jit] fallback-reason compile=0 budget=80 zero=1067348 cold=5178   invalid=437 flush=2 boundary=1072606 bios-bypass=94473
+[jit] resident=9/140562 generic=0/0 cfg=0/0 cfg-edges=0   code=2518/24576 B
+[jit] exit histogram: budget=80 zero=1067348 cold=5178 return=245013 cs-change=472
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~  116182  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~  140616  14CB:0456 op=9E -> 14CB:0456  zero
+[jit]   ~  140614  14CB:0458 op=F7 -> 14CB:0458  zero
+[jit]   ~  140612  14CB:045C op=98 -> 14CB:045C  zero
+[jit]   ~  140609  14CB:045E op=87 -> 14CB:045E  zero
+[jit]   ~  140618  14CB:0450 op=93 -> 14CB:0450  zero
+[jit]   ~  140615  14CB:0452 op=9F -> 14CB:0452  zero
+[jit]   ~  117040  14CB:03E8 op=A9 -> 14CB:03E8  zero
+[jit] --- since previous Ctrl+] ---
+[jit] native=90646 fallback=3596716 control=34 entry=262280 compile=103 hit=262228 miss=812 return=37507 cs-exit=59 stop=0
+[jit] fallback-reason compile=0 budget=51 zero=224752 cold=709   invalid=59 flush=1 boundary=225512 bios-bypass=8312
+[jit] resident=1/15618 generic=0/0 cfg=0/0 cfg-edges=0   code=2518/24576 B
+[jit] exit histogram: budget=51 zero=224752 cold=709 return=37507 cs-change=59
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~   23044  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~  140616  14CB:0456 op=9E -> 14CB:0456  zero
+[jit]   ~  140614  14CB:0458 op=F7 -> 14CB:0458  zero
+[jit]   ~  140612  14CB:045C op=98 -> 14CB:045C  zero
+[jit]   ~  140609  14CB:045E op=87 -> 14CB:045E  zero
+[jit]   ~  140618  14CB:0450 op=93 -> 14CB:0450  zero
+[jit]   ~  140615  14CB:0452 op=9F -> 14CB:0452  zero
+
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT ON, guest PSRAM
+[perf] --- since boot ---
+[perf] wall    23.996 s   in-guest-loop    23.845 s
+[perf] active  15.455 s   idle-sleep 8.369 s   console-out 0.015 s   input-wait 0.000 s   disk 0.006 s
+[perf] instructions 21400000   active 1.385 MIPS
+[perf] tiers: static-aot 3648406 (17.0%)   jit-native 569355 (2.7%)   interpreted 17182239 (80.3%)
+[perf] interpreted split: bios 99877   other 17082362
+[perf] jit-owned 17651627 (fallback interpreted 17082272)   cache h/m/i/f 0/0/0/0   idle-sleeps 16737
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.739 s   in-guest-loop     0.727 s
+[perf] active   0.051 s   idle-sleep 0.676 s   console-out 0.000 s   input-wait 0.000 s   disk 0.000 s
+[perf] instructions 200000   active 3.893 MIPS
+[perf] tiers: static-aot 194589 (97.3%)   jit-native 0 (0.0%)   interpreted 5411 (2.7%)
+[perf] interpreted split: bios 5404   other 7
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1351
+[perf] aot: kernel compiled 3648406   non-kernel AOT 0   attached-segment steps 90
+[perf] aot: attaches=1 enters=50481 evictions=0   disk writes 0   CS:IP=1000:37E1
+[jit] --- since boot ---
+[jit] native=569355 fallback=17082272 control=286 entry=1312525 compile=747 hit=1311858 miss=5925 return=245013 cs-exit=472 stop=0
+[jit] fallback-reason compile=0 budget=80 zero=1067348 cold=5178   invalid=437 flush=2 boundary=1072606 bios-bypass=99877
+[jit] resident=9/140562 generic=0/0 cfg=0/0 cfg-edges=0   code=2518/24576 B
+[jit] exit histogram: budget=80 zero=1067348 cold=5178 return=245013 cs-change=472
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~  116182  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit]   ~  140616  14CB:0456 op=9E -> 14CB:0456  zero
+[jit]   ~  140614  14CB:0458 op=F7 -> 14CB:0458  zero
+[jit]   ~  140612  14CB:045C op=98 -> 14CB:045C  zero
+[jit]   ~  140609  14CB:045E op=87 -> 14CB:045E  zero
+[jit]   ~  140618  14CB:0450 op=93 -> 14CB:0450  zero
+[jit]   ~  140615  14CB:0452 op=9F -> 14CB:0452  zero
+[jit]   ~  117040  14CB:03E8 op=A9 -> 14CB:03E8  zero
+[jit] --- since previous Ctrl+] ---
+[jit] native=0 fallback=0 control=0 entry=0 compile=0 hit=0 miss=0 return=0 cs-exit=0 stop=0
+[jit] fallback-reason compile=0 budget=0 zero=0 cold=0   invalid=0 flush=0 boundary=0 bios-bypass=5404
+[jit] resident=0/0 generic=0/0 cfg=0/0 cfg-edges=0   code=2518/24576 B
+[jit] exit histogram:
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+MDSTRESS 8
+
+microDOS ENGINE STRESS LAB v2
+Deterministic workload for interpreter/cache/AOT/JIT profiling.
+Modes: MDSTRESS | MDSTRESS /S | MDSTRESS 1..9
+[MDSTRESS] CS=0x14CB
+[MDSTRESS] single phase = 8
+
+[08/09] DOS INT 21h FILE + MEMORY SERVICE LOAD
+
+MDSTRESS complete. deterministic checksum = 0x1357
+Return to COMMAND.COM.
+
+A>
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT ON, guest PSRAM
+[perf] --- since boot ---
+[perf] wall    24.686 s   in-guest-loop    24.525 s
+[perf] active  15.557 s   idle-sleep 8.941 s   console-out 0.018 s   input-wait 0.000 s   disk 0.010 s
+[perf] instructions 21800000   active 1.401 MIPS
+[perf] tiers: static-aot 4018505 (18.4%)   jit-native 588148 (2.7%)   interpreted 17193347 (78.9%)
+[perf] interpreted split: bios 108833   other 17084514
+[perf] jit-owned 17672554 (fallback interpreted 17084406)   cache h/m/i/f 0/0/0/0   idle-sleeps 17882
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.690 s   in-guest-loop     0.680 s
+[perf] active   0.101 s   idle-sleep 0.572 s   console-out 0.002 s   input-wait 0.000 s   disk 0.004 s
+[perf] instructions 400000   active 3.944 MIPS
+[perf] tiers: static-aot 370099 (92.5%)   jit-native 18793 (4.7%)   interpreted 11108 (2.8%)
+[perf] interpreted split: bios 8956   other 2152
+[perf] jit-owned 20927 (fallback interpreted 2134)   cache h/m/i/f 0/0/0/0   idle-sleeps 1145
+[perf] aot: kernel compiled 4018505   non-kernel AOT 0   attached-segment steps 108
+[perf] aot: attaches=1 enters=55120 evictions=0   disk writes 71   CS:IP=1000:102E
+[jit] --- since boot ---
+[jit] native=588148 fallback=17084406 control=318 entry=1312738 compile=839 hit=1311979 miss=6748 return=245067 cs-exit=615 stop=0
+[jit] fallback-reason compile=0 budget=80 zero=1067485 cold=5909   invalid=485 flush=2 boundary=1073474 bios-bypass=108833
+[jit] resident=11/159237 generic=0/0 cfg=0/0 cfg-edges=0   code=9042/24576 B
+[jit] exit histogram: budget=80 zero=1067485 cold=5909 return=245067 cs-change=615
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~  117117  9D1F:021C op=CD -> 9D1F:021C  cold
+[jit]   ~  140616  14CB:0456 op=9E -> 14CB:0456  zero
+[jit]   ~  140614  14CB:0458 op=F7 -> 14CB:0458  zero
+[jit]   ~  140612  14CB:045C op=98 -> 14CB:045C  zero
+[jit]   ~  140609  14CB:045E op=87 -> 14CB:045E  zero
+[jit]   ~  140618  14CB:0450 op=93 -> 14CB:0450  zero
+[jit]   ~  140615  14CB:0452 op=9F -> 14CB:0452  zero
+[jit]   ~  117117  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit] --- since previous Ctrl+] ---
+[jit] native=18793 fallback=2134 control=32 entry=213 compile=92 hit=121 miss=823 return=54 cs-exit=143 stop=0
+[jit] fallback-reason compile=0 budget=0 zero=137 cold=731   invalid=48 flush=0 boundary=868 bios-bypass=8956
+[jit] resident=2/18675 generic=0/0 cfg=0/0 cfg-edges=0   code=9042/24576 B
+[jit] exit histogram: zero=137 cold=731 return=54 cs-change=143
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~  117117  9D1F:021C op=CD -> 9D1F:021C  cold
+[jit]   ~     935  9D1F:021C op=CD -> 1000:058D  cs-change
+
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT ON, guest PSRAM
+[perf] --- since boot ---
+[perf] wall    25.424 s   in-guest-loop    25.252 s
+[perf] active  15.608 s   idle-sleep 9.617 s   console-out 0.018 s   input-wait 0.000 s   disk 0.010 s
+[perf] instructions 22000000   active 1.410 MIPS
+[perf] tiers: static-aot 4213095 (19.2%)   jit-native 588148 (2.7%)   interpreted 17198757 (78.2%)
+[perf] interpreted split: bios 114241   other 17084516
+[perf] jit-owned 17672554 (fallback interpreted 17084406)   cache h/m/i/f 0/0/0/0   idle-sleeps 19234
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.738 s   in-guest-loop     0.727 s
+[perf] active   0.051 s   idle-sleep 0.676 s   console-out 0.000 s   input-wait 0.000 s   disk 0.000 s
+[perf] instructions 200000   active 3.894 MIPS
+[perf] tiers: static-aot 194590 (97.3%)   jit-native 0 (0.0%)   interpreted 5410 (2.7%)
+[perf] interpreted split: bios 5408   other 2
+[perf] jit-owned 0 (fallback interpreted 0)   cache h/m/i/f 0/0/0/0   idle-sleeps 1352
+[perf] aot: kernel compiled 4213095   non-kernel AOT 0   attached-segment steps 110
+[perf] aot: attaches=1 enters=57827 evictions=0   disk writes 71   CS:IP=1000:29AC
+[jit] --- since boot ---
+[jit] native=588148 fallback=17084406 control=318 entry=1312738 compile=839 hit=1311979 miss=6748 return=245067 cs-exit=615 stop=0
+[jit] fallback-reason compile=0 budget=80 zero=1067485 cold=5909   invalid=485 flush=2 boundary=1073474 bios-bypass=114241
+[jit] resident=11/159237 generic=0/0 cfg=0/0 cfg-edges=0   code=9042/24576 B
+[jit] exit histogram: budget=80 zero=1067485 cold=5909 return=245067 cs-change=615
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~  117117  9D1F:021C op=CD -> 9D1F:021C  cold
+[jit]   ~  140616  14CB:0456 op=9E -> 14CB:0456  zero
+[jit]   ~  140614  14CB:0458 op=F7 -> 14CB:0458  zero
+[jit]   ~  140612  14CB:045C op=98 -> 14CB:045C  zero
+[jit]   ~  140609  14CB:045E op=87 -> 14CB:045E  zero
+[jit]   ~  140618  14CB:0450 op=93 -> 14CB:0450  zero
+[jit]   ~  140615  14CB:0452 op=9F -> 14CB:0452  zero
+[jit]   ~  117117  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit] --- since previous Ctrl+] ---
+[jit] native=0 fallback=0 control=0 entry=0 compile=0 hit=0 miss=0 return=0 cs-exit=0 stop=0
+[jit] fallback-reason compile=0 budget=0 zero=0 cold=0   invalid=0 flush=0 boundary=0 bios-bypass=5408
+[jit] resident=0/0 generic=0/0 cfg=0/0 cfg-edges=0   code=9042/24576 B
+[jit] exit histogram:
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+MDSTRESS 9
+
+microDOS ENGINE STRESS LAB v2
+Deterministic workload for interpreter/cache/AOT/JIT profiling.
+Modes: MDSTRESS | MDSTRESS /S | MDSTRESS 1..9
+[MDSTRESS] CS=0x14CB
+[MDSTRESS] single phase = 9
+
+[09/09] SELF-MODIFYING CODE / CACHE INVALIDATION
+
+MDSTRESS complete. deterministic checksum = 0x1B57
+Return to COMMAND.COM.
+
+A>
+[perf] config: M21.1b, clk 300 MHz, code SRAM (copy_to_ram), block cache OFF, kernel AOT ON, runtime JIT ON, guest PSRAM
+[perf] --- since boot ---
+[perf] wall    26.225 s   in-guest-loop    26.044 s
+[perf] active  15.746 s   idle-sleep 10.268 s   console-out 0.020 s   input-wait 0.000 s   disk 0.010 s
+[perf] instructions 22400000   active 1.423 MIPS
+[perf] tiers: static-aot 4557667 (20.3%)   jit-native 610709 (2.7%)   interpreted 17231624 (76.9%)
+[perf] interpreted split: bios 123673   other 17107951
+[perf] jit-owned 17718549 (fallback interpreted 17107840)   cache h/m/i/f 0/0/0/0   idle-sleeps 20535
+[perf] --- since previous Ctrl+] ---
+[perf] wall     0.802 s   in-guest-loop     0.792 s
+[perf] active   0.138 s   idle-sleep 0.650 s   console-out 0.002 s   input-wait 0.000 s   disk 0.001 s
+[perf] instructions 400000   active 2.890 MIPS
+[perf] tiers: static-aot 344572 (86.1%)   jit-native 22561 (5.6%)   interpreted 32867 (8.2%)
+[perf] interpreted split: bios 9432   other 23435
+[perf] jit-owned 45995 (fallback interpreted 23434)   cache h/m/i/f 0/0/0/0   idle-sleeps 1301
+[perf] aot: kernel compiled 4557667   non-kernel AOT 0   attached-segment steps 111
+[perf] aot: attaches=1 enters=62602 evictions=0   disk writes 71   CS:IP=1000:1085
+[jit] --- since boot ---
+[jit] native=610709 fallback=17107840 control=3082 entry=1318333 compile=2308 hit=1316107 miss=8919 return=249217 cs-exit=674 stop=0
+[jit] fallback-reason compile=0 budget=82 zero=1068908 cold=6611   invalid=1905 flush=7 boundary=1075601 bios-bypass=123673
+[jit] resident=12/174855 generic=0/0 cfg=0/0 cfg-edges=0   code=2518/24576 B
+[jit] exit histogram: budget=82 zero=1068908 cold=6611 return=249217 cs-change=674
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~  118720  14CB:0554 op=8B -> 14CB:0554  zero
+[jit]   ~  140616  14CB:0456 op=9E -> 14CB:0456  zero
+[jit]   ~  140614  14CB:0458 op=F7 -> 14CB:0458  zero
+[jit]   ~  140612  14CB:045C op=98 -> 14CB:045C  zero
+[jit]   ~  140609  14CB:045E op=87 -> 14CB:045E  zero
+[jit]   ~  140618  14CB:0450 op=93 -> 14CB:0450  zero
+[jit]   ~  140615  14CB:0452 op=9F -> 14CB:0452  zero
+[jit]   ~  117765  9D1F:021C op=CD -> 1000:058D  cs-change
+[jit] --- since previous Ctrl+] ---
+[jit] native=22561 fallback=23434 control=2764 entry=5595 compile=1469 hit=4128 miss=2171 return=4150 cs-exit=59 stop=0
+[jit] fallback-reason compile=0 budget=2 zero=1423 cold=702   invalid=1420 flush=5 boundary=2127 bios-bypass=9432
+[jit] resident=1/15618 generic=0/0 cfg=0/0 cfg-edges=0   code=2518/24576 B
+[jit] exit histogram: budget=2 zero=1423 cold=702 return=4150 cs-change=59
+[jit] hot sites (interval delta; ~ means space-saving candidate):
+[jit]   ~  118720  14CB:0554 op=8B -> 14CB:0554  zero
+[jit]   ~     648  9D1F:021C op=CD -> 1000:058D  cs-change
