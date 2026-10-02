@@ -20,6 +20,10 @@ typedef enum MdStopReason {
 } MdStopReason;
 
 struct MdRuntime;
+#ifndef MD_AOT_LIVE_PAGES
+#define MD_AOT_LIVE_PAGES 8u    /* 4 KiB: DOS kernel (5 pages) + a compiled program; beyond that, pages fall back to the exact guard path */
+#endif
+
 typedef struct MdRuntime MdRuntime;
 struct MdBlockCache;
 typedef struct MdBlockCache MdBlockCache;
@@ -60,6 +64,13 @@ struct MdRuntime {
     /* Attachments of generated images (M15). Cleared by init/reset, so an
        attachment can never outlive the runtime it was made for. */
     MdAotGuard aot_slots[MD_AOT_ATTACH_SLOTS];
+    uint8_t aot_page_owner[MD_X86_CODE_PAGE_COUNT];   /* M21.1b, see MdX86 */
+    /* M21.1b live-code bitmaps: per page a pointer into a small pool (one
+       bit per byte of a 4 KiB page); pages beyond the pool use an all-ones
+       bitmap, which simply means "always take the guard path". */
+    uint8_t *aot_live_bits[MD_X86_CODE_PAGE_COUNT];
+    uint8_t aot_live_pool[MD_AOT_LIVE_PAGES][MD_X86_CODE_PAGE_SIZE / 8u];
+    uint8_t aot_live_pool_used;
     uint32_t aot_use_clock;
     uint32_t aot_evictions;
 };

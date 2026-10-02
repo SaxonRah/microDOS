@@ -558,15 +558,24 @@ static void test_aot_guard_word_writes(uint8_t *memory)
     md_x86_write16(&rt.cpu, 0x2000u, 0x010Bu, 0x21CDu);
     CHECK(!prog->block_ok(&rt, 0x2000u, 0x0100u));
 
-    /* data + data inside the image: stays valid; page generation still
-       advances exactly once (block cache bookkeeping unchanged). */
+    /* data + data inside the image: stays valid. M21.1b page flags: on a
+       page that only holds compiled (AOT) code the generation is untouched
+       (nothing validates by page there); once the cache/JIT has translated
+       code on the page (TRANSLATED), it advances exactly once. */
     md_runtime_init(&rt, memory, &hooks);
     test_load_hello(&rt, 0x2000u);
     CHECK(prog->attach(&rt, 0x2000u));
     {
         const unsigned page = md_x86_code_page(md_x86_linear(0x2000u, 0x0110u));
-        const uint32_t gen = rt.code_page_generation[page];
+        uint32_t gen;
+        rt.code_page_executable[page] = MD_X86_PAGE_AOT;     /* compiled only */
+        gen = rt.code_page_generation[page];
         md_x86_write16(&rt.cpu, 0x2000u, 0x0110u, 0x5858u);
+        CHECK(prog->ready(&rt, 0x2000u));
+        CHECK(rt.code_page_generation[page] == gen);
+        md_runtime_mark_code_range(&rt, 0x2000u, 0x0100u, 16u); /* + translated */
+        gen = rt.code_page_generation[page];
+        md_x86_write16(&rt.cpu, 0x2000u, 0x0110u, 0x5959u);
         CHECK(prog->ready(&rt, 0x2000u));
         CHECK(rt.code_page_generation[page] == gen + 1u);
     }

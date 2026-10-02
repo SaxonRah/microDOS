@@ -32,8 +32,16 @@ enum {
     MD_X86_FLAG_ALWAYS1 = 0x0002u
 };
 
-#define MD_X86_ADDRESS_MASK 0x000FFFFFu
-#define MD_X86_ADDRESS_SPACE (1u << 20)
+/* Guest physical address width. 20 bits (1 MiB) is the 8086 and the
+   default everywhere. Smaller widths exist only for memory-placement
+   experiments (M21.1 A/B firmware: a 128 KiB guest that fits in SRAM);
+   addresses then alias modulo the smaller space. Mask and size are derived
+   from one number so they can never disagree. */
+#ifndef MD_X86_ADDRESS_BITS
+#define MD_X86_ADDRESS_BITS 20u
+#endif
+#define MD_X86_ADDRESS_SPACE (1u << MD_X86_ADDRESS_BITS)
+#define MD_X86_ADDRESS_MASK (MD_X86_ADDRESS_SPACE - 1u)
 
 /* 4 KiB executable-page tracking keeps the metadata small enough for RP2350
    internal SRAM while still invalidating only the region touched by self-
@@ -109,6 +117,17 @@ typedef struct MdX86 {
     /* Optional generated-image guards (see MdAotGuard), runtime-owned. */
     MdAotGuard *aot_guards;
     unsigned aot_guard_count;
+    /* M21.1b: per-code-page owner of live compiled code: 0 = none,
+       k = only guard slot k-1, 0xFF = several. Conservative: never 0 for a
+       page a live guard covers (a stale entry naming a dead guard is
+       harmless). NULL = scan every guard (standalone MdX86 users). */
+    const uint8_t *aot_page_owner;
+    /* M21.1b: per-code-page merged bitmap of LIVE compiled bytes (one bit
+       per byte; NULL = none on this page). A store whose bit is clear needs
+       no guard work at all. Maintained by the runtime: built on attach,
+       cleared per chunk as chunks die (re-derived from other live guards).
+       NULL table = always take the guard path (standalone MdX86 users). */
+    uint8_t **aot_live_bits;
 } MdX86;
 
 /* ---- M18 lazy flags ---------------------------------------------------- */
@@ -257,11 +276,24 @@ static inline int md_aot_chunks_ok(const MdAotGuard *guard, uint32_t first, uint
     return 1;
 }
 
+/* M21.1b page flags (code_page_executable[]): who must hear about stores.
+   TRANSLATED: the decoded-block cache or the JIT translated code on this
+   page; its generation (and the global code-write epoch) must change on
+   every store. AOT: compiled code may be live here; stores are checked
+   against the live-code bitmap / guards. Compiled images set only AOT, so
+   kernel stack/data stores no longer pay for generation bumps nobody reads. */
+#define MD_X86_PAGE_TRANSLATED 0x01u
+#define MD_X86_PAGE_AOT 0x02u
+
+static inline unsigned md_x86_page_flags(const MdX86 *cpu, uint32_t address)
+{
+    if (cpu->code_page_generation == NULL || cpu->code_page_executable == NULL) return 0u;
+    return cpu->code_page_executable[md_x86_code_page(address)];
+}
+
 static inline int md_x86_page_executable(const MdX86 *cpu, uint32_t address)
 {
-    return cpu->code_page_generation != NULL &&
-           cpu->code_page_executable != NULL &&
-           cpu->code_page_executable[md_x86_code_page(address)] != 0u;
+    return md_x86_page_flags(cpu, address) != 0u;
 }
 
 /* Page-granular bookkeeping for the decoded-block cache and the global code
@@ -285,42 +317,80 @@ static inline void md_x86_note_page_write(MdX86 *cpu, uint32_t address)
 /* Byte-exact AOT check. Must be called for EVERY modified byte that lies on
    an executable page, including both bytes of a same-page word store (M15
    bug fix: the second byte used to be skipped unless it crossed a page). */
-static inline void md_x86_note_aot_write(MdX86 *cpu, uint32_t address)
+/* One guard, one byte: the exact M15/M17 semantics. */
+/* Clears the merged live bits of one dead chunk (runtime.c); bits another
+   live guard still needs are re-derived there. */
+void md_x86_aot_chunk_died(MdX86 *cpu, const MdAotGuard *guard, uint32_t chunk);
+
+/* One guard, one byte: the exact M15/M17 semantics. `invalidations` counts
+   stores that hit a live compiled byte (M21.1b; it is a statistic only). */
+static inline void md_x86_aot_check_guard(MdX86 *cpu, MdAotGuard *guard, uint32_t a)
 {
-    const uint32_t a = address & MD_X86_ADDRESS_MASK;
-    unsigned i;
-    for (i = 0; i < cpu->aot_guard_count; ++i) {
-        MdAotGuard *guard = &cpu->aot_guards[i];
-        uint32_t off;
-        if (!guard->valid) continue;
-        off = (a - guard->base) & MD_X86_ADDRESS_MASK;
-        if (off < guard->size &&
-            ((guard->code_bits[off >> 3] >> (off & 7u)) & 1u) != 0u) {
-            const uint32_t chunk = off >> MD_AOT_CHUNK_SHIFT;
-            const uint8_t bit = (uint8_t)(1u << (chunk & 7u));
-            if ((guard->chunk_ok[chunk >> 3] & bit) != 0u) {
-                guard->chunk_ok[chunk >> 3] &= (uint8_t)~bit;
-                /* Every compiled chunk overwritten (e.g. DOS loaded another
-                   program here): the attachment is dead, so hosts stop
-                   treating this segment as compiled code. */
-                if (guard->live_chunks != 0u && --guard->live_chunks == 0u) guard->valid = 0u;
-                /* M17b: only a chunk that goes valid -> invalid can affect a
-                   running block (blocks are checked on entry), so only that
-                   advances the epoch. Stores into chunks that are already
-                   invalid (DOS buffers in old init code) no longer force
-                   compiled code out after every store check. */
-                ++guard->epoch;
-            }
+    uint32_t off;
+    if (!guard->valid) return;
+    off = (a - guard->base) & MD_X86_ADDRESS_MASK;
+    if (off < guard->size &&
+        ((guard->code_bits[off >> 3] >> (off & 7u)) & 1u) != 0u) {
+        const uint32_t chunk = off >> MD_AOT_CHUNK_SHIFT;
+        const uint8_t bit = (uint8_t)(1u << (chunk & 7u));
+        if ((guard->chunk_ok[chunk >> 3] & bit) != 0u) {
+            guard->chunk_ok[chunk >> 3] &= (uint8_t)~bit;
+            /* Every compiled chunk overwritten (e.g. DOS loaded another
+               program here): the attachment is dead, so hosts stop treating
+               this segment as compiled code. */
+            if (guard->live_chunks != 0u && --guard->live_chunks == 0u) guard->valid = 0u;
+            /* M17b: only a chunk that goes valid -> invalid can affect a
+               running block (blocks are checked on entry), so only that
+               advances the epoch. */
+            ++guard->epoch;
             ++guard->invalidations;
+            if (cpu->aot_live_bits != NULL) md_x86_aot_chunk_died(cpu, guard, chunk);
         }
     }
 }
 
+/* Guard work for a store that may hit live compiled code (runtime.c). */
+void md_x86_note_aot_slow(MdX86 *cpu, uint32_t a);
+
+#if defined(__GNUC__) || defined(__clang__)
+#define MD_X86_ALWAYS_INLINE inline __attribute__((always_inline))
+#else
+#define MD_X86_ALWAYS_INLINE inline
+#endif
+
+/* M21.1b: one bit test inline; a clear bit means "not a live compiled
+   byte" (stack, data, DOS buffers in dead init code), which is almost
+   every store. Only live hits reach the out-of-line guard path. */
+static MD_X86_ALWAYS_INLINE void md_x86_note_aot_write(MdX86 *cpu, uint32_t address)
+{
+    const uint32_t a = address & MD_X86_ADDRESS_MASK;
+    if (cpu->aot_live_bits != NULL) {
+        const uint8_t *bm = cpu->aot_live_bits[a >> MD_X86_CODE_PAGE_SHIFT];
+        if (bm == NULL) return;
+        if (((bm[(a & MD_X86_CODE_PAGE_MASK) >> 3] >> (a & 7u)) & 1u) == 0u) return;
+    }
+    md_x86_note_aot_slow(cpu, a);
+}
+
+static inline void md_x86_note_aot_guards(MdX86 *cpu, uint32_t a)
+{
+    unsigned i;
+    if (cpu->aot_page_owner != NULL) {
+        const uint8_t owner = cpu->aot_page_owner[a >> MD_X86_CODE_PAGE_SHIFT];
+        if (owner == 0u) return;
+        if (owner != 0xFFu) {
+            md_x86_aot_check_guard(cpu, &cpu->aot_guards[owner - 1u], a);
+            return;
+        }
+    }
+    for (i = 0; i < cpu->aot_guard_count; ++i) md_x86_aot_check_guard(cpu, &cpu->aot_guards[i], a);
+}
+
 static inline void md_x86_note_code_write(MdX86 *cpu, uint32_t address)
 {
-    if (!md_x86_page_executable(cpu, address)) return;
-    md_x86_note_page_write(cpu, address);
-    md_x86_note_aot_write(cpu, address);
+    const unsigned f = md_x86_page_flags(cpu, address);
+    if (f & MD_X86_PAGE_TRANSLATED) md_x86_note_page_write(cpu, address);
+    if (f != 0u) md_x86_note_aot_write(cpu, address);
 }
 
 static inline uint8_t md_x86_read8_linear(const MdX86 *cpu, uint32_t address)
@@ -335,30 +405,61 @@ static inline uint16_t md_x86_read16_linear(const MdX86 *cpu, uint32_t address)
     return (uint16_t)((uint16_t)cpu->memory[a0] | ((uint16_t)cpu->memory[a1] << 8));
 }
 
+/* Tracked stores (M21.1b). The inline part handles the common case of a
+   page holding no translated/compiled code; anything else goes to one
+   shared out-of-line implementation (runtime.c), instead of the whole
+   tracking sequence being inlined at every store site in generated code.
+   Semantics are exactly those of md_x86_write8/16_tracked_inline below. */
+void md_x86_store8_tracked(MdX86 *cpu, uint32_t a0, uint8_t value);
+void md_x86_store16_tracked(MdX86 *cpu, uint32_t a0, uint16_t value);
+/* Copy `len` bytes to segment:offset with exactly the effect of `len`
+   md_x86_write8 calls (offset wraps within the segment), but one memcpy and
+   per-page bookkeeping when the range does not wrap (disk transfers). */
+void md_x86_write_block(MdX86 *cpu, uint16_t segment, uint16_t offset,
+                        const uint8_t *data, uint32_t len);
+
+static inline void md_x86_write8_tracked_inline(MdX86 *cpu, uint32_t a0, uint8_t value)
+{
+    cpu->memory[a0] = value;
+    md_x86_note_code_write(cpu, a0);
+}
+
+static inline void md_x86_write16_tracked_inline(MdX86 *cpu, uint32_t a0, uint16_t value)
+{
+    const uint32_t a1 = (a0 + 1u) & MD_X86_ADDRESS_MASK;
+    const unsigned p0 = md_x86_code_page(a0);
+    const unsigned p1 = md_x86_code_page(a1);
+
+    const unsigned f0 = md_x86_page_flags(cpu, a0);
+    const unsigned f1 = p1 == p0 ? f0 : md_x86_page_flags(cpu, a1);
+
+    cpu->memory[a0] = (uint8_t)value;
+    cpu->memory[a1] = (uint8_t)(value >> 8);
+    /* Page generations: once per touched TRANSLATED page. AOT: every byte. */
+    if (f0 & MD_X86_PAGE_TRANSLATED) md_x86_note_page_write(cpu, a0);
+    if ((f1 & MD_X86_PAGE_TRANSLATED) && p1 != p0) md_x86_note_page_write(cpu, a1);
+    if (f0 != 0u) md_x86_note_aot_write(cpu, a0);
+    if (f1 != 0u) md_x86_note_aot_write(cpu, a1);
+}
+
 static inline void md_x86_write8_linear(MdX86 *cpu, uint32_t address, uint8_t value)
 {
     const uint32_t a0 = address & MD_X86_ADDRESS_MASK;
-    cpu->memory[a0] = value;
-    md_x86_note_code_write(cpu, a0);
+    if (!md_x86_page_executable(cpu, a0)) { cpu->memory[a0] = value; return; }
+    md_x86_store8_tracked(cpu, a0, value);
 }
 
 static inline void md_x86_write16_linear(MdX86 *cpu, uint32_t address, uint16_t value)
 {
     const uint32_t a0 = address & MD_X86_ADDRESS_MASK;
     const uint32_t a1 = (a0 + 1u) & MD_X86_ADDRESS_MASK;
-    const unsigned p0 = md_x86_code_page(a0);
-    const unsigned p1 = md_x86_code_page(a1);
-
-    const int e0 = md_x86_page_executable(cpu, a0);
-    const int e1 = p1 == p0 ? e0 : md_x86_page_executable(cpu, a1);
-
-    cpu->memory[a0] = (uint8_t)value;
-    cpu->memory[a1] = (uint8_t)(value >> 8);
-    /* Page generations: once per touched page. AOT guards: every byte. */
-    if (e0) md_x86_note_page_write(cpu, a0);
-    if (e1 && p1 != p0) md_x86_note_page_write(cpu, a1);
-    if (e0) md_x86_note_aot_write(cpu, a0);
-    if (e1) md_x86_note_aot_write(cpu, a1);
+    if (!md_x86_page_executable(cpu, a0) &&
+        ((a0 & MD_X86_CODE_PAGE_MASK) != MD_X86_CODE_PAGE_MASK || !md_x86_page_executable(cpu, a1))) {
+        cpu->memory[a0] = (uint8_t)value;
+        cpu->memory[a1] = (uint8_t)(value >> 8);
+        return;
+    }
+    md_x86_store16_tracked(cpu, a0, value);
 }
 
 static inline uint8_t md_x86_read8(const MdX86 *cpu, uint16_t segment, uint16_t offset)

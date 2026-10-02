@@ -1164,10 +1164,13 @@ static int dr_emit_c(DrProgram *p, const DrOptions *opt, const char *header_name
           "#define MD_COND(cc_) md_aot_condition(cpu, (cc_))\n"
           "#define MD_CHUNKS(g_, a_, b_) md_aot_chunks_ok_ol((g_), (a_), (b_))\n"
           "#else\n"
-          "#define MD_W8(s_, o_, v_) md_x86_write8(cpu, (s_), (o_), (v_))\n"
-          "#define MD_W16(s_, o_, v_) md_x86_write16(cpu, (s_), (o_), (v_))\n"
-          "#define MD_PUSH(v_) md_x86_push(cpu, (v_))\n"
-          "#define MD_PUSHR(r_) md_x86_push_reg(cpu, (r_))\n"
+          /* M21.1b: stores always go through one shared out-of-line
+             function (it holds the fast path); inlining the tracked-store
+             sequence at every store site only made generated code bigger. */
+          "#define MD_W8(s_, o_, v_) md_aot_store8(cpu, (s_), (o_), (v_))\n"
+          "#define MD_W16(s_, o_, v_) md_aot_store16(cpu, (s_), (o_), (v_))\n"
+          "#define MD_PUSH(v_) md_aot_push(cpu, (v_))\n"
+          "#define MD_PUSHR(r_) md_aot_push_reg(cpu, (r_))\n"
           "#define MD_ALU8(op_, a_, b_) md_x86_alu8(cpu, (op_), (a_), (b_))\n"
           "#define MD_ALU16(op_, a_, b_) md_x86_alu16(cpu, (op_), (a_), (b_))\n"
           "#define MD_SH8(op_, v_, c_) md_x86_shift8(cpu, (op_), (v_), (c_))\n"
@@ -1252,7 +1255,9 @@ static int dr_emit_c(DrProgram *p, const DrOptions *opt, const char *header_name
         "static MdAotGuard *md_arm(MdRuntime *runtime, uint16_t segment)\n{\n"
         "    MdAotGuard *guard = md_runtime_aot_attach(runtime, &%s_program, segment,\n"
         "        md_x86_linear(segment, 0x%04Xu), (uint32_t)sizeof(md_image), md_code_bits);\n"
-        "    md_runtime_mark_code_range(runtime, segment, 0x%04Xu, %uu);\n"
+        "    /* M21.1b: the guard marks its pages MD_X86_PAGE_AOT; the image\n"
+        "       is not TRANSLATED (no page generations needed for it). */\n"
+        "    (void)0x%04Xu; (void)%uu;\n"
         "    return guard;\n}\n\n",
         s, p->base, lo, (unsigned)(hi - lo));
 

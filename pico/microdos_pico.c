@@ -6,7 +6,12 @@
  * instruction partitioning and JIT exit hot sites.
  */
 #include "md_dos2_system.h"
+#ifndef MICRODOS_PICO_DOS2TEST_AOT
+#define MICRODOS_PICO_DOS2TEST_AOT 1
+#endif
+#if MICRODOS_PICO_DOS2TEST_AOT
 #include "dos2test_recomp.h"
+#endif
 #if MICRODOS_PICO_KERNEL_AOT
 #include "msdos2_recomp.h"
 #endif
@@ -26,7 +31,13 @@
 #include <stdio.h>
 #include <string.h>
 
-#define MD_GUEST_BYTES (1u << 20)
+/* Guest RAM spans the whole guest address space (1 MiB by default;
+   M21.1 A/B firmware uses a 128 KiB space). MICRODOS_PICO_GUEST_SRAM places
+   it in SRAM instead of PSRAM, for measuring the PSRAM penalty. */
+#ifndef MICRODOS_PICO_GUEST_SRAM
+#define MICRODOS_PICO_GUEST_SRAM 0
+#endif
+#define MD_GUEST_BYTES MD_X86_ADDRESS_SPACE
 #define MD_DISK_BYTES (720u * 512u)
 #define MD_SLICE 200000u
 #define MD_IDLE_POLLS 256u
@@ -34,14 +45,24 @@
 extern const uint8_t md_blob_msdos_sys[], md_blob_msdos_sys_end[];
 extern const uint8_t md_blob_disk[], md_blob_disk_end[];
 
+#if MICRODOS_PICO_GUEST_SRAM
+static uint8_t g_guest[MD_GUEST_BYTES] __attribute__((aligned(16)));
+#else
 static uint8_t __uninitialized_psram("md_guest") __attribute__((aligned(16)))
     g_guest[MD_GUEST_BYTES];
+#endif
 static uint8_t __uninitialized_psram("md_disk") __attribute__((aligned(16)))
     g_disk[MD_DISK_BYTES];
 
 static MdDos2System g_sys;
 static MdBlockCache g_cache;
+#if MICRODOS_PICO_DOS2TEST_AOT
 static const MdAotProgram *const g_programs[] = { &md_recomp_dos2test_program };
+#define MD_PICO_PROGRAM_COUNT 1u
+#else
+static const MdAotProgram *const *const g_programs = NULL;   /* DOS2TEST runs interpreted/JIT */
+#define MD_PICO_PROGRAM_COUNT 0u
+#endif
 
 typedef struct PicoConsole {
     bool have_pending;
@@ -245,7 +266,8 @@ static bool md_psram_ok(void)
     volatile uint32_t *d = (volatile uint32_t *)g_disk;
     uint32_t i;
     if (!psram_is_available()) { md_say("  psram:   NOT AVAILABLE\n"); return false; }
-    if (!psram_check_address(&g_guest[0]) || !psram_check_address(&g_guest[MD_GUEST_BYTES - 1u]) ||
+    if ((!MICRODOS_PICO_GUEST_SRAM &&
+         (!psram_check_address(&g_guest[0]) || !psram_check_address(&g_guest[MD_GUEST_BYTES - 1u]))) ||
         !psram_check_address(&g_disk[0]) || !psram_check_address(&g_disk[MD_DISK_BYTES - 1u])) {
         md_say("  psram:   buffers not inside PSRAM (%p, %p)\n", (void *)g_guest, (void *)g_disk);
         return false;
@@ -407,11 +429,12 @@ static void md_stats(uint64_t start_us)
     PicoPerf now=g_perf, zero;
     memset(&zero,0,sizeof(zero));
     md_perf_snapshot(&now);
-    md_say("\n[perf] config: M20.2, clk %lu MHz, code %s, block cache %s, kernel AOT %s, runtime JIT %s, guest PSRAM\n",
+    md_say("\n[perf] config: M21.1b, clk %lu MHz, code %s, block cache %s, kernel AOT %s, runtime JIT %s, guest %s\n",
            (unsigned long)(clock_get_hz(clk_sys)/1000000u),
            MICRODOS_PICO_CODE_IN_SRAM?"SRAM (copy_to_ram)":"flash XIP",
            MICRODOS_PICO_CACHE?"ON":"OFF", g_sys.kernel_attached?"ON":"OFF",
-           MICRODOS_PICO_JIT?"ON":"OFF");
+           MICRODOS_PICO_JIT?"ON":"OFF",
+           MICRODOS_PICO_GUEST_SRAM?"SRAM":"PSRAM");
     md_perf_report("since boot",&now,&zero,start_us);
     md_perf_report("since previous Ctrl+]",&now,&g_perf_mark,g_perf_mark.at_us?g_perf_mark.at_us:start_us);
     md_say("[perf] aot: kernel compiled %llu   non-kernel AOT %llu   attached-segment steps %llu\n",
@@ -447,7 +470,9 @@ int main(void)
            MICRODOS_PICO_SYS_KHZ>0?(clock_ok?" (raised; PSRAM retimed)":" (REQUESTED CLOCK FAILED)"):"");
     md_say("  psram:   %lu KiB (sdk available=%d)\n",(unsigned long)(psram_get_size()/1024u),psram_is_available()?1:0);
     if(!md_psram_ok()){md_say("microDOS: PSRAM check failed; halting.\n");for(;;)sleep_ms(1000);}
-    md_say("  guest:   1 MiB at %p (PSRAM, page check ok)\n",(void*)g_guest);
+    md_say("  guest:   %lu KiB at %p (%s, page check ok), DOS memory %lu KiB\n",
+           (unsigned long)(MD_GUEST_BYTES / 1024u),(void*)g_guest,MICRODOS_PICO_GUEST_SRAM?"SRAM":"PSRAM",
+           (unsigned long)MD_MSDOS2_DEFAULT_MEMORY_PARAGRAPHS / 64ul);
     if(disk_size!=MD_DISK_BYTES){md_say("microDOS: embedded disk is %lu bytes, expected %lu; halting.\n",(unsigned long)disk_size,(unsigned long)MD_DISK_BYTES);for(;;)sleep_ms(1000);}
     memset(g_guest,0,MD_GUEST_BYTES); memcpy(g_disk,md_blob_disk,MD_DISK_BYTES);
     md_say("  disk:    360 KiB image copied from flash to PSRAM (writes are lost at reset)\n");
@@ -459,7 +484,7 @@ int main(void)
 #if MICRODOS_PICO_KERNEL_AOT
     md_dos2_system_set_kernel_aot(&g_sys,&md_recomp_msdos2_program);
 #endif
-    md_dos2_system_set_aot(&g_sys,g_programs,1u,true);
+    md_dos2_system_set_aot(&g_sys,g_programs,MD_PICO_PROGRAM_COUNT,true);
     if(!md_dos2_system_start(&g_sys,md_blob_msdos_sys,kernel_size)){md_say("microDOS: embedded MSDOS.SYS rejected (%lu bytes); halting.\n",(unsigned long)kernel_size);for(;;)sleep_ms(1000);}
     md_say("  kernel:  MSDOS.SYS %lu bytes\n",(unsigned long)kernel_size);
 #if MICRODOS_PICO_KERNEL_AOT
@@ -467,7 +492,11 @@ int main(void)
 #else
     md_say("  aot:     MSDOS.SYS kernel: not compiled in this firmware\n");
 #endif
+#if MICRODOS_PICO_DOS2TEST_AOT
     md_say("  aot:     %s (%lu compiled, %lu holes)\n",g_programs[0]->name,(unsigned long)g_programs[0]->compiled_instructions,(unsigned long)g_programs[0]->hole_instructions);
+#else
+    md_say("  aot:     DOS2TEST.COM: not compiled in this firmware\n");
+#endif
     md_say("  config:  code %s, block cache %s, runtime JIT %s\n",MICRODOS_PICO_CODE_IN_SRAM?"SRAM (copy_to_ram)":"flash XIP",MICRODOS_PICO_CACHE?"ON":"OFF",MICRODOS_PICO_JIT?"ON":"OFF");
     md_say("  keys:    Ctrl+] -> M20.2.1 tier/JIT statistics (boot + interval)\n");
 

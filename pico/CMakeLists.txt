@@ -186,5 +186,18 @@ target_compile_definitions(microdos_pico_jit PRIVATE MD_JIT_PROFILE=0)
 md_pico_dos(microdos_pico_jit_profile 1 0 300000 1 1) # same hybrid, full M20/M21 telemetry
 target_compile_definitions(microdos_pico_jit_profile PRIVATE MD_JIT_PROFILE=1)
 
+# M21.1 memory-placement A/B: identical firmwares (compiled kernel, no cache,
+# no JIT, 300 MHz, 128 KiB guest, DOS told it has 128 KiB, DOS2TEST not
+# precompiled so the SRAM variant fits) except for where guest RAM lives.
+# DOS2TEST's MIPS difference is the real PSRAM penalty for DOS.
+md_pico_dos(microdos_pico_g128_psram 1 0 300000 1 0)
+md_pico_dos(microdos_pico_g128_sram  1 0 300000 1 0)
+foreach(t microdos_pico_g128_psram microdos_pico_g128_sram)
+    target_compile_definitions(${t} PRIVATE MD_X86_ADDRESS_BITS=17u
+        MD_MSDOS2_DEFAULT_MEMORY_PARAGRAPHS=0x2000u MICRODOS_PICO_DOS2TEST_AOT=0)
+endforeach()
+target_compile_definitions(microdos_pico_g128_psram PRIVATE MICRODOS_PICO_GUEST_SRAM=0)
+target_compile_definitions(microdos_pico_g128_sram  PRIVATE MICRODOS_PICO_GUEST_SRAM=1)
+
 md_pico_bench(microdos_bench     1 300000)
 md_pico_bench(microdos_bench_150 1 0)

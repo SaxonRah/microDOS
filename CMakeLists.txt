@@ -77,6 +77,7 @@ function(md_recompile_com name symbol input code_end)
     )
     set(MD_RECOMP_${name}_C "${out_c}" PARENT_SCOPE)
     set(MD_RECOMP_${name}_H "${out_h}" PARENT_SCOPE)
+    set_property(GLOBAL APPEND PROPERTY MD_GENERATED_OUTPUTS "${out_c}" "${out_h}")
 endfunction()
 
 md_recompile_com(hello md_recomp_hello tests/programs/hello.com 0x10c)
@@ -169,6 +170,10 @@ if(MD_BUILD_TESTS)
     target_link_libraries(microdos_jit_diff PRIVATE microdos::runtime microdos::decode)
     target_include_directories(microdos_jit_diff PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/runtime")
     add_test(NAME jit_diff COMMAND microdos_jit_diff)
+    # M21.1b: restructured store tracking vs the original algorithm.
+    add_executable(microdos_store_tracking tests/test_store_tracking.c)
+    target_link_libraries(microdos_store_tracking PRIVATE microdos::runtime)
+    add_test(NAME store_tracking COMMAND microdos_store_tracking)
     add_executable(microdos_jit_m203 tests/test_jit.c ${MD_JIT_TEST_SOURCES})
     target_link_libraries(microdos_jit_m203 PRIVATE microdos::runtime microdos::decode)
     target_include_directories(microdos_jit_m203 PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/runtime")
@@ -216,9 +221,46 @@ if(MD_BUILD_TESTS)
         # M17: compiled kernel + DOS2TEST vs pure interpreter, compared after
         # every compiled unit (CPU state) and periodically (all of memory).
         add_test(NAME dos2_e2e_lockstep COMMAND microdos_dos2_e2e "${MD_MSDOS2_BIN}/MSDOS.SYS" "${MD_E2E_IMG}" --lockstep)
-        set_tests_properties(dos2_e2e_aot dos2_e2e_interp dos2_e2e_nocache dos2_e2e_lockstep
+        # M21.1: the 128 KiB guest used by the Pico SRAM/PSRAM A/B firmware.
+        # MdX86's code-page tables are sized from the address space, so this
+        # target compiles the runtime itself instead of linking the 1 MiB
+        # microdos::runtime library (mixing them would be a layout mismatch).
+        add_executable(microdos_dos2_e2e_g128 tests/test_dos2_e2e.c
+            src/system/md_dos2_system.c src/host/msdos2_boot.c
+            src/runtime/runtime.c src/runtime/x86_interp.c
+            src/runtime/x86_block_cache.c src/runtime/region.c
+            "${MD_RECOMP_dos2test_C}" "${MD_RECOMP_msdos2_C}")
+        target_link_libraries(microdos_dos2_e2e_g128 PRIVATE microdos::decode)
+        target_include_directories(microdos_dos2_e2e_g128 PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/include" "${CMAKE_CURRENT_LIST_DIR}/src/runtime"
+            "${CMAKE_CURRENT_LIST_DIR}/src/host" "${CMAKE_CURRENT_LIST_DIR}/src/system" "${MD_GENERATED_DIR}")
+        target_compile_definitions(microdos_dos2_e2e_g128 PRIVATE
+            MD_X86_ADDRESS_BITS=17u MD_MSDOS2_DEFAULT_MEMORY_PARAGRAPHS=0x2000u)
+        if((CMAKE_C_COMPILER_ID MATCHES "GNU|Clang") AND NOT MD_FORCE_SWITCH_DISPATCH)
+            target_compile_definitions(microdos_dos2_e2e_g128 PRIVATE MD_THREADED_DISPATCH=1)
+        endif()
+        if(MSVC)
+            target_compile_definitions(microdos_dos2_e2e_g128 PRIVATE _CRT_SECURE_NO_WARNINGS)
+        endif()
+        add_test(NAME dos2_e2e_g128 COMMAND microdos_dos2_e2e_g128 "${MD_MSDOS2_BIN}/MSDOS.SYS" "${MD_E2E_IMG}" --no-cache)
+        set_tests_properties(dos2_e2e_aot dos2_e2e_interp dos2_e2e_nocache dos2_e2e_lockstep dos2_e2e_g128
                              PROPERTIES FIXTURES_REQUIRED dos2_image)
     else()
         message(STATUS "microDOS: DOS 2 end-to-end tests skipped (run .\\md.bat deps msdos)")
     endif()
 endif()
+
+# M21.1b: generated sources have exactly one owner. Several targets compile
+# the same generated files; with a custom command attached to each of them,
+# a parallel build could run dosrecomp for one target while another compiled
+# the half-written file (seen as a truncated dos2test_recomp.c). Every
+# consumer now waits for this single target instead.
+get_property(md_generated_outputs GLOBAL PROPERTY MD_GENERATED_OUTPUTS)
+add_custom_target(md_generated DEPENDS ${md_generated_outputs})
+foreach(md_consumer microdos_bench microdos_dos2_e2e microdos_dos2_e2e_g128 microdos_host
+        microdos_msdos2 microdos_tests microdos_region_aot_tests microdos_region_tests
+        microdos_jit_diff microdos_jit_m203 microdos_store_tracking)
+    if(TARGET ${md_consumer})
+        add_dependencies(${md_consumer} md_generated)
+    endif()
+endforeach()

@@ -603,9 +603,7 @@ static bool md_disk_transfer(MdRuntime *runtime, MdMsdos2Boot *boot, bool write)
                 md_device_error(runtime, boot, MD_DEV_ERR_READ_FAULT);
                 return true;
             }
-            for (i = 0u; i < boot->disk.sector_size; ++i) {
-                md_x86_write8(cpu, data_segment, (uint16_t)(guest_base + i), sector[i]);
-            }
+            md_x86_write_block(cpu, data_segment, guest_base, sector, boot->disk.sector_size);
             ++boot->disk_sectors_read;
         }
     }

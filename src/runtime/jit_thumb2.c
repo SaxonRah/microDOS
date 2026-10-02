@@ -6,6 +6,14 @@
 #include <stddef.h>
 #include <string.h>
 
+/* The emitted Thumb (resident regions, direct memory paths) wraps guest
+   addresses at 20 bits. Smaller experimental address spaces are not
+   supported by the JIT. */
+#if MD_X86_ADDRESS_BITS != 20
+#error "the runtime JIT requires MD_X86_ADDRESS_BITS == 20"
+#endif
+
+
 _Static_assert(offsetof(MdRuntime, cpu) == 0u,
                "M19.2 generated code requires MdX86 at MdRuntime offset 0");
 _Static_assert((MD_JIT_BLOCK_SLOTS & (MD_JIT_BLOCK_SLOTS - 1u)) == 0u,

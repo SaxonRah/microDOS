@@ -234,7 +234,7 @@ static void md_snapshot_block_pages(MdRuntime *runtime, MdDecodedBlock *block,
         unsigned j;
         int seen = 0;
 
-        runtime->code_page_executable[page] = 1u;
+        runtime->code_page_executable[page] |= MD_X86_PAGE_TRANSLATED;
 
         for (j = 0u; j < block->page_count; ++j) {
             if (block->code_page[j] == page) {
