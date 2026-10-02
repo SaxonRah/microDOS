@@ -1,5 +1,10 @@
 # microDOS
 
+M23 adds an interpreter-first execution router with optional selective hot-region
+promotion. See [implementation and rollout](docs/M23_IMPLEMENTATION.md) and the
+[design proposal](docs/M23_UNIFIED_TIERED_ENGINE_DESIGN.md). Promotion is disabled
+by default until Pico phase benchmarks validate it.
+
 microDOS is a source-assisted 8086 recompilation and execution project targeting the RP2350 / Pico 2 family, with the Pimoroni Pico Plus 2 as the first hardware target.
 
 The project has two permanent execution paths sharing one architectural state and one instruction-semantics layer:

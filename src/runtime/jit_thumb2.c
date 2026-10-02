@@ -1,5 +1,6 @@
 #include "microdos/jit.h"
 #include "microdos/ops.h"
+#include "microdos/region.h"
 
 #include "microdos/decode.h"
 
@@ -68,7 +69,7 @@ static unsigned md_jit_hash(uint16_t cs, uint16_t ip)
 
 static int md_jit_hot_ready(MdJit *jit, uint16_t cs, uint16_t ip)
 {
-#if MD_JIT_HOT_THRESHOLD <= 1
+#if MD_JIT_HOT_THRESHOLD <= 1 || !MD_JIT_LEGACY_HOTNESS
     (void)jit; (void)cs; (void)ip;
     return 1;
 #else
@@ -1409,7 +1410,7 @@ static enum MdJitCfState md_jit_generic_cf_after(const MdJitBlock *block, unsign
 static int md_jit_generic_si_window(const MdJitBlock *block, unsigned loop_start,
                                     unsigned final_dec, int *has_memory, int *has_store)
 {
-    int known_high = 0;
+    int known_high = loop_start == 0u;
     unsigned i;
     *has_memory = 0;
     *has_store = 0;
@@ -1614,23 +1615,27 @@ static int th_emit_cfg_cmp(MdThumbBuf *b, const MdJitOp *op)
  * Guest retirement is path-exact: r3 counts executed guest instructions.
  * Budget admission uses the conservative longest path, so the region either
  * executes completely within budget or executes zero instructions. */
-static int md_jit_emit_resident_cfg(MdJit *jit, MdJitBlock *block)
+/* Live loop-head admission; tmp/dst are scratch, budget stays in r2. */
+static void th_live_loop_count(MdThumbBuf *b, unsigned dst, unsigned tmp, unsigned stride)
 {
-    MdThumbBuf b;
-    size_t op_native[MD_JIT_MAX_OPS];
-    size_t patch_at[MD_JIT_MAX_OPS];
-    unsigned patch_target[MD_JIT_MAX_OPS];
-    unsigned patch_cond[MD_JIT_MAX_OPS];
-    unsigned patch_count = 0u;
+    const unsigned cxoff = (unsigned)(offsetof(MdX86, r) + MD_X86_CX * 2u);
+    size_t nonzero;
+    th16(b, th_ldrh(dst, 4u, cxoff));
+    th16(b, th_cmp_imm(dst, 0u));
+    nonzero = th_emit_bcond_placeholder(b, 1u);
+    th_load_imm32(b, dst, 65536u);
+    (void)th_patch_bcond(b, nonzero, 1u, b->at);
+    th16(b, th_movs(tmp, stride));
+    th16(b, (uint16_t)(0x4340u | (tmp << 3) | dst)); /* MULS dst,tmp */
+}
+
+static int md_jit_shape_cfg(const MdJitBlock *block, unsigned *out_start, uint32_t *out_trips, unsigned *out_edges)
+{
     const unsigned n = block->op_count;
     unsigned final_dec, loop_start, i, forward_edges = 0u;
     int cx_setup = -1;
-    uint32_t trips = 0u, worst_retired;
+    uint32_t trips = 0u;
     enum MdJitCfState final_cf;
-    const unsigned foff = (unsigned)offsetof(MdX86, flags_raw);
-    const unsigned coff = (unsigned)offsetof(MdX86, lazy_carry);
-    size_t blo_budget, loop_at, bne_loop, fail_at;
-
     if (n < 6u) return 0;
     if (block->ops[n - 1u].kind != MD_JIT_OP_JCC || block->ops[n - 1u].aux != 5u) return 0;
     final_dec = n - 2u;
@@ -1666,23 +1671,46 @@ static int md_jit_emit_resident_cfg(MdJit *jit, MdJitBlock *block)
         }
         if (!md_jit_generic_op_supported(op)) return 0;
     }
-    if (cx_setup < 0 || trips == 0u || forward_edges == 0u) return 0;
+    if ((cx_setup < 0 && loop_start != 0u) || (cx_setup >= 0 && trips == 0u) || forward_edges == 0u) return 0;
 
     /* Require a deterministic CF at the final DEC. A logic op after every
        branch path is sufficient and is easy to prove conservatively. */
     final_cf = md_jit_generic_cf_after(block, final_dec);
     if (final_cf != MD_JIT_CF_ZERO) return 0;
+    *out_start = loop_start; *out_trips = trips; *out_edges = forward_edges;
+    return 1;
+}
+
+static int md_jit_emit_resident_cfg(MdJit *jit, MdJitBlock *block, int allow_live)
+{
+    MdThumbBuf b;
+    size_t op_native[MD_JIT_MAX_OPS];
+    size_t patch_at[MD_JIT_MAX_OPS];
+    unsigned patch_target[MD_JIT_MAX_OPS];
+    unsigned patch_cond[MD_JIT_MAX_OPS];
+    unsigned patch_count = 0u;
+    const unsigned n = block->op_count;
+    unsigned final_dec, loop_start, i, forward_edges = 0u;
+    uint32_t trips = 0u, worst_retired;
+    const unsigned foff = (unsigned)offsetof(MdX86, flags_raw);
+    const unsigned coff = (unsigned)offsetof(MdX86, lazy_carry);
+    size_t blo_budget, loop_at, bne_loop, fail_at;
+
+    if (!md_jit_shape_cfg(block, &loop_start, &trips, &forward_edges)) return 0;
+    if (trips == 0u && !allow_live) return 0;
+    final_dec = n - 2u;
     if (!th_offset_ok_h(foff) || !th_offset_ok_b(coff)) return 0;
 
     worst_retired = loop_start + trips * (n - loop_start);
-    if (worst_retired == 0u) return 0;
+    if (trips != 0u && worst_retired == 0u) return 0;
 
     memset(&b, 0, sizeof(b));
     memset(op_native, 0, sizeof(op_native));
     th16(&b, 0xB5F8u);                    /* push {r3,r4,r5,r6,r7,lr} */
     th16(&b, th_mov(4u, 0u));             /* r4 runtime */
     th16(&b, th_mov(5u, 1u));             /* r5 block; free after admission */
-    th_load_imm32(&b, 0u, worst_retired);
+    if (trips != 0u) th_load_imm32(&b, 0u, worst_retired);
+    else th_live_loop_count(&b, 0u, 3u, n);
     th16(&b, th_cmp_reg(2u, 0u));          /* budget >= conservative longest path */
     blo_budget = th_emit_bcond_placeholder(&b, 3u);
 
@@ -1771,23 +1799,13 @@ static int md_jit_emit_resident_cfg(MdJit *jit, MdJitBlock *block)
  * is a straight-line prefix followed by an arbitrary supported body ending in
  * DEC CX / JNZ back to an earlier body instruction.  AX/BX/CX/SI are resident
  * in r0/r1/r6/r7 and [SI] uses r5 as the guest-memory base. */
-static int md_jit_emit_resident_counted(MdJit *jit, MdJitBlock *block)
+static int md_jit_shape_counted(const MdJitBlock *block, unsigned *out_start, uint32_t *out_trips, enum MdJitCfState *out_cf, int *out_memory, int *out_store)
 {
-    MdThumbBuf b;
     const unsigned n = block->op_count;
     unsigned final_dec, loop_start, i;
-    uint32_t trips = 0u, retired;
-    int cx_setup = -1;
-    int has_memory = 0, has_store = 0;
+    int cx_setup = -1, has_memory = 0, has_store = 0;
+    uint32_t trips = 0u;
     enum MdJitCfState final_cf;
-    const unsigned dsoff = (unsigned)offsetof(MdX86, ds);
-    const unsigned xoff = (unsigned)offsetof(MdX86, code_page_executable);
-    const unsigned memoff = (unsigned)offsetof(MdX86, memory);
-    const unsigned foff = (unsigned)offsetof(MdX86, flags_raw);
-    const unsigned coff = (unsigned)offsetof(MdX86, lazy_carry);
-    const unsigned moff = (unsigned)offsetof(MdJitBlock, materialize);
-    size_t blo_budget, bne_ds = 0u, bne_exec = 0u, bne_loop, loop_at, fail_at;
-
     if (n < 3u) return 0;
     if (block->ops[n - 1u].kind != MD_JIT_OP_JCC || block->ops[n - 1u].aux != 5u) return 0;
     final_dec = n - 2u;
@@ -1812,7 +1830,7 @@ static int md_jit_emit_resident_counted(MdJit *jit, MdJitBlock *block)
             }
         }
     }
-    if (cx_setup < 0 || trips == 0u) return 0;
+    if ((cx_setup < 0 && loop_start != 0u) || (cx_setup >= 0 && trips == 0u)) return 0;
 
     final_cf = md_jit_generic_cf_after(block, final_dec);
     if (final_cf == MD_JIT_CF_LAZY_UNKNOWN) return 0;
@@ -1825,8 +1843,32 @@ static int md_jit_emit_resident_counted(MdJit *jit, MdJitBlock *block)
         }
     }
 
+    *out_start = loop_start; *out_trips = trips; *out_cf = final_cf;
+    *out_memory = has_memory; *out_store = has_store;
+    return 1;
+}
+
+static int md_jit_emit_resident_counted(MdJit *jit, MdJitBlock *block, int allow_live)
+{
+    MdThumbBuf b;
+    const unsigned n = block->op_count;
+    unsigned final_dec, loop_start, i;
+    uint32_t trips = 0u, retired;
+    int has_memory = 0, has_store = 0;
+    enum MdJitCfState final_cf;
+    const unsigned dsoff = (unsigned)offsetof(MdX86, ds);
+    const unsigned xoff = (unsigned)offsetof(MdX86, code_page_executable);
+    const unsigned memoff = (unsigned)offsetof(MdX86, memory);
+    const unsigned foff = (unsigned)offsetof(MdX86, flags_raw);
+    const unsigned coff = (unsigned)offsetof(MdX86, lazy_carry);
+    const unsigned moff = (unsigned)offsetof(MdJitBlock, materialize);
+    size_t blo_budget, bne_ds = 0u, bne_si = 0u, bne_exec = 0u, bne_loop, loop_at, fail_at;
+
+    if (!md_jit_shape_counted(block, &loop_start, &trips, &final_cf, &has_memory, &has_store)) return 0;
+    if (trips == 0u && !allow_live) return 0;
+    final_dec = n - 2u;
     retired = loop_start + trips * (n - loop_start);
-    if (retired == 0u || !th_offset_ok_h(foff) || !th_offset_ok_b(coff) || !th_offset_ok_w(moff)) return 0;
+    if ((trips != 0u && retired == 0u) || !th_offset_ok_h(foff) || !th_offset_ok_b(coff) || !th_offset_ok_w(moff)) return 0;
     if (has_memory && (!th_offset_ok_h(dsoff) || !th_offset_ok_w(memoff))) return 0;
     if (has_store && !th_offset_ok_w(xoff)) return 0;
 
@@ -1835,7 +1877,8 @@ static int md_jit_emit_resident_counted(MdJit *jit, MdJitBlock *block)
     th16(&b, th_mov(4u, 0u));             /* r4 runtime */
     th16(&b, th_mov(5u, 1u));             /* r5 block during entry guards */
 
-    th_load_imm32(&b, 3u, retired);
+    if (trips != 0u) th_load_imm32(&b, 3u, retired);
+    else th_live_loop_count(&b, 3u, 0u, n);
     th16(&b, th_cmp_reg(2u, 3u));          /* r2 is budget argument */
     blo_budget = th_emit_bcond_placeholder(&b, 3u);
 
@@ -1843,6 +1886,14 @@ static int md_jit_emit_resident_counted(MdJit *jit, MdJitBlock *block)
         th16(&b, th_ldrh(0u, 4u, dsoff));
         th16(&b, th_cmp_imm(0u, 0u));
         bne_ds = th_emit_bcond_placeholder(&b, 1u);
+        if (trips == 0u) {
+            const unsigned sioff = (unsigned)(offsetof(MdX86, r) + MD_X86_SI * 2u);
+            th16(&b, th_ldrh(0u, 4u, sioff));
+            th16(&b, th_lsr_imm(0u, 0u, 15u));
+            th16(&b, th_cmp_imm(0u, 0u));
+            /* Share the DS failure target, but retain a separate patch. */
+            bne_si = th_emit_bcond_placeholder(&b, 0u);
+        }
     }
     if (has_store) {
         th16(&b, th_ldr(0u, 4u, xoff));
@@ -1866,6 +1917,8 @@ static int md_jit_emit_resident_counted(MdJit *jit, MdJitBlock *block)
         ++jit->helper_sites;
     }
 
+    if (trips == 0u) th_live_loop_count(&b, 3u, 2u, n);
+
     /* Load the resident architectural set once.  Unused registers cost a few
        one-time loads/stores but let one emitter handle many loop shapes. */
     th_resident_load_reg(&b, MD_X86_AX);
@@ -1873,7 +1926,7 @@ static int md_jit_emit_resident_counted(MdJit *jit, MdJitBlock *block)
     th_resident_load_reg(&b, MD_X86_CX);
     th_resident_load_reg(&b, MD_X86_SI);
     if (has_memory) th16(&b, th_ldr(5u, 4u, memoff));
-    th_load_imm32(&b, 3u, retired);        /* C helper may have clobbered r3 */
+    if (trips != 0u) th_load_imm32(&b, 3u, retired); /* helper may clobber r3 */
 
     for (i = 0u; i < loop_start && !b.failed; ++i) {
         if (!th_emit_generic_resident_op(&b, &block->ops[i])) return 0;
@@ -1902,6 +1955,7 @@ static int md_jit_emit_resident_counted(MdJit *jit, MdJitBlock *block)
     fail_at = b.at;
     if (!th_patch_bcond(&b, blo_budget, 3u, fail_at)) return 0;
     if (has_memory && !th_patch_bcond(&b, bne_ds, 1u, fail_at)) return 0;
+    if (has_memory && trips == 0u && !th_patch_bcond(&b, bne_si, 0u, fail_at)) return 0;
     if (has_store && !th_patch_bcond(&b, bne_exec, 1u, fail_at)) return 0;
     th16(&b, th_movs(0u, 0u));
     th16(&b, 0xBDF8u);
@@ -2106,20 +2160,12 @@ static int th_emit_lods_copy(MdThumbBuf *b, const MdJitBlock *block, int backwar
     return !b->failed;
 }
 
-static int md_jit_emit_resident_lodsloop(MdJit *jit, MdJitBlock *block)
+static int md_jit_shape_lodsloop(const MdJitBlock *block, unsigned *out_start)
 {
-    MdThumbBuf b;
     const unsigned n = block->op_count;
     const MdJitOp *last;
-    const unsigned dsoff = (unsigned)offsetof(MdX86, ds);
-    const unsigned moff = (unsigned)offsetof(MdX86, memory);
-    const unsigned foff = (unsigned)offsetof(MdX86, flags_raw);
-    const unsigned opoff = (unsigned)offsetof(MdX86, lazy_op);
     int has_lods = 0, li;
-    unsigned loop_start;
-    size_t bmi_back;
-    unsigned i;
-
+    unsigned loop_start, i;
     if (n < 2u || n > 32u) return 0;
     last = &block->ops[n - 1u];
     if (last->kind != MD_JIT_OP_LOOP || last->aux != 2u) return 0;
@@ -2137,6 +2183,21 @@ static int md_jit_emit_resident_lodsloop(MdJit *jit, MdJitBlock *block)
         if (op->aux == 2u || op->aux == 3u) return 0;
     }
     if (!has_lods) return 0;
+    *out_start = loop_start;
+    return 1;
+}
+
+static int md_jit_emit_resident_lodsloop(MdJit *jit, MdJitBlock *block)
+{
+    MdThumbBuf b;
+    const unsigned dsoff = (unsigned)offsetof(MdX86, ds);
+    const unsigned moff = (unsigned)offsetof(MdX86, memory);
+    const unsigned foff = (unsigned)offsetof(MdX86, flags_raw);
+    const unsigned opoff = (unsigned)offsetof(MdX86, lazy_op);
+    unsigned loop_start;
+    size_t bmi_back;
+
+    if (!md_jit_shape_lodsloop(block, &loop_start)) return 0;
     if (!th_offset_ok_h(dsoff) || !th_offset_ok_w(moff) || !th_offset_ok_h(foff) ||
         !th_offset_ok_b(opoff)) return 0;
 
@@ -2171,13 +2232,43 @@ static int md_jit_emit_resident_lodsloop(MdJit *jit, MdJitBlock *block)
     return 1;
 }
 
-static int md_jit_emit_resident(MdJit *jit, MdJitBlock *block)
+static uint32_t md_jit_shared_dec(MdRuntime *rt, MdJitBlock *block, uint32_t budget)
 {
+    unsigned reg = md_x86_read8(&rt->cpu, block->cs, block->ip) & 7u;
+    return md_region_try_dec_jnz(rt, reg, block->ip, block->end_ip, budget);
+}
+
+static uint32_t md_jit_shared_checksum(MdRuntime *rt, MdJitBlock *block, uint32_t budget)
+{
+    return md_region_try_lodsw_add_dx_ax_loop(rt, block->ip, block->end_ip, budget);
+}
+
+static int md_jit_emit_resident(MdJit *jit, MdJitBlock *block, int allow_live)
+{
+    const MdJitOp *ops = block->ops;
+    if (allow_live && block->op_count == 2u && ops[0].kind == MD_JIT_OP_DEC_R16 &&
+        ops[1].kind == MD_JIT_OP_JCC && ops[1].aux == 5u && ops[1].target == ops[0].ip) {
+        block->native = md_jit_shared_dec;
+        block->resident = 2u;
+        block->direct_prefix_ops = 2u;
+        ++jit->resident_regions;
+        return 1;
+    }
+    if (allow_live && block->op_count == 3u && ops[0].kind == MD_JIT_OP_LODS && ops[0].aux == 2u &&
+        ops[1].kind == MD_JIT_OP_ALU_RR16 && ops[1].aux == 0u &&
+        ops[1].reg == MD_X86_DX && ops[1].imm == MD_X86_AX &&
+        ops[2].kind == MD_JIT_OP_LOOP && ops[2].aux == 2u && ops[2].target == ops[0].ip) {
+        block->native = md_jit_shared_checksum;
+        block->resident = 3u;
+        block->direct_prefix_ops = 3u;
+        ++jit->resident_regions;
+        return 1;
+    }
     if (md_jit_emit_resident_lodsloop(jit, block)) return 1;   /* M20.3 */
     if (md_jit_is_resident_loop(block)) return md_jit_emit_resident_loop(jit, block);
     if (md_jit_is_resident_memloop(block)) return md_jit_emit_resident_memloop(jit, block);
-    if (md_jit_emit_resident_cfg(jit, block)) return 1;
-    if (md_jit_emit_resident_counted(jit, block)) return 1;
+    if (md_jit_emit_resident_cfg(jit, block, allow_live)) return 1;
+    if (md_jit_emit_resident_counted(jit, block, allow_live)) return 1;
     return 0;
 }
 
@@ -2249,21 +2340,11 @@ static int th_emit_loop(MdThumbBuf *b, const MdJitBlock *block, unsigned index,
     return !b->failed;
 }
 
-static int md_jit_emit_thumb(MdJit *jit, MdJitBlock *block)
+static unsigned md_jit_direct_prefix(const MdJitBlock *block, int *materialize)
 {
-    MdThumbBuf b;
-
-    /* M19.2: recognize loop-shaped regions before the conservative per-op
-       emitter. A failed/unsafe specialization simply falls through to M19.1. */
-    if (md_jit_emit_resident(jit, block)) return 1;
-    size_t op_native[MD_JIT_MAX_OPS];
-    unsigned i;
-    unsigned direct = 0u;
+    unsigned i, direct = 0u;
     enum MdJitCfState cf = MD_JIT_CF_RAW;
     int needs_materialize = 0;
-    memset(&b, 0, sizeof(b));
-    memset(op_native, 0, sizeof(op_native));
-
     /* Decide how far direct lowering can proceed without duplicating subtle
        flag semantics. ADD/SUB leave CF lazy-unknown; a following INC/DEC
        would need md_x86_cf(), so that boundary remains canonical for now. */
@@ -2325,6 +2406,26 @@ static int md_jit_emit_thumb(MdJit *jit, MdJitBlock *block)
         if (!ok) break;
         ++direct;
     }
+    *materialize = needs_materialize;
+    return direct;
+}
+
+static int md_jit_emit_thumb(MdJit *jit, MdJitBlock *block, int allow_live)
+{
+    MdThumbBuf b;
+
+    /* M19.2: recognize loop-shaped regions before the conservative per-op
+       emitter. A failed/unsafe specialization simply falls through to M19.1. */
+    if (md_jit_emit_resident(jit, block, allow_live)) return 1;
+    size_t op_native[MD_JIT_MAX_OPS];
+    unsigned i;
+    unsigned direct = 0u;
+    enum MdJitCfState cf = MD_JIT_CF_RAW;
+    int needs_materialize = 0;
+    memset(&b, 0, sizeof(b));
+    memset(op_native, 0, sizeof(op_native));
+
+    direct = md_jit_direct_prefix(block, &needs_materialize);
     block->direct_prefix_ops = (uint8_t)direct;
 
     th16(&b, 0xB5F8u);                    /* push {r3,r4,r5,r6,r7,lr} */
@@ -2456,11 +2557,12 @@ static int md_jit_emit_thumb(MdJit *jit, MdJitBlock *block)
                 break;
             case MD_JIT_OP_HLT: {
                 const unsigned soff = (unsigned)offsetof(MdRuntime, stop_reason);
-                if (!th_offset_ok_w(soff)) { b.failed = 1; break; }
                 th16(&b, th_add_imm(6u, 1u));
                 th_store_ip(&b, op->next_ip);
                 th16(&b, th_movs(0u, MD_STOP_HALT));
-                th16(&b, (uint16_t)(0x6000u | (((soff >> 2) & 31u) << 6) | (4u << 3) | 0u)); /* str r0,[r4,#off] */
+                th_load_imm32(&b, 1u, soff);
+                th16(&b, th_add_reg(1u, 4u, 1u));
+                th16(&b, 0x6008u); /* str r0,[r1,#0], any runtime layout */
                 th_return(&b);
                 i = direct;
                 break;
@@ -2514,25 +2616,19 @@ static void md_jit_flush_code(MdJit *jit)
     MD_JIT_STAT(++jit->flushes);
 }
 
-static MdJitBlock *md_jit_compile(MdJit *jit, MdRuntime *runtime)
+static bool md_jit_decode_block(MdJit *jit, MdRuntime *runtime, uint16_t cs, uint16_t start_ip, MdJitBlock *block, MdJitProbe *probe)
 {
     uint8_t image[MD_JIT_DECODE_WINDOW];
-    const uint16_t cs = runtime->cpu.cs;
-    const uint16_t start_ip = runtime->cpu.ip;
     const size_t avail = (size_t)((0x10000u - (uint32_t)start_ip) < MD_JIT_DECODE_WINDOW
                                       ? (0x10000u - (uint32_t)start_ip)
                                       : MD_JIT_DECODE_WINDOW);
-    MdJitBlock *block;
-    unsigned slot;
     uint16_t ip;
     size_t i;
     uint32_t linear0, linear1;
 
-    if (avail == 0u) return NULL;
+    if (avail == 0u) return false;
     for (i = 0u; i < avail; ++i) image[i] = md_x86_read8(&runtime->cpu, cs, (uint16_t)(start_ip + i));
 
-    slot = md_jit_hash(cs, start_ip);
-    block = &jit->blocks[slot];
     memset(block, 0, sizeof(*block));
     block->ops = jit->compile_ops;
     block->materialize = md_jit_materialize;
@@ -2547,72 +2643,111 @@ static MdJitBlock *md_jit_compile(MdJit *jit, MdRuntime *runtime)
         MdDecodedInstruction inst;
         MdJitOp *op;
         if (!md_decode_8086(image, avail, start_ip, ip, &inst) || !inst.valid_8086) {
-            if (block->op_count == 0u) return NULL;
+            if (block->op_count == 0u) return false;
             break;
         }
         op = &block->ops[block->op_count++];
         md_jit_classify(image, start_ip, &inst, op);
+        if (probe != NULL) {
+            if (inst.flow == MD_DECODE_FLOW_CALL || inst.flow == MD_DECODE_FLOW_INDIRECT_CALL)
+                probe->has_call = 1u;
+            if (inst.flow == MD_DECODE_FLOW_RETURN) probe->has_return = 1u;
+            if (inst.flow != MD_DECODE_FLOW_FALLTHROUGH) ++probe->control_ops;
+        }
         ip = inst.next_ip;
         if (md_jit_boundary(&inst) &&
             !md_jit_continue_forward_conditional(&inst, start_ip, avail)) break;
     }
 
-    if (block->op_count == 0u || ip < start_ip) return NULL;
+    if (block->op_count == 0u || ip < start_ip) return false;
     block->end_ip = ip;
     block->source_bytes = (uint16_t)(ip - start_ip);
 
     linear0 = md_x86_linear(cs, start_ip);
-    if (linear0 + block->source_bytes > MD_X86_ADDRESS_SPACE) return NULL;
+    if (linear0 + block->source_bytes > MD_X86_ADDRESS_SPACE) return false;
     linear1 = linear0 + block->source_bytes - 1u;
     block->page0 = (uint8_t)md_x86_code_page(linear0);
     block->page1 = (uint8_t)md_x86_code_page(linear1);
     block->page_count = block->page0 == block->page1 ? 1u : 2u;
 
+    return true;
+}
+
+static MdJitBlock *md_jit_compile(MdJit *jit, MdRuntime *runtime, int allow_live)
+{
+    const uint16_t cs = runtime->cpu.cs, start_ip = runtime->cpu.ip;
+    MdJitBlock *block = &jit->blocks[md_jit_hash(cs, start_ip)];
+    if (!md_jit_decode_block(jit, runtime, cs, start_ip, block, NULL)) return NULL;
     md_runtime_mark_code_range(runtime, cs, start_ip, block->source_bytes);
     block->code_epoch = runtime->code_epoch;
     block->page_gen0 = runtime->code_page_generation[block->page0];
     block->page_gen1 = runtime->code_page_generation[block->page1];
-
-    if (!md_jit_emit_thumb(jit, block) || !md_jit_persist_ops(jit, block)) {
-        /* Arena full: discard translations and compile this block into the
-           fresh arena. Guest state/decoder metadata remain authoritative. */
+    if (!md_jit_emit_thumb(jit, block, allow_live) || !md_jit_persist_ops(jit, block)) {
         md_jit_flush_code(jit);
-        slot = md_jit_hash(cs, start_ip);
-        block = &jit->blocks[slot];
-        memset(block, 0, sizeof(*block));
-        block->ops = jit->compile_ops;
-        block->materialize = md_jit_materialize;
-        block->store8_slow = md_jit_store8_slow;
-        block->exec_one = md_jit_exec_one;
-        block->owner = jit;
-        block->cs = cs;
-        block->ip = start_ip;
-        ip = start_ip;
-        for (i = 0u; i < avail && block->op_count < MD_JIT_MAX_OPS;) {
-            MdDecodedInstruction inst;
-            MdJitOp *op;
-            if (!md_decode_8086(image, avail, start_ip, ip, &inst) || !inst.valid_8086) return NULL;
-            op = &block->ops[block->op_count++];
-            md_jit_classify(image, start_ip, &inst, op);
-            ip = inst.next_ip;
-            i = (size_t)(uint16_t)(ip - start_ip);
-            if (md_jit_boundary(&inst) &&
-            !md_jit_continue_forward_conditional(&inst, start_ip, avail)) break;
-        }
-        block->end_ip = ip;
-        block->source_bytes = (uint16_t)(ip - start_ip);
-        block->page0 = (uint8_t)md_x86_code_page(linear0);
-        block->page1 = (uint8_t)md_x86_code_page(linear0 + block->source_bytes - 1u);
-        block->page_count = block->page0 == block->page1 ? 1u : 2u;
+        block = &jit->blocks[md_jit_hash(cs, start_ip)];
+        if (!md_jit_decode_block(jit, runtime, cs, start_ip, block, NULL)) return NULL;
         block->code_epoch = runtime->code_epoch;
         block->page_gen0 = runtime->code_page_generation[block->page0];
         block->page_gen1 = runtime->code_page_generation[block->page1];
-        if (!md_jit_emit_thumb(jit, block) || !md_jit_persist_ops(jit, block)) return NULL;
+        if (!md_jit_emit_thumb(jit, block, allow_live) || !md_jit_persist_ops(jit, block)) return NULL;
     }
-
     block->valid = 1u;
     MD_JIT_STAT(++jit->compiles);
     return block;
+}
+
+bool md_jit_probe(MdJit *jit, MdRuntime *runtime, uint16_t cs, uint16_t ip, MdJitProbe *probe)
+{
+    MdJitBlock block;
+    unsigned i, loop_start, edges;
+    uint32_t trips;
+    enum MdJitCfState cf;
+    int materialize, memory, store;
+    if (probe == NULL) return false;
+    memset(probe, 0, sizeof(*probe));
+    if (jit == NULL || runtime == NULL || !md_jit_decode_block(jit, runtime, cs, ip, &block, probe))
+        return false;
+    probe->decoded_ops = block.op_count;
+    probe->direct_ops = (uint8_t)md_jit_direct_prefix(&block, &materialize);
+    probe->fallback_ops = (uint8_t)(block.op_count - probe->direct_ops);
+    probe->pages = block.page_count;
+    for (i = 0u; i < block.op_count; ++i) {
+        const MdJitOp *op = &block.ops[i];
+        if (op->kind == MD_JIT_OP_CALL_NEAR) probe->has_call = 1u;
+        if (op->kind >= MD_JIT_OP_RET_NEAR && op->kind <= MD_JIT_OP_RET_FAR_IMM)
+            probe->has_return = 1u;
+        if ((op->kind == MD_JIT_OP_JCC || op->kind == MD_JIT_OP_JMP || op->kind == MD_JIT_OP_LOOP) &&
+            op->target <= op->ip && md_jit_find_op_ip(&block, op->target) >= 0)
+            probe->has_backedge = 1u;
+    }
+    if (md_jit_is_resident_loop(&block) ||
+        (block.op_count == 2u && block.ops[0].kind == MD_JIT_OP_DEC_R16 &&
+         block.ops[1].kind == MD_JIT_OP_JCC && block.ops[1].aux == 5u &&
+         block.ops[1].target == block.ops[0].ip))
+        probe->resident_kind = MD_JIT_RESIDENT_DEC_JNZ;
+    else if (md_jit_is_resident_memloop(&block)) probe->resident_kind = MD_JIT_RESIDENT_MEMLOOP;
+    else if (md_jit_shape_lodsloop(&block, &loop_start)) probe->resident_kind = MD_JIT_RESIDENT_LODS_LOOP;
+    else if (md_jit_shape_cfg(&block, &loop_start, &trips, &edges)) probe->resident_kind = MD_JIT_RESIDENT_CFG;
+    else if (md_jit_shape_counted(&block, &loop_start, &trips, &cf, &memory, &store))
+        probe->resident_kind = memory ? MD_JIT_RESIDENT_MEMLOOP : MD_JIT_RESIDENT_COUNTED;
+    return true;
+}
+
+bool md_jit_prepare_region(MdJit *jit, MdRuntime *runtime)
+{
+    MdJitBlock *block;
+    if (jit == NULL || runtime == NULL || jit->code == NULL || jit->code_size < 64u)
+        return false;
+    MD_JIT_STAT(++jit->lookups);
+    block = &jit->blocks[md_jit_hash(runtime->cpu.cs, runtime->cpu.ip)];
+    if (block->cs == runtime->cpu.cs && block->ip == runtime->cpu.ip &&
+        md_jit_block_current(block, runtime)) {
+        MD_JIT_STAT(++jit->hits);
+        return true;
+    }
+    MD_JIT_STAT(++jit->misses);
+    /* Router heat replaces the legacy per-lookup hotness gate. */
+    return md_jit_compile(jit, runtime, 1) != NULL;
 }
 
 static MdJitBlock *md_jit_get(MdJit *jit, MdRuntime *runtime)
@@ -2637,7 +2772,7 @@ static MdJitBlock *md_jit_get(MdJit *jit, MdRuntime *runtime)
         jit->last_lookup_cold = 1u;
         return NULL;
     }
-    return md_jit_compile(jit, runtime);
+    return md_jit_compile(jit, runtime, 0);
 }
 
 void md_jit_init(MdJit *jit, void *code, size_t code_size)
@@ -2662,6 +2797,14 @@ void md_jit_reset(MdJit *jit)
 
 static uint32_t md_jit_execute_block(MdRuntime *runtime, MdJitBlock *block, uint32_t budget)
 {
+    if (block->resident == 2u || block->resident == 3u) {
+        uint32_t retired = block->native(runtime, block, budget);
+#if !defined(__arm__) && !defined(__thumb__)
+        runtime->instructions += retired;
+        MD_JIT_STAT(block->owner->direct_instructions += retired);
+#endif
+        return retired;
+    }
 #if defined(__arm__) || defined(__thumb__)
     return block->native(runtime, block, budget);
 #else
@@ -2681,6 +2824,62 @@ static uint32_t md_jit_execute_block(MdRuntime *runtime, MdJitBlock *block, uint
     }
     return (uint32_t)(runtime->instructions - before);
 #endif
+}
+
+MdStopReason md_jit_run_region(MdJit *jit, MdRuntime *runtime, uint64_t budget,
+                               MdJitRunResult *result)
+{
+    MdJitBlock *block;
+    uint16_t cs, ip;
+    uint32_t left;
+    if (result == NULL) return MD_STOP_FAULT;
+    memset(result, 0, sizeof(*result));
+    if (jit == NULL || runtime == NULL) return MD_STOP_FAULT;
+    if (runtime->stop_reason != MD_STOP_NONE || budget == 0u) return runtime->stop_reason;
+    cs = runtime->cpu.cs; ip = runtime->cpu.ip;
+    left = (uint32_t)(budget > 0x7fffffffu ? 0x7fffffffu : budget);
+    block = &jit->blocks[md_jit_hash(cs, ip)];
+    if (!block->valid || block->cs != cs || block->ip != ip) return MD_STOP_NONE;
+    if (!md_jit_block_current(block, runtime)) {
+        result->invalidated = 1u;
+        MD_JIT_STAT(++jit->invalidations);
+        return MD_STOP_NONE;
+    }
+    while (left != 0u && runtime->stop_reason == MD_STOP_NONE &&
+           runtime->cpu.cs == cs && runtime->cpu.ip == ip) {
+        uint32_t retired;
+        if (left < block->op_count) { result->budget_limited = 1u; break; }
+        if (!md_jit_block_current(block, runtime)) { result->invalidated = 1u; break; }
+        ++result->entries;
+        MD_JIT_STAT(++jit->native_entries);
+        if (block->resident) MD_JIT_STAT(++jit->resident_entries);
+        if (block->generic_region) MD_JIT_STAT(++jit->generic_entries);
+        if (block->cfg_region) MD_JIT_STAT(++jit->cfg_entries);
+        retired = md_jit_execute_block(runtime, block, left);
+#if defined(__arm__) || defined(__thumb__)
+        runtime->instructions += retired;
+        MD_JIT_STAT(jit->direct_instructions += retired);
+#endif
+        result->retired += retired;
+        result->native += retired;
+        MD_JIT_STAT(++jit->native_returns);
+        left -= retired;
+        if (block->resident) MD_JIT_STAT(jit->resident_instructions += retired);
+        if (block->generic_region) MD_JIT_STAT(jit->generic_instructions += retired);
+        if (block->cfg_region) MD_JIT_STAT(jit->cfg_instructions += retired);
+        if (!md_jit_block_current(block, runtime)) { result->invalidated = 1u; break; }
+        if (retired == 0u) {
+            const uint32_t trips = runtime->cpu.r[MD_X86_CX] ? runtime->cpu.r[MD_X86_CX] : 65536u;
+            if (block->generic_region && (uint64_t)trips * block->op_count > left)
+                result->budget_limited = 1u;
+            else { ++result->zero_exits; MD_JIT_STAT(++jit->zero_progress_fallbacks); }
+            break;
+        }
+    }
+    if (left == 0u && runtime->cpu.cs == cs && runtime->cpu.ip == ip)
+        result->budget_limited = 1u;
+    result->cs_changed = runtime->cpu.cs != cs;
+    return runtime->stop_reason;
 }
 
 static MdStopReason md_jit_run_common(MdJit *jit, MdRuntime *runtime,

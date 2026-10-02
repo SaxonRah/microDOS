@@ -5,7 +5,11 @@
 #ifndef MICRODOS_SYSTEM_JIT_CODE_BYTES
 #define MICRODOS_SYSTEM_JIT_CODE_BYTES (24u * 1024u)
 #endif
+#if defined(_MSC_VER)
+__declspec(align(16)) static uint8_t g_md_system_jit_code[MICRODOS_SYSTEM_JIT_CODE_BYTES];
+#else
 static uint8_t g_md_system_jit_code[MICRODOS_SYSTEM_JIT_CODE_BYTES] __attribute__((aligned(16)));
+#endif
 static MdJit g_md_system_jit;
 #endif
 
@@ -19,6 +23,7 @@ void md_dos2_system_init(MdDos2System *sys, uint8_t *memory, MdBlockCache *cache
     MdHooks hooks;
 
     memset(sys, 0, sizeof(*sys));
+    md_exec_router_init(&sys->router);
     md_msdos2_boot_init(&sys->boot);
     sys->boot.continue_after_dosinit = true;
 
@@ -50,7 +55,10 @@ void md_dos2_system_set_aot(MdDos2System *sys, const MdAotProgram *const *progra
 
 void md_dos2_system_set_jit(MdDos2System *sys, MdJit *jit)
 {
-    if (sys != NULL) sys->jit = jit;
+    if (sys != NULL) {
+        sys->jit = jit;
+        md_exec_router_init(&sys->router);
+    }
 }
 
 bool md_dos2_system_start(MdDos2System *sys, const uint8_t *msdos_sys, size_t size)
@@ -59,6 +67,10 @@ bool md_dos2_system_start(MdDos2System *sys, const uint8_t *msdos_sys, size_t si
         msdos_sys[0] != 0xE9u || msdos_sys[1] != 0x78u || msdos_sys[2] != 0x3Eu) {
         return false;
     }
+    md_exec_router_init(&sys->router);
+#ifdef MICRODOS_ENABLE_JIT
+    if (sys->jit != NULL) md_jit_reset(sys->jit);
+#endif
     md_msdos2_boot_prepare_cpu(&sys->runtime, &sys->boot, msdos_sys, size);
     if (sys->aot_enabled && sys->kernel_program != NULL) {
         sys->kernel_attached = sys->kernel_program->attach(&sys->runtime, sys->boot.dos_segment);
@@ -162,6 +174,9 @@ MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
                     const uint64_t before_aot = rt->aot_instructions;
                     const MdStopReason st =
                         prog->enter(rt, left < MD_DOS2_AOT_CHUNK ? left : MD_DOS2_AOT_CHUNK);
+                    md_exec_router_record(&sys->router, MD_EXEC_TIER_AOT, rt->aot_instructions - before_aot);
+                    md_exec_router_record(&sys->router, MD_EXEC_TIER_INTERP,
+                                          rt->instructions - before - (rt->aot_instructions - before_aot));
                     ++sys->aot_enters;
                     if (prog == sys->kernel_program) {
                         sys->kernel_aot_instructions += rt->aot_instructions - before_aot;
@@ -190,6 +205,9 @@ MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
                 const uint16_t entered_cs = rt->cpu.cs;
                 const MdStopReason st =
                     prog->enter(rt, left < MD_DOS2_AOT_CHUNK ? left : MD_DOS2_AOT_CHUNK);
+                md_exec_router_record(&sys->router, MD_EXEC_TIER_AOT, rt->aot_instructions - before_aot);
+                md_exec_router_record(&sys->router, MD_EXEC_TIER_INTERP,
+                                      rt->instructions - before - (rt->aot_instructions - before_aot));
                 ++sys->aot_enters;
                 if (prog == sys->kernel_program) {
                     sys->kernel_aot_instructions += rt->aot_instructions - before_aot;
@@ -202,6 +220,7 @@ MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
                     /* Keep AOT hole/invalid-chunk behaviour conservative for
                        now; M20 JIT is for segments with no static image. */
                     (void)md_interp_step(rt);
+                    md_exec_router_record(&sys->router, MD_EXEC_TIER_INTERP, 1u);
                     ++sys->attached_steps;
                 }
                 continue;
@@ -216,6 +235,7 @@ MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
                Keep it on the canonical threaded path until its CS changes. */
             const uint64_t before = rt->instructions;
             (void)md_interp_run_until_cs_change(rt, left);
+            md_exec_router_record(&sys->router, MD_EXEC_TIER_INTERP, rt->instructions - before);
             sys->bios_interpreted_instructions += rt->instructions - before;
             sys->jit->bios_bypass_instructions += rt->instructions - before;
             if (rt->stop_reason == MD_STOP_BUDGET) {
@@ -227,26 +247,56 @@ MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
         }
 
         if (sys->jit != NULL) {
-            /* M20.2: arbitrary/unrecognised application segments stay in the
-               native translator until a far transfer/INT/IRET changes CS.
-               Static kernel/DOS2TEST AOT still has first priority above. */
-            const uint64_t before = rt->instructions;
-            const uint64_t before_native = sys->jit->direct_instructions;
-            const uint64_t before_fallback = sys->jit->fallback_instructions;
-            const MdStopReason st = md_jit_run_until_cs_change(sys->jit, rt, left);
-            sys->jit_instructions += rt->instructions - before;
-            sys->jit_native_instructions += sys->jit->direct_instructions - before_native;
-            sys->jit_fallback_instructions += sys->jit->fallback_instructions - before_fallback;
-            if (st == MD_STOP_BUDGET) {
-                rt->stop_reason = MD_STOP_NONE;
-                break;
+            MdExecSite *site = md_exec_router_lookup(&sys->router, rt->cpu.cs, rt->cpu.ip);
+            uint64_t before;
+            uint64_t q;
+            MdStopReason st;
+            if (site->mode == MD_EXEC_JIT_REGION) {
+                MdJitRunResult result;
+                st = md_jit_run_region(sys->jit, rt, left, &result);
+                sys->jit_instructions += result.retired;
+                sys->jit_native_instructions += result.native;
+                sys->jit_fallback_instructions += result.fallback;
+                md_exec_router_record(&sys->router, MD_EXEC_TIER_JIT, result.retired);
+                md_exec_router_jit_feedback(&sys->router, site, &result);
+                if (st != MD_STOP_NONE) break;
+                if (result.retired != 0u) continue;
+                /* Refused budget/guard or invalidated code: canonical quantum,
+                   never retry native at the unchanged IP without progress. */
             }
-            if (st != MD_STOP_NONE) break;
+            q = left < MD_EXEC_INTERP_QUANTUM ? left : MD_EXEC_INTERP_QUANTUM;
+            before = rt->instructions;
+            st = md_interp_run_until_cs_change(rt, q);
+            md_exec_router_record(&sys->router, MD_EXEC_TIER_INTERP, rt->instructions - before);
+            if (st == MD_STOP_BUDGET) rt->stop_reason = MD_STOP_NONE;
+            else if (st != MD_STOP_NONE) break;
+            /* Sample only real quanta or CS boundaries, not arbitrary tiny
+               caller slices. Profile/test slicing must not manufacture heat. */
+            if (rt->instructions - before == MD_EXEC_INTERP_QUANTUM || st == MD_STOP_NONE) {
+                site = md_exec_router_lookup(&sys->router, rt->cpu.cs, rt->cpu.ip);
+                md_exec_router_sample(site);
+#if MD_EXEC_ENABLE_PROMOTION
+                if (rt->cpu.cs != sys->boot.bios_segment &&
+                    !(sys->aot_enabled && md_aot_here(sys) != NULL) &&
+                    md_exec_router_should_probe(site)) {
+                    MdJitProbe probe;
+                    if (md_jit_probe(sys->jit, rt, site->cs, site->ip, &probe) &&
+                        md_exec_router_accept_probe(&probe, MD_EXEC_ENABLE_DIRECT != 0) &&
+                        md_jit_prepare_region(sys->jit, rt))
+                        md_exec_router_promote(&sys->router, site);
+                    else md_exec_router_reject(&sys->router, site);
+                }
+#endif
+            }
             continue;
         }
 #endif
 
-        (void)md_interp_run_until_cs_change(rt, left);
+        {
+            const uint64_t before = rt->instructions;
+            (void)md_interp_run_until_cs_change(rt, left);
+            md_exec_router_record(&sys->router, MD_EXEC_TIER_INTERP, rt->instructions - before);
+        }
         if (rt->stop_reason == MD_STOP_BUDGET) {
             rt->stop_reason = MD_STOP_NONE;
             break;

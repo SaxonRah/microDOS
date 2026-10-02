@@ -269,7 +269,13 @@ static void run_fixture(const Fixture *f, int verbose)
     CHECK(same_mem);
     CHECK(a.instructions == b.instructions);
 #if defined(__arm__) || defined(__thumb__)
-    if (f->max_fallback >= 0) CHECK(jit.fallback_instructions <= (uint64_t)f->max_fallback);
+    /* M22 changed a single warm-up fallback into a bounded burst. Preserve
+       zero-fallback requirements; nonzero allowances admit that one burst. */
+    if (f->max_fallback >= 0) {
+        const uint64_t limit = (uint64_t)f->max_fallback +
+            (f->max_fallback > 0 ? MD_JIT_ZERO_ESCAPE_BURST - 1u : 0u);
+        CHECK(jit.fallback_instructions <= limit);
+    }
     if (f->want_resident) CHECK(jit.resident_regions >= 1u);
     if (f->want_control) CHECK(jit.control_instructions > 0u);
 #endif

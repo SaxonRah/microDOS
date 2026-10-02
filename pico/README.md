@@ -1,5 +1,10 @@
 # microDOS on Pico 2 (Pimoroni Pico Plus 2)
 
+The DOS JIT targets now use the M23 execution router. Unknown code begins in the
+interpreter; resident/direct promotion is opt-in through CMake. See the
+[M23 rollout guide](../docs/M23_IMPLEMENTATION.md) for build switches, profiling,
+and hardware acceptance gates.
+
 Boots the released MS-DOS 2.0 kernel and COMMAND.COM on an RP2350 with 8 MiB
 PSRAM, with a USB serial console. DOS2TEST.COM is on the disk and runs as
 dosrecomp-compiled native code when you start it at `A>`.

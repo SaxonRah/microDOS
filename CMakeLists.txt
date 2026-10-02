@@ -14,6 +14,7 @@ add_library(microdos_runtime STATIC
     src/runtime/x86_interp.c
     src/runtime/x86_block_cache.c
     src/runtime/region.c
+    src/runtime/exec_router.c
 )
 add_library(microdos::runtime ALIAS microdos_runtime)
 target_include_directories(microdos_runtime PUBLIC "${CMAKE_CURRENT_LIST_DIR}/include" PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/runtime")
@@ -193,6 +194,44 @@ if(MD_BUILD_TESTS)
     target_include_directories(microdos_region_aot_tests PRIVATE "${MD_GENERATED_DIR}")
     add_test(NAME region_aot COMMAND microdos_region_aot_tests)
 
+    # M23: pure policy, and real system-loop differential tests in baseline,
+    # promotion and lean configurations. Compile each layout consistently.
+    add_executable(microdos_exec_router tests/test_exec_router.c)
+    target_link_libraries(microdos_exec_router PRIVATE microdos::runtime)
+    add_test(NAME exec_router COMMAND microdos_exec_router)
+    add_executable(microdos_exec_router_lean tests/test_exec_router.c src/runtime/exec_router.c)
+    target_include_directories(microdos_exec_router_lean PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+    target_compile_definitions(microdos_exec_router_lean PRIVATE MD_EXEC_PROFILE=0)
+    add_test(NAME exec_router_lean COMMAND microdos_exec_router_lean)
+    foreach(variant baseline promote lean)
+        add_executable(microdos_exec_router_diff_${variant}
+            tests/test_exec_router_diff.c src/system/md_dos2_system.c
+            src/host/msdos2_boot.c src/runtime/jit_thumb2.c
+            src/runtime/runtime.c src/runtime/x86_interp.c
+            src/runtime/x86_block_cache.c src/runtime/region.c src/runtime/exec_router.c
+            "${MD_RECOMP_loop_C}")
+        target_link_libraries(microdos_exec_router_diff_${variant} PRIVATE microdos::decode)
+        target_include_directories(microdos_exec_router_diff_${variant} PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/include" "${CMAKE_CURRENT_LIST_DIR}/src/runtime"
+            "${CMAKE_CURRENT_LIST_DIR}/src/host" "${CMAKE_CURRENT_LIST_DIR}/src/system" "${MD_GENERATED_DIR}")
+        target_compile_definitions(microdos_exec_router_diff_${variant} PRIVATE MICRODOS_ENABLE_JIT=1)
+        if(NOT variant STREQUAL "baseline")
+            target_compile_definitions(microdos_exec_router_diff_${variant} PRIVATE
+                MD_EXEC_ENABLE_PROMOTION=1 MD_EXEC_ENABLE_DIRECT=1)
+        endif()
+        if(variant STREQUAL "lean")
+            target_compile_definitions(microdos_exec_router_diff_${variant} PRIVATE MD_JIT_PROFILE=0 MD_EXEC_PROFILE=0 MD_JIT_LEGACY_HOTNESS=0)
+        endif()
+        if((CMAKE_C_COMPILER_ID MATCHES "GNU|Clang") AND NOT MD_FORCE_SWITCH_DISPATCH)
+            target_compile_definitions(microdos_exec_router_diff_${variant} PRIVATE MD_THREADED_DISPATCH=1)
+        endif()
+        if(MSVC)
+            target_compile_definitions(microdos_exec_router_diff_${variant} PRIVATE _CRT_SECURE_NO_WARNINGS)
+        endif()
+        add_dependencies(microdos_exec_router_diff_${variant} md_generated)
+        add_test(NAME exec_router_diff_${variant} COMMAND microdos_exec_router_diff_${variant})
+    endforeach()
+
     # M14 end-to-end: boot the released MS-DOS 2.0 through the portable
     # system loop (the code the Pico 2 runs) and pass DOS2TEST at A>.
     # Needs the pinned Microsoft binaries (.\md.bat deps msdos).
@@ -228,7 +267,7 @@ if(MD_BUILD_TESTS)
         add_executable(microdos_dos2_e2e_g128 tests/test_dos2_e2e.c
             src/system/md_dos2_system.c src/host/msdos2_boot.c
             src/runtime/runtime.c src/runtime/x86_interp.c
-            src/runtime/x86_block_cache.c src/runtime/region.c
+            src/runtime/x86_block_cache.c src/runtime/region.c src/runtime/exec_router.c
             "${MD_RECOMP_dos2test_C}" "${MD_RECOMP_msdos2_C}")
         target_link_libraries(microdos_dos2_e2e_g128 PRIVATE microdos::decode)
         target_include_directories(microdos_dos2_e2e_g128 PRIVATE
@@ -243,6 +282,34 @@ if(MD_BUILD_TESTS)
             target_compile_definitions(microdos_dos2_e2e_g128 PRIVATE _CRT_SECURE_NO_WARNINGS)
         endif()
         add_test(NAME dos2_e2e_g128 COMMAND microdos_dos2_e2e_g128 "${MD_MSDOS2_BIN}/MSDOS.SYS" "${MD_E2E_IMG}" --no-cache)
+        foreach(variant baseline promote lean)
+            add_executable(microdos_dos2_e2e_router_${variant}
+                tests/test_dos2_e2e.c src/system/md_dos2_system.c src/host/msdos2_boot.c
+                src/runtime/jit_thumb2.c src/runtime/runtime.c src/runtime/x86_interp.c
+                src/runtime/x86_block_cache.c src/runtime/region.c src/runtime/exec_router.c
+                "${MD_RECOMP_dos2test_C}" "${MD_RECOMP_msdos2_C}")
+            target_link_libraries(microdos_dos2_e2e_router_${variant} PRIVATE microdos::decode)
+            target_include_directories(microdos_dos2_e2e_router_${variant} PRIVATE
+                "${CMAKE_CURRENT_LIST_DIR}/include" "${CMAKE_CURRENT_LIST_DIR}/src/runtime"
+                "${CMAKE_CURRENT_LIST_DIR}/src/host" "${CMAKE_CURRENT_LIST_DIR}/src/system" "${MD_GENERATED_DIR}")
+            target_compile_definitions(microdos_dos2_e2e_router_${variant} PRIVATE MICRODOS_ENABLE_JIT=1)
+            if(NOT variant STREQUAL "baseline")
+                target_compile_definitions(microdos_dos2_e2e_router_${variant} PRIVATE MD_EXEC_ENABLE_PROMOTION=1 MD_EXEC_ENABLE_DIRECT=1)
+            endif()
+            if(variant STREQUAL "lean")
+                target_compile_definitions(microdos_dos2_e2e_router_${variant} PRIVATE MD_JIT_PROFILE=0 MD_EXEC_PROFILE=0 MD_JIT_LEGACY_HOTNESS=0)
+            endif()
+            if((CMAKE_C_COMPILER_ID MATCHES "GNU|Clang") AND NOT MD_FORCE_SWITCH_DISPATCH)
+                target_compile_definitions(microdos_dos2_e2e_router_${variant} PRIVATE MD_THREADED_DISPATCH=1)
+            endif()
+            if(MSVC)
+                target_compile_definitions(microdos_dos2_e2e_router_${variant} PRIVATE _CRT_SECURE_NO_WARNINGS)
+            endif()
+            add_dependencies(microdos_dos2_e2e_router_${variant} md_generated)
+            add_test(NAME dos2_e2e_router_${variant} COMMAND microdos_dos2_e2e_router_${variant}
+                "${MD_MSDOS2_BIN}/MSDOS.SYS" "${MD_E2E_IMG}" --no-cache)
+            set_tests_properties(dos2_e2e_router_${variant} PROPERTIES FIXTURES_REQUIRED dos2_image)
+        endforeach()
         set_tests_properties(dos2_e2e_aot dos2_e2e_interp dos2_e2e_nocache dos2_e2e_lockstep dos2_e2e_g128
                              PROPERTIES FIXTURES_REQUIRED dos2_image)
     else()

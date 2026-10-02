@@ -424,12 +424,49 @@ static void md_jit_report(const char *label, const PicoPerf *now, const PicoPerf
 }
 #endif
 
+#if MICRODOS_PICO_JIT && MD_EXEC_PROFILE
+static void md_router_report(const MdExecRouter *router)
+{
+    const uint64_t total = router->interp_instructions + router->aot_instructions + router->jit_instructions;
+    unsigned top[4] = { MD_EXEC_SITE_SLOTS, MD_EXEC_SITE_SLOTS, MD_EXEC_SITE_SLOTS, MD_EXEC_SITE_SLOTS };
+    unsigned i, j, k;
+    md_say("[router] interp=%llu aot=%llu jit=%llu promotions=%lu reject=%lu demote=%lu unstable=%lu\n",
+           (unsigned long long)router->interp_instructions, (unsigned long long)router->aot_instructions,
+           (unsigned long long)router->jit_instructions, (unsigned long)router->promotions,
+           (unsigned long)router->rejections, (unsigned long)router->demotions,
+           (unsigned long)router->unstable_demotions);
+    md_say("[router] entries=%lu switches/1k=%llu avg-jit-run=%llu promotion=%s direct=%s\n",
+           (unsigned long)router->tier_entries,
+           (unsigned long long)(total ? (uint64_t)router->tier_switches * 1000u / total : 0u),
+           (unsigned long long)(router->jit_entries ? router->jit_instructions / router->jit_entries : 0u),
+           MD_EXEC_ENABLE_PROMOTION ? "ON" : "OFF", MD_EXEC_ENABLE_DIRECT ? "ON" : "OFF");
+    for (i = 0u; i < MD_EXEC_SITE_SLOTS; ++i) {
+        const MdExecSite *site = &router->site[i];
+        unsigned score = site->heat + site->penalty + site->cooldown;
+        if (score == 0u) continue;
+        for (j = 0u; j < 4u; ++j) {
+            if (top[j] == MD_EXEC_SITE_SLOTS || score >
+                (unsigned)(router->site[top[j]].heat + router->site[top[j]].penalty + router->site[top[j]].cooldown)) {
+                for (k = 3u; k > j; --k) top[k] = top[k - 1u];
+                top[j] = i;
+                break;
+            }
+        }
+    }
+    for (i = 0u; i < 4u && top[i] != MD_EXEC_SITE_SLOTS; ++i) {
+        const MdExecSite *site = &router->site[top[i]];
+        md_say("[router] %04X:%04X mode=%s heat=%u penalty=%u cooldown=%u\n",
+               site->cs, site->ip, md_exec_mode_name(site->mode), site->heat, site->penalty, site->cooldown);
+    }
+}
+#endif
+
 static void md_stats(uint64_t start_us)
 {
     PicoPerf now=g_perf, zero;
     memset(&zero,0,sizeof(zero));
     md_perf_snapshot(&now);
-    md_say("\n[perf] config: M21.1b, clk %lu MHz, code %s, block cache %s, kernel AOT %s, runtime JIT %s, guest %s\n",
+    md_say("\n[perf] config: M23, clk %lu MHz, code %s, block cache %s, kernel AOT %s, runtime JIT %s, guest %s\n",
            (unsigned long)(clock_get_hz(clk_sys)/1000000u),
            MICRODOS_PICO_CODE_IN_SRAM?"SRAM (copy_to_ram)":"flash XIP",
            MICRODOS_PICO_CACHE?"ON":"OFF", g_sys.kernel_attached?"ON":"OFF",
@@ -447,6 +484,9 @@ static void md_stats(uint64_t start_us)
            g_sys.runtime.cpu.cs,g_sys.runtime.cpu.ip);
 #if MICRODOS_PICO_JIT
     if (g_sys.jit) {
+#if MD_EXEC_PROFILE
+        md_router_report(&g_sys.router);
+#endif
         md_jit_report("since boot",&now,&zero);
         md_jit_report("since previous Ctrl+]",&now,&g_perf_mark);
     }

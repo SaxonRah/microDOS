@@ -15,6 +15,7 @@
 #include "microdos/aot.h"
 #include "microdos/block_cache.h"
 #include "microdos/runtime.h"
+#include "microdos/exec_router.h"
 #include "msdos2_boot.h"
 
 #ifdef __cplusplus
@@ -37,11 +38,10 @@ typedef struct MdDos2System {
     const MdAotProgram *kernel_program;
     bool kernel_attached;
 
-    /* M20: optional runtime native translator.  Static AOT always wins.  The
-       JIT is used only when the current segment has no matching live AOT
-       program, so COMMAND.COM/arbitrary apps can become native while the
-       compiled DOS kernel keeps its existing path. */
+    /* M20: optional runtime native translator.  Static AOT always wins.  The router
+       interprets unknown code first and admits only proven hot regions. */
     MdJit *jit;
+    MdExecRouter router;
 
     uint32_t aot_attaches;
     uint32_t aot_enters;

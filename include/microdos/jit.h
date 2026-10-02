@@ -42,6 +42,10 @@ extern "C" {
  * synthetic BIOS/boundary churn. Unsupported shapes still use the canonical path.
  */
 
+#ifndef MD_JIT_ZERO_ESCAPE_BURST
+#define MD_JIT_ZERO_ESCAPE_BURST 16u
+#endif
+
 #ifndef MD_JIT_BLOCK_SLOTS
 #define MD_JIT_BLOCK_SLOTS 128u
 #endif
@@ -60,6 +64,12 @@ extern "C" {
 
 #ifndef MD_JIT_HOTNESS_SLOTS
 #define MD_JIT_HOTNESS_SLOTS 64u
+#endif
+
+/* Whole-run research JIT keeps its historical hotness gate. The production
+   system router owns admission and omits this redundant fixed table. */
+#ifndef MD_JIT_LEGACY_HOTNESS
+#define MD_JIT_LEGACY_HOTNESS 1
 #endif
 
 #ifndef MD_JIT_HOT_THRESHOLD
@@ -101,6 +111,27 @@ typedef struct MdJitHotness {
     uint8_t count;
     uint8_t valid;
 } MdJitHotness;
+
+typedef enum MdJitResidentKind {
+    MD_JIT_RESIDENT_NONE = 0,
+    MD_JIT_RESIDENT_DEC_JNZ,
+    MD_JIT_RESIDENT_MEMLOOP,
+    MD_JIT_RESIDENT_LODS_LOOP,
+    MD_JIT_RESIDENT_COUNTED,
+    MD_JIT_RESIDENT_CFG
+} MdJitResidentKind;
+
+typedef struct MdJitProbe {
+    uint8_t decoded_ops, direct_ops, fallback_ops, control_ops;
+    uint8_t has_backedge, has_call, has_return, resident_kind;
+    uint8_t pages, unstable;
+} MdJitProbe;
+
+/* Local episode feedback is available even with MD_JIT_PROFILE=0. */
+typedef struct MdJitRunResult {
+    uint32_t retired, native, fallback, entries, zero_exits;
+    uint8_t invalidated, cs_changed, budget_limited;
+} MdJitRunResult;
 
 typedef enum MdJitOpKind {
     MD_JIT_OP_FALLBACK = 0,
@@ -246,12 +277,25 @@ struct MdJit {
     uint64_t bios_bypass_instructions;
     uint64_t exit_reason[MD_JIT_EXIT_REASON_COUNT];
     MdJitHotSite hot_sites[MD_JIT_HOT_SITES];
+#if MD_JIT_LEGACY_HOTNESS
     MdJitHotness hotness[MD_JIT_HOTNESS_SLOTS];
+#endif
     uint8_t last_lookup_cold;
 };
 
 void md_jit_init(MdJit *jit, void *code, size_t code_size);
 void md_jit_reset(MdJit *jit);
+
+/* Probe uses compile scratch only: no emitted code, table entries or guest
+   state changes. Prepare requires the runtime to be at that same CS:IP. */
+bool md_jit_probe(MdJit *jit, MdRuntime *runtime, uint16_t cs, uint16_t ip,
+                   MdJitProbe *probe);
+bool md_jit_prepare_region(MdJit *jit, MdRuntime *runtime);
+/* Execute only the admitted block/region. Never compile or interpret another
+   site internally; return to the router at the exact exit CS:IP. Budget zero
+   means no work (unlike the legacy whole-run JIT APIs). */
+MdStopReason md_jit_run_region(MdJit *jit, MdRuntime *runtime, uint64_t budget,
+                               MdJitRunResult *result);
 
 MdStopReason md_jit_run(MdJit *jit, MdRuntime *runtime, uint64_t instruction_budget);
 MdStopReason md_jit_run_until_cs_change(MdJit *jit, MdRuntime *runtime,

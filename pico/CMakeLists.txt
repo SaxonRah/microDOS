@@ -82,11 +82,15 @@ configure_file("${CMAKE_CURRENT_LIST_DIR}/md_pico_blobs.S.in"
 set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/md_pico_blobs.S" PROPERTIES
     OBJECT_DEPENDS "${MICRODOS_PICO_KERNEL};${MICRODOS_PICO_DISK}")
 
+option(MD_EXEC_ENABLE_PROMOTION "M23 promote proven hot regions (requires hardware validation)" OFF)
+option(MD_EXEC_ENABLE_DIRECT "M23 admit high-coverage direct blocks (requires phase tuning)" OFF)
+
 set(MD_RUNTIME_SOURCES
     "${MD_ROOT}/src/runtime/runtime.c"
     "${MD_ROOT}/src/runtime/x86_interp.c"
     "${MD_ROOT}/src/runtime/x86_block_cache.c"
-    "${MD_ROOT}/src/runtime/region.c")
+    "${MD_ROOT}/src/runtime/region.c"
+    "${MD_ROOT}/src/runtime/exec_router.c")
 
 function(md_pico_common target code_in_sram)
     target_include_directories(${target} PRIVATE
@@ -138,9 +142,15 @@ function(md_pico_dos target code_in_sram cache sys_khz kernel_aot jit)
                                MICRODOS_PICO_KERNEL_AOT=${kernel_aot}
                                MICRODOS_PICO_JIT=${jit})
     if(jit)
-        target_compile_definitions(${target} PRIVATE MICRODOS_ENABLE_JIT=1 MD_JIT_BLOCK_SLOTS=64 MD_JIT_HOT_THRESHOLD=2 MD_JIT_HOTNESS_SLOTS=64 MICRODOS_SYSTEM_JIT_CODE_BYTES=24576)
+        target_compile_definitions(${target} PRIVATE MICRODOS_ENABLE_JIT=1 MD_JIT_LEGACY_HOTNESS=0 MD_JIT_BLOCK_SLOTS=64 MD_JIT_HOT_THRESHOLD=2 MD_JIT_HOTNESS_SLOTS=64 MICRODOS_SYSTEM_JIT_CODE_BYTES=24576)
+    endif()
+    if(NOT jit)
+        target_compile_definitions(${target} PRIVATE MD_EXEC_PROFILE=0)
     endif()
     if(jit)
+        target_compile_definitions(${target} PRIVATE
+            MD_EXEC_ENABLE_PROMOTION=$<BOOL:${MD_EXEC_ENABLE_PROMOTION}>
+            MD_EXEC_ENABLE_DIRECT=$<BOOL:${MD_EXEC_ENABLE_DIRECT}>)
         pico_set_program_name(${target} "microDOS JIT")
     else()
         pico_set_program_name(${target} "microDOS")
@@ -178,13 +188,13 @@ md_pico_dos(microdos_pico_region      1 1 300000 0 0) # decoded cache + resident
 target_compile_definitions(microdos_pico_region PRIVATE MD_CACHE_PROFILE=0)
 
 md_pico_dos(microdos_pico_jitkernel   1 0 300000 0 1) # runtime JIT owns the DOS kernel
-target_compile_definitions(microdos_pico_jitkernel PRIVATE MD_JIT_PROFILE=0)
+target_compile_definitions(microdos_pico_jitkernel PRIVATE MD_JIT_PROFILE=0 MD_EXEC_PROFILE=0)
 
 md_pico_dos(microdos_pico_jit         1 0 300000 1 1) # AOT kernel + lean JIT applications
-target_compile_definitions(microdos_pico_jit PRIVATE MD_JIT_PROFILE=0)
+target_compile_definitions(microdos_pico_jit PRIVATE MD_JIT_PROFILE=0 MD_EXEC_PROFILE=0)
 
 md_pico_dos(microdos_pico_jit_profile 1 0 300000 1 1) # same hybrid, full M20/M21 telemetry
-target_compile_definitions(microdos_pico_jit_profile PRIVATE MD_JIT_PROFILE=1)
+target_compile_definitions(microdos_pico_jit_profile PRIVATE MD_JIT_PROFILE=1 MD_EXEC_PROFILE=1)
 
 # M21.1 memory-placement A/B: identical firmwares (compiled kernel, no cache,
 # no JIT, 300 MHz, 128 KiB guest, DOS told it has 128 KiB, DOS2TEST not
