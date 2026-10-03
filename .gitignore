@@ -25,6 +25,7 @@
 *.elf
 *.img
 *.map
+*.log
 
 # Temporary patches, backups, and rejected merges
 *.patch
@@ -34,11 +35,15 @@
 *.before-*
 *.before_*
 
-# Generated diagnostics / captures
+# Generated source/captures that do not belong in the source tree
+/src/generated/
 /mdstress-*.txt
 /mdstress-*.csv
+/mdstress-*.json
 /jit-*.txt
+/jit-backend-*.txt
 /pico/CURRENT_PICO_OUTPUT.TXT
+/tests/dos2/*.MAP
 
 # Python
 __pycache__/
