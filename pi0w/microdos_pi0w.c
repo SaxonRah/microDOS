@@ -13,6 +13,7 @@
 #include "md_dos2_system.h"
 #include "dos2test_recomp.h"
 #include "msdos2_recomp.h"
+#include "microdos/ops.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -652,30 +653,53 @@ void kernel_main(void)
         const uint8_t opcode = md_x86_read8(&rt->cpu, cs, ip);
 
         if (opcode == 0xF6u) {
-            uint8_t modrm;
-            unsigned j;
+            /*
+             * The previous F6 dump proved the live instruction is:
+             *
+             *   F6 44 04 08    TEST byte ptr [SI+04h],08h
+             *
+             * with DS=0800h and SI=0020h, so the operand is at 0800:0024.
+             *
+             * The normal md_interp_step() never returned from this instruction
+             * on the Pi.  Probe each semantic sub-operation separately, printing
+             * before and after every potentially interesting operation.  Then
+             * manually commit the architecturally equivalent TEST and continue
+             * stepping.  This tells us whether the failure is the guest-memory
+             * read, lazy-flag update/materialization, or specifically the
+             * interpreter's Group-3 dispatch path.
+             */
+            const uint8_t modrm =
+                md_x86_read8(&rt->cpu, cs, (uint16_t)(ip + 1u));
+            const int8_t disp =
+                (int8_t)md_x86_read8(&rt->cpu, cs, (uint16_t)(ip + 2u));
+            const uint8_t imm =
+                md_x86_read8(&rt->cpu, cs, (uint16_t)(ip + 3u));
+            const uint16_t ea_off =
+                (uint16_t)(rt->cpu.r[MD_X86_SI] + (int16_t)disp);
+            const uint16_t ea_seg = rt->cpu.ds;
+            uint8_t value;
+            uint8_t result;
+            uint16_t flags_after;
 
-            uart_puts("\n[F6DBG] exact live guest state before F6\n");
-            uart_puts("[F6DBG] CS:IP=");
+            uart_puts("\n[F6STAGE] BEGIN ins=");
+            uart_put_u64(before + 1u);
+            uart_puts(" CS:IP=");
             uart_put_hex16(cs);
             uart_putc_raw(':');
             uart_put_hex16(ip);
-            uart_puts(" ins=");
-            uart_put_u64(before + 1u);
             uart_putc('\n');
 
-            uart_puts("[F6DBG] bytes:");
-            for (j = 0u; j < 12u; ++j) {
-                const uint8_t b = md_x86_read8(&rt->cpu, cs, (uint16_t)(ip + j));
-                uart_putc_raw(' ');
-                uart_put_hex16((uint16_t)b);
-            }
-            uart_putc('\n');
-
-            modrm = md_x86_read8(&rt->cpu, cs, (uint16_t)(ip + 1u));
-            uart_puts("[F6DBG] modrm=");
+            uart_puts("[F6STAGE] bytes=");
+            uart_put_hex16((uint16_t)opcode);
+            uart_putc_raw(' ');
             uart_put_hex16((uint16_t)modrm);
-            uart_puts(" mod=");
+            uart_putc_raw(' ');
+            uart_put_hex16((uint16_t)(uint8_t)disp);
+            uart_putc_raw(' ');
+            uart_put_hex16((uint16_t)imm);
+            uart_puts("  TEST byte [SI+disp8],imm8\n");
+
+            uart_puts("[F6STAGE] mod=");
             uart_put_u64((uint64_t)(modrm >> 6));
             uart_puts(" ext=");
             uart_put_u64((uint64_t)((modrm >> 3) & 7u));
@@ -683,41 +707,71 @@ void kernel_main(void)
             uart_put_u64((uint64_t)(modrm & 7u));
             uart_putc('\n');
 
-            uart_puts("[F6DBG] AX=");
-            uart_put_hex16(rt->cpu.r[MD_X86_AX]);
-            uart_puts(" BX=");
-            uart_put_hex16(rt->cpu.r[MD_X86_BX]);
-            uart_puts(" CX=");
-            uart_put_hex16(rt->cpu.r[MD_X86_CX]);
-            uart_puts(" DX=");
-            uart_put_hex16(rt->cpu.r[MD_X86_DX]);
-            uart_puts(" SP=");
-            uart_put_hex16(rt->cpu.r[MD_X86_SP]);
-            uart_puts(" BP=");
-            uart_put_hex16(rt->cpu.r[MD_X86_BP]);
-            uart_puts(" SI=");
-            uart_put_hex16(rt->cpu.r[MD_X86_SI]);
-            uart_puts(" DI=");
-            uart_put_hex16(rt->cpu.r[MD_X86_DI]);
+            uart_puts("[F6STAGE] EA=");
+            uart_put_hex16(ea_seg);
+            uart_putc_raw(':');
+            uart_put_hex16(ea_off);
+            uart_puts(" linear=");
+            uart_put_u64((uint64_t)md_x86_linear(ea_seg, ea_off));
             uart_putc('\n');
 
-            uart_puts("[F6DBG] CS=");
+            uart_puts("[F6STAGE] flags pre: raw=");
+            uart_put_hex16(rt->cpu.flags_raw);
+            uart_puts(" lazy_op=");
+            uart_put_u64((uint64_t)rt->cpu.lazy_op);
+            uart_puts(" lazy_a=");
+            uart_put_hex16(rt->cpu.lazy_a);
+            uart_puts(" lazy_b=");
+            uart_put_hex16(rt->cpu.lazy_b);
+            uart_puts(" lazy_res=");
+            uart_put_hex16(rt->cpu.lazy_res);
+            uart_putc('\n');
+
+            uart_puts("[F6STAGE A] operand read BEGIN\n");
+            value = md_x86_read8(&rt->cpu, ea_seg, ea_off);
+            uart_puts("[F6STAGE A] operand read OK value=");
+            uart_put_hex16((uint16_t)value);
+            uart_putc('\n');
+
+            result = (uint8_t)(value & imm);
+            uart_puts("[F6STAGE B] AND OK result=");
+            uart_put_hex16((uint16_t)result);
+            uart_putc('\n');
+
+            uart_puts("[F6STAGE C] md_x86_logic8 BEGIN\n");
+            (void)md_x86_logic8(&rt->cpu, result);
+            uart_puts("[F6STAGE C] md_x86_logic8 OK lazy_op=");
+            uart_put_u64((uint64_t)rt->cpu.lazy_op);
+            uart_puts(" lazy_res=");
+            uart_put_hex16(rt->cpu.lazy_res);
+            uart_putc('\n');
+
+            uart_puts("[F6STAGE D] flags materialize BEGIN\n");
+            flags_after = md_x86_flags(&rt->cpu);
+            uart_puts("[F6STAGE D] flags materialize OK FLAGS=");
+            uart_put_hex16(flags_after);
+            uart_puts(" lazy_op=");
+            uart_put_u64((uint64_t)rt->cpu.lazy_op);
+            uart_putc('\n');
+
+            /*
+             * Commit the four-byte TEST manually.  TEST changes flags only;
+             * it does not modify the operand.  md_interp_step() normally bumps
+             * the instruction counter before executing the opcode.
+             */
+            rt->cpu.ip = (uint16_t)(ip + 4u);
+            rt->instructions = before + 1u;
+
+            uart_puts("[F6STAGE E] manual TEST commit OK CS:IP=");
             uart_put_hex16(rt->cpu.cs);
-            uart_puts(" DS=");
-            uart_put_hex16(rt->cpu.ds);
-            uart_puts(" ES=");
-            uart_put_hex16(rt->cpu.es);
-            uart_puts(" SS=");
-            uart_put_hex16(rt->cpu.ss);
-            uart_puts(" FLAGS=");
-            uart_put_hex16(md_x86_flags(&rt->cpu));
+            uart_putc_raw(':');
+            uart_put_hex16(rt->cpu.ip);
+            uart_puts(" ins=");
+            uart_put_u64(rt->instructions);
             uart_putc('\n');
 
-            uart_puts("[F6DBG] HALT before executing F6\n");
-
-            for (;;) {
-                __asm__ volatile("wfe");
-            }
+            uart_puts("[F6STAGE] bypassing only this F6; resume md_interp_step\n");
+            continue;
         }
 
         if (before >= 80u) {

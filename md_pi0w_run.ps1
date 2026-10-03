@@ -1,12 +1,7 @@
 ﻿param(
     [string]$Repo = "C:\microDOS",
-    [string]$ConsolePort = "COM3",
-    [string]$ResetPort = "COM8",
     [int]$CaptureSeconds = 15,
-    [int]$UsbSettleMs = 1500,
-    [int]$RpiBootRetries = 3,
-    [switch]$NoBuild,
-    [switch]$ExternalConsole
+    [switch]$NoBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,69 +33,202 @@ if (-not (Test-Path $BuiltKernel)) {
 Write-Host ""
 Write-Host "=== STAGE ==="
 Copy-Item $BuiltKernel $UsbKernel -Force
-
 $kernel = Get-Item $UsbKernel
 Write-Host ("kernel8.img: {0} bytes  {1}" -f $kernel.Length, $kernel.LastWriteTime)
 
-# A stale rpiboot instance can consume the wrong USB stage.
 Get-Process rpiboot -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 250
 
 Write-Host ""
-Write-Host "=== RESET + USB BOOT + UART ==="
-if ($ExternalConsole) {
-    Write-Host ("{0} capture: external" -f $ConsolePort)
-} else {
-    Write-Host ("{0} capture: this window" -f $ConsolePort)
-}
-
-$external = if ($ExternalConsole) { "1" } else { "0" }
+Write-Host "=== V28 HID UART BRIDGE TEST ==="
+Write-Host "No CDC/COM port is used. Transport is 64-byte USB HID interrupt reports."
 
 $py = @'
 import os
+import re
+import struct
 import subprocess
-import sys
 import threading
 import time
+import traceback
 
-import serial
+try:
+    import hid
+except Exception as exc:
+    print(
+        "[runner] Python package 'hidapi' is required for v28.",
+        flush=True,
+    )
+    print(
+        "[runner] Install once with: python -m pip install hidapi",
+        flush=True,
+    )
+    print(f"[runner] import error: {exc}", flush=True)
+    raise SystemExit(4)
 
-console_port = os.environ["MD_CONSOLE_PORT"]
-reset_port = os.environ["MD_RESET_PORT"]
+VID = 0xCAFE
+PID = 0x4028
+
+RESP_PONG = 1
+RESP_CLEARED = 2
+RESP_HELD = 3
+RESP_RELEASED = 4
+RESP_STATUS = 5
+
 rpiboot = os.environ["MD_RPIBOOT"]
 usbdir = os.environ["MD_USBDIR"]
 capture_seconds = float(os.environ["MD_CAPTURE_SECONDS"])
-usb_settle = float(os.environ["MD_USB_SETTLE_MS"]) / 1000.0
-retries = int(os.environ["MD_RPIBOOT_RETRIES"])
-external_console = os.environ["MD_EXTERNAL_CONSOLE"] == "1"
 
-console = None
-
-
-def pulse_reset():
-    print(f"[reset] pulsing Pi RUN through {reset_port}", flush=True)
-    reset = serial.Serial(reset_port, 115200, timeout=0.5)
-    try:
-        time.sleep(0.20)
-        reset.reset_input_buffer()
-        reset.write(b"R")
-        reset.flush()
-        time.sleep(0.40)
-        reply = reset.read(4096)
-        if reply:
-            text = reply.decode(errors="replace").rstrip()
-            if text:
-                print(text, flush=True)
-    finally:
-        reset.close()
+dev = None
+captured = bytearray()
+control_responses = []
 
 
-def run_rpiboot(attempt):
-    print(
-        f"[usb] starting fresh one-shot rpiboot "
-        f"(attempt {attempt}/{retries})",
-        flush=True,
+def u32le(b, off):
+    return struct.unpack_from("<I", b, off)[0]
+
+
+def discover_hid(timeout=12.0):
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        found = hid.enumerate(VID, PID)
+
+        for item in found:
+            product = item.get("product_string") or ""
+
+            if "microDOS HID UART bridge v28" in product:
+                return item["path"]
+
+        time.sleep(0.25)
+
+    raise RuntimeError("v28 HID bridge not found after 12 seconds")
+
+
+def open_hid(path):
+    d = hid.device()
+    d.open_path(path)
+    d.set_nonblocking(1)
+    return d
+
+
+def send_command(ch):
+    # hidapi write buffer starts with Report ID.
+    # This device uses no report IDs, so byte 0 is the required zero ID.
+    payload = bytearray(65)
+    payload[0] = 0
+    payload[1] = ord(ch)
+
+    written = dev.write(bytes(payload))
+
+    if written <= 0:
+        raise RuntimeError(f"HID command {ch!r} write failed")
+
+
+def print_uart(data):
+    if not data:
+        return
+
+    captured.extend(data)
+    print(data.decode(errors="replace"), end="", flush=True)
+
+
+def pump_hid_once():
+    got_any = False
+
+    while True:
+        raw = dev.read(64)
+
+        if not raw:
+            break
+
+        got_any = True
+        frame = bytes(raw)
+
+        if len(frame) < 2:
+            continue
+
+        ftype = frame[0]
+
+        if ftype == 0x01:
+            n = min(frame[1], 62)
+            print_uart(frame[2:2+n])
+
+        elif ftype == 0x02:
+            code = frame[1]
+            control_responses.append(frame)
+
+    return got_any
+
+
+def wait_response(code, timeout=2.0):
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        pump_hid_once()
+
+        for i, frame in enumerate(control_responses):
+            if len(frame) >= 2 and frame[1] == code:
+                return control_responses.pop(i)
+
+        time.sleep(0.001)
+
+    return None
+
+
+def parse_status(frame):
+    if frame is None or len(frame) < 30:
+        return None
+
+    return {
+        "rx": u32le(frame, 2),
+        "drop": u32le(frame, 6),
+        "queued": u32le(frame, 10),
+        "reports": u32le(frame, 14),
+        "fail": u32le(frame, 18),
+        "actual": u32le(frame, 22),
+        "gp17": frame[26],
+        "readable": frame[27],
+        "last": frame[28],
+        "mounted": frame[29],
+    }
+
+
+def fmt_status(s):
+    return (
+        f"rx={s['rx']} drop={s['drop']} queued={s['queued']} "
+        f"reports={s['reports']} fail={s['fail']} "
+        f"actual={s['actual']} GP17={s['gp17']} "
+        f"readable={s['readable']} last={s['last']:02X} "
+        f"mounted={s['mounted']}"
     )
+
+
+def preflight():
+    send_command("P")
+    if wait_response(RESP_PONG, 1.5) is None:
+        raise RuntimeError("v28 HID PONG failed")
+    print("[preflight] HID PONG", flush=True)
+
+    send_command("S")
+    status_frame = wait_response(RESP_STATUS, 1.5)
+
+    if status_frame is None:
+        raise RuntimeError("v28 HID STATUS failed")
+
+    status = parse_status(status_frame)
+    print("[preflight] " + fmt_status(status), flush=True)
+
+    send_command("C")
+    if wait_response(RESP_CLEARED, 1.5) is None:
+        raise RuntimeError("v28 HID CLEAR failed")
+    print("[preflight] HID CLEARED", flush=True)
+
+
+def run_rpiboot():
+    waiting = threading.Event()
+    stage0 = threading.Event()
+    stage1 = threading.Event()
 
     proc = subprocess.Popen(
         [rpiboot, "-d", usbdir, "-v"],
@@ -110,179 +238,157 @@ def run_rpiboot(attempt):
         bufsize=1,
     )
 
-    lines = []
-
-    def usb_reader():
+    def reader():
         assert proc.stdout is not None
+
         for line in proc.stdout:
-            lines.append(line)
             print("[usb] " + line, end="", flush=True)
 
-    thread = threading.Thread(target=usb_reader, daemon=True)
-    thread.start()
-    return proc, thread, lines
+            if "Waiting for BCM2835/6/7/2711/2712" in line:
+                waiting.set()
 
+            if "Found serial number 0" in line:
+                stage0.set()
 
-def read_console_once():
-    global console
+            if "Found serial number 1" in line:
+                stage1.set()
 
-    if console is None:
-        return
+    th = threading.Thread(target=reader, daemon=True)
+    th.start()
 
-    try:
-        data = console.read(4096)
-        if data:
-            print(data.decode(errors="replace"), end="", flush=True)
-    except (serial.SerialException, OSError) as exc:
-        print(f"\n[uart] disconnected: {exc}", flush=True)
-        try:
-            console.close()
-        except Exception:
-            pass
-        console = None
+    return proc, th, waiting, stage0, stage1
 
 
 try:
-    if not external_console:
-        print(f"[uart] opening {console_port} before reset", flush=True)
+    path = discover_hid()
+    print("[hid] v28 bridge found", flush=True)
 
-        console = serial.Serial(
-            console_port,
-            115200,
-            timeout=0.05,
-            rtscts=False,
-            dsrdtr=False,
-        )
+    dev = open_hid(path)
+    time.sleep(0.15)
 
-        # pico-uart-bridge-pi02w v4 deliberately treats CDC0 DTR as
-        # "host console attached". Assert the line state explicitly before
-        # resetting the Pi so TinyUSB will forward Pi UART bytes to Windows.
-        console.dtr = True
-        console.rts = True
+    preflight()
 
-        # Give Windows + TinyUSB time to propagate SET_CONTROL_LINE_STATE.
-        time.sleep(0.25)
+    print("[reset] HOLDING Pi RUN before rpiboot", flush=True)
+    send_command("H")
 
-        # Drop anything stale from a previous Pi boot only after DTR/RTS have
-        # been established.
-        console.reset_input_buffer()
+    if wait_response(RESP_HELD, 1.5) is None:
+        raise RuntimeError("v28 HID HELD acknowledgement failed")
 
-        print(
-            f"[uart] {console_port} open: "
-            f"DTR={int(bool(console.dtr))} "
-            f"RTS={int(bool(console.rts))}",
-            flush=True,
-        )
+    print("[reset] HID HELD", flush=True)
+    time.sleep(0.50)
 
-    # Fresh hardware reset puts the Pi back in USB ROM boot.
-    pulse_reset()
+    proc, th, waiting, stage0, stage1 = run_rpiboot()
 
-    print(
-        f"[usb] waiting {usb_settle:.2f}s for Windows USB enumeration",
-        flush=True,
-    )
-    time.sleep(usb_settle)
+    if not waiting.wait(timeout=2.0):
+        proc.terminate()
+        raise RuntimeError("rpiboot never reached BCM wait state")
 
-    proc = None
-    thread = None
-    lines = None
-    success = False
+    print("[reset] rpiboot armed; RELEASING Pi RUN", flush=True)
+    send_command("L")
 
-    for attempt in range(1, retries + 1):
-        proc, thread, lines = run_rpiboot(attempt)
+    if wait_response(RESP_RELEASED, 1.5) is None:
+        proc.terminate()
+        raise RuntimeError("v28 HID RELEASED acknowledgement failed")
 
-        # While rpiboot is running, continue collecting UART so early kernel
-        # output is never lost.
-        while proc.poll() is None:
-            read_console_once()
-            time.sleep(0.005)
+    print("[reset] HID RELEASED", flush=True)
 
-        rc = proc.returncode
-        thread.join(timeout=1.0)
-        print(f"\n[usb] rpiboot exited: {rc}", flush=True)
+    start = time.monotonic()
+    next_notice = 5.0
 
-        if rc == 0:
-            success = True
-            break
+    while proc.poll() is None:
+        pump_hid_once()
 
-        # Common Windows race: device exists but descriptors are not readable
-        # yet. Do not force another Pi reset first; the ROM device normally
-        # remains waiting for rpiboot. Give Plug-and-Play time to settle and
-        # retry.
-        if attempt < retries:
+        elapsed = time.monotonic() - start
+
+        if not stage0.is_set() and elapsed >= next_notice:
             print(
-                "[usb] transient failure; waiting 1.0s and retrying "
-                "without reset",
+                f"[usb] still waiting for fresh serial 0... {int(elapsed)}s",
                 flush=True,
             )
-            time.sleep(1.0)
+            next_notice += 5.0
 
-    if not success:
-        print(
-            "[usb] retries exhausted; doing one fresh hardware reset "
-            "and final attempt",
-            flush=True,
+        if not stage0.is_set() and elapsed > 60.0:
+            proc.terminate()
+            raise RuntimeError(
+                "fresh serial 0 not seen within 60s after reset release"
+            )
+
+        time.sleep(0.001)
+
+    proc.wait(timeout=2.0)
+    th.join(timeout=1.0)
+
+    print(
+        f"\n[usb] rpiboot exited: {proc.returncode} "
+        f"stage0={int(stage0.is_set())} stage1={int(stage1.is_set())}",
+        flush=True,
+    )
+
+    if not (
+        proc.returncode == 0
+        and stage0.is_set()
+        and stage1.is_set()
+    ):
+        raise RuntimeError(
+            "verified serial-0 -> serial-1 rpiboot cycle did not complete"
         )
 
-        pulse_reset()
-        time.sleep(max(usb_settle, 1.5))
-        proc, thread, lines = run_rpiboot(retries + 1)
+    print("[uart] capturing for %.0fs" % capture_seconds, flush=True)
 
-        while proc.poll() is None:
-            read_console_once()
-            time.sleep(0.005)
+    deadline = time.monotonic() + capture_seconds
 
-        thread.join(timeout=1.0)
-        print(f"\n[usb] rpiboot exited: {proc.returncode}", flush=True)
-        success = proc.returncode == 0
+    while time.monotonic() < deadline:
+        pump_hid_once()
+        time.sleep(0.001)
 
-    if not success:
-        raise SystemExit(2)
+    send_command("S")
+    status_frame = wait_response(RESP_STATUS, 2.0)
 
-    if not external_console:
-        print(
-            f"[uart] rpiboot complete; "
-            f"capturing for {capture_seconds:.0f}s",
-            flush=True,
+    if status_frame is None:
+        raise RuntimeError(
+            "post-stream HID STATUS did not return"
         )
 
-        deadline = time.monotonic() + capture_seconds
-        while time.monotonic() < deadline:
-            read_console_once()
-            time.sleep(0.005)
+    status = parse_status(status_frame)
+
+    print("\n[postflight] " + fmt_status(status), flush=True)
+    print("[postflight] PASS: HID endpoint still responds", flush=True)
+    print(
+        f"[uart] host captured {len(captured)} byte(s)",
+        flush=True,
+    )
+
+except Exception as exc:
+    print(
+        f"\n[runner] ERROR: {type(exc).__name__}: {exc}",
+        flush=True,
+    )
+    traceback.print_exc()
+    raise SystemExit(3)
 
 finally:
-    if console is not None:
+    if dev is not None:
         try:
-            console.close()
+            dev.close()
         except Exception:
             pass
 
 print("\n=== RUN COMPLETE ===", flush=True)
 '@
 
-$env:MD_CONSOLE_PORT = $ConsolePort
-$env:MD_RESET_PORT = $ResetPort
 $env:MD_RPIBOOT = $RpiBoot
 $env:MD_USBDIR = $UsbDir
 $env:MD_CAPTURE_SECONDS = [string]$CaptureSeconds
-$env:MD_USB_SETTLE_MS = [string]$UsbSettleMs
-$env:MD_RPIBOOT_RETRIES = [string]$RpiBootRetries
-$env:MD_EXTERNAL_CONSOLE = $external
 
 try {
     $py | python -
+
     if ($LASTEXITCODE -ne 0) {
         throw "runner failed with exit code $LASTEXITCODE"
     }
 }
 finally {
-    Remove-Item Env:MD_CONSOLE_PORT -ErrorAction SilentlyContinue
-    Remove-Item Env:MD_RESET_PORT -ErrorAction SilentlyContinue
     Remove-Item Env:MD_RPIBOOT -ErrorAction SilentlyContinue
     Remove-Item Env:MD_USBDIR -ErrorAction SilentlyContinue
     Remove-Item Env:MD_CAPTURE_SECONDS -ErrorAction SilentlyContinue
-    Remove-Item Env:MD_USB_SETTLE_MS -ErrorAction SilentlyContinue
-    Remove-Item Env:MD_RPIBOOT_RETRIES -ErrorAction SilentlyContinue
-    Remove-Item Env:MD_EXTERNAL_CONSOLE -ErrorAction SilentlyContinue
 }

@@ -66,6 +66,19 @@ target_compile_options(microdos_pi0w.elf PRIVATE
     -Wno-unused-parameter
     -ffunction-sections
     -fdata-sections
+
+    # Diagnostic for the Pi Zero 2 W bare-metal bring-up:
+    #
+    # MdX86::lazy_a is 16-bit aligned but starts at byte offset 30.  At -O2
+    # AArch64 GCC may legally coalesce adjacent 16-bit lazy-flag stores into
+    # one 32-bit store at that address.  If firmware leaves alignment checking
+    # enabled, that unaligned word store faults silently because this early
+    # bare-metal port does not yet install exception vectors.
+    #
+    # Force the compiler to emit alignment-safe accesses while we confirm the
+    # F6/TEST failure.  If this proves the cause, the permanent fast fix can
+    # normalize SCTLR_ELx.A during startup instead of keeping strict alignment.
+    -mstrict-align
 )
 
 target_link_options(microdos_pi0w.elf PRIVATE
