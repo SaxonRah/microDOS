@@ -1,9 +1,21 @@
-build/
-build-*/
+# Build trees
+/build/
+/build-*/
+/build-analysis/
+/build-disk/
+/logs/
+
+# Local third-party checkout
+/third_party/msdos/
+
+# IDE / editor
 .vs/
 .vscode/
 *.user
 *.suo
+*~
+
+# Compiler / linker output
 *.obj
 *.o
 *.exe
@@ -11,11 +23,23 @@ build-*/
 *.ilk
 *.uf2
 *.elf
+*.img
+*.map
 
-/third_party/msdos/
-/build-analysis/
+# Temporary patches, backups, and rejected merges
+*.patch
+*.bak
+*.orig
+*.rej
+*.before-*
+*.before_*
 
-/build-disk/
+# Generated diagnostics / captures
+/mdstress-*.txt
+/mdstress-*.csv
+/jit-*.txt
+/pico/CURRENT_PICO_OUTPUT.TXT
 
-/logs/
-/third_party
+# Python
+__pycache__/
+*.pyc
