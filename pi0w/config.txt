@@ -1,0 +1,13 @@
+# microDOS Raspberry Pi Zero 2 W - bare metal AArch64
+arm_64bit=1
+kernel=kernel8.img
+
+# The first bare-metal console uses the mini UART on GPIO14/GPIO15.
+# Lock the core clock so 115200 baud stays stable.
+enable_uart=1
+core_freq=250
+core_freq_min=250
+
+# Leave as much RAM as practical to ARM.
+gpu_mem=16
+disable_splash=1

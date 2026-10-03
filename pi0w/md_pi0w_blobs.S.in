@@ -1,0 +1,15 @@
+.section .rodata.md_blobs, "a", %progbits
+.balign 16
+
+.global md_blob_msdos_sys
+.global md_blob_msdos_sys_end
+md_blob_msdos_sys:
+    .incbin "@MICRODOS_PI0W_KERNEL@"
+md_blob_msdos_sys_end:
+
+.balign 16
+.global md_blob_disk
+.global md_blob_disk_end
+md_blob_disk:
+    .incbin "@MICRODOS_PI0W_DISK@"
+md_blob_disk_end:
