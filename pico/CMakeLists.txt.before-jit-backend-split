@@ -133,7 +133,7 @@ function(md_pico_dos target code_in_sram cache sys_khz kernel_aot jit)
     endif()
     if(jit)
         target_sources(${target} PRIVATE
-            "${MD_ROOT}/src/runtime/jit_core.c"
+            "${MD_ROOT}/src/runtime/jit_thumb2.c"
             "${MD_ROOT}/src/decode/x86_decode.c")
     endif()
     md_pico_common(${target} ${code_in_sram})
@@ -163,7 +163,7 @@ function(md_pico_bench target code_in_sram sys_khz)
     add_executable(${target}
         "${CMAKE_CURRENT_LIST_DIR}/microdos_bench.c"
         ${MD_RUNTIME_SOURCES}
-        "${MD_ROOT}/src/runtime/jit_core.c"
+        "${MD_ROOT}/src/runtime/jit_thumb2.c"
         "${MD_ROOT}/src/decode/x86_decode.c"
         "${MD_GENERATED}/loop_recomp.c"
         "${MD_GENERATED}/memloop_recomp.c"

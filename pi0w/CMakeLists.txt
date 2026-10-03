@@ -14,6 +14,9 @@ set(MD_GENERATED "${MICRODOS_HOST_BUILD}/generated")
 foreach(req
         "${MD_GENERATED}/dos2test_recomp.c"
         "${MD_GENERATED}/msdos2_recomp.c"
+        "${MD_GENERATED}/loop_recomp.c"
+        "${MD_GENERATED}/memloop_recomp.c"
+        "${MD_GENERATED}/checksum_recomp.c"
         "${MICRODOS_PI0W_KERNEL}"
         "${MICRODOS_PI0W_DISK}")
     if(NOT EXISTS "${req}")
@@ -37,6 +40,7 @@ add_executable(microdos_pi0w.elf
     "${MD_ROOT}/src/runtime/x86_block_cache.c"
     "${MD_ROOT}/src/runtime/region.c"
     "${MD_ROOT}/src/runtime/exec_router.c"
+    "${MD_ROOT}/src/runtime/jit_core.c"
     "${MD_ROOT}/src/decode/x86_decode.c"
     "${MD_ROOT}/src/system/md_dos2_system.c"
     "${MD_ROOT}/src/host/msdos2_boot.c"
@@ -57,6 +61,20 @@ target_compile_definitions(microdos_pi0w.elf PRIVATE
     NDEBUG=1
     MD_THREADED_DISPATCH=1
     MICRODOS_PI0W_BAREMETAL=1
+
+    # AArch64 JIT v1:
+    #
+    # Shared JIT/router policy remains common with Pico. jit_core.c selects
+    # jit_aarch64_backend.inc on __aarch64__. The first native slice emits
+    # A64 direct prefixes plus small resident-helper trampolines.
+    MICRODOS_ENABLE_JIT=1
+    MICRODOS_PI0W_JIT_AARCH64=1
+    MICRODOS_SYSTEM_JIT_CODE_BYTES=24576
+    MD_JIT_LEGACY_HOTNESS=0
+    MD_JIT_PROFILE=1
+    MD_EXEC_PROFILE=1
+    MD_EXEC_ENABLE_PROMOTION=1
+    MD_EXEC_ENABLE_DIRECT=1
 )
 
 target_compile_options(microdos_pi0w.elf PRIVATE
@@ -66,16 +84,6 @@ target_compile_options(microdos_pi0w.elf PRIVATE
     -Wno-unused-parameter
     -ffunction-sections
     -fdata-sections
-
-    # Pi Zero 2 W bring-up result:
-    #
-    # CurrentEL = EL2
-    # SCTLR_EL2.A = 0
-    #
-    # The normal F6 /0 TEST path has now been proven to return correctly while
-    # the temporary -mstrict-align diagnostic was enabled.  Remove that
-    # diagnostic here for the next controlled test and let GCC use its normal
-    # AArch64 alignment assumptions/code generation.
 )
 
 target_link_options(microdos_pi0w.elf PRIVATE
@@ -98,4 +106,72 @@ add_custom_command(TARGET microdos_pi0w.elf POST_BUILD
     COMMAND "${CMAKE_SIZE}" "$<TARGET_FILE:microdos_pi0w.elf>"
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/kernel8.img"
     COMMENT "Producing Raspberry Pi Zero 2 W bare-metal kernel8.img"
+)
+
+
+# ---------------------------------------------------------------------------
+# Standalone Pi benchmark image.  It shares start.S, the runtime/JIT core and
+# generated AOT fixtures with the normal DOS image, but has its own kernel_main.
+# The normal kernel8.img is left untouched; this target emits kernel8_bench.img.
+# ---------------------------------------------------------------------------
+
+add_executable(microdos_pi0w_bench.elf
+    "${CMAKE_CURRENT_LIST_DIR}/start.S"
+    "${CMAKE_CURRENT_LIST_DIR}/microdos_pi0w_bench.c"
+    "${CMAKE_CURRENT_LIST_DIR}/mini_libc.c"
+
+    "${MD_ROOT}/src/runtime/runtime.c"
+    "${MD_ROOT}/src/runtime/x86_interp.c"
+    "${MD_ROOT}/src/runtime/x86_block_cache.c"
+    "${MD_ROOT}/src/runtime/region.c"
+    "${MD_ROOT}/src/runtime/exec_router.c"
+    "${MD_ROOT}/src/runtime/jit_core.c"
+    "${MD_ROOT}/src/decode/x86_decode.c"
+
+    "${MD_GENERATED}/loop_recomp.c"
+    "${MD_GENERATED}/memloop_recomp.c"
+    "${MD_GENERATED}/checksum_recomp.c"
+)
+
+target_include_directories(microdos_pi0w_bench.elf PRIVATE
+    "${MD_ROOT}/include"
+    "${MD_ROOT}/src/runtime"
+    "${MD_GENERATED}"
+)
+
+target_compile_definitions(microdos_pi0w_bench.elf PRIVATE
+    NDEBUG=1
+    MD_THREADED_DISPATCH=1
+    MICRODOS_PI0W_BAREMETAL=1
+    MICRODOS_PI0W_JIT_AARCH64=1
+    MD_JIT_PROFILE=1
+)
+
+target_compile_options(microdos_pi0w_bench.elf PRIVATE
+    -O2
+    -Wall
+    -Wextra
+    -Wno-unused-parameter
+    -ffunction-sections
+    -fdata-sections
+)
+
+target_link_options(microdos_pi0w_bench.elf PRIVATE
+    -nostdlib
+    -static
+    "-T${CMAKE_CURRENT_LIST_DIR}/linker.ld"
+    -Wl,--gc-sections
+    -Wl,--build-id=none
+    "-Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/microdos_pi0w_bench.map"
+)
+
+target_link_libraries(microdos_pi0w_bench.elf PRIVATE gcc)
+
+add_custom_command(TARGET microdos_pi0w_bench.elf POST_BUILD
+    COMMAND "${CMAKE_OBJCOPY}" -O binary
+            "$<TARGET_FILE:microdos_pi0w_bench.elf>"
+            "${CMAKE_CURRENT_BINARY_DIR}/kernel8_bench.img"
+    COMMAND "${CMAKE_SIZE}" "$<TARGET_FILE:microdos_pi0w_bench.elf>"
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/kernel8_bench.img"
+    COMMENT "Producing Pi Zero 2 W benchmark kernel8_bench.img"
 )

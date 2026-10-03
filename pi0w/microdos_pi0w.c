@@ -7,13 +7,16 @@
  * Disk:    embedded 360 KiB FAT12 image copied to RAM; writes last until reset.
  * CPU:     AArch64 Cortex-A53. Static dosrecomp AOT compiles as native AArch64 C.
  *
- * The RP2350 Thumb-2 runtime JIT is intentionally not linked here; an AArch64
- * runtime JIT is a separate backend.
+ * The shared runtime-JIT core/router is common with Pico. On AArch64,
+ * jit_core.c selects the v1 native backend: simple direct prefixes are emitted
+ * as A64 machine code, while the first resident shapes use emitted A64
+ * tail-call trampolines into the proven shared region helpers.
  */
 #include "md_dos2_system.h"
 #include "dos2test_recomp.h"
 #include "msdos2_recomp.h"
 #include "microdos/ops.h"
+#include "microdos/jit.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -65,6 +68,11 @@ static uint32_t g_disk_writes;
 
 static uint64_t g_perf_last_ticks;
 static uint64_t g_perf_last_instructions;
+static uint64_t g_perf_last_aot_instructions;
+static uint64_t g_perf_last_kernel_aot_instructions;
+static uint64_t g_perf_last_jit_instructions;
+static uint64_t g_perf_last_jit_native_instructions;
+static uint64_t g_perf_last_jit_fallback_instructions;
 static bool g_perf_valid;
 
 static inline void mmio_write(uintptr_t address, uint32_t value)
@@ -240,6 +248,11 @@ static void pi0_perf_reset(void)
 {
     g_perf_last_ticks = pi0_timer_ticks();
     g_perf_last_instructions = g_sys.runtime.instructions;
+    g_perf_last_aot_instructions = g_sys.runtime.aot_instructions;
+    g_perf_last_kernel_aot_instructions = g_sys.kernel_aot_instructions;
+    g_perf_last_jit_instructions = g_sys.jit_instructions;
+    g_perf_last_jit_native_instructions = g_sys.jit_native_instructions;
+    g_perf_last_jit_fallback_instructions = g_sys.jit_fallback_instructions;
     g_perf_valid = true;
 }
 
@@ -362,6 +375,11 @@ static void print_stats(void)
     const uint64_t now_ticks = pi0_timer_ticks();
     const uint64_t timer_hz = pi0_timer_hz();
     const uint64_t now_instructions = g_sys.runtime.instructions;
+    const uint64_t now_aot = g_sys.runtime.aot_instructions;
+    const uint64_t now_kernel_aot = g_sys.kernel_aot_instructions;
+    const uint64_t now_jit = g_sys.jit_instructions;
+    const uint64_t now_jit_native = g_sys.jit_native_instructions;
+    const uint64_t now_jit_fallback = g_sys.jit_fallback_instructions;
 
     uart_puts("\n");
 
@@ -371,6 +389,35 @@ static void print_stats(void)
             now_instructions >= g_perf_last_instructions
                 ? now_instructions - g_perf_last_instructions
                 : 0u;
+        const uint64_t delta_aot =
+            now_aot >= g_perf_last_aot_instructions
+                ? now_aot - g_perf_last_aot_instructions
+                : 0u;
+        const uint64_t delta_kernel_aot =
+            now_kernel_aot >= g_perf_last_kernel_aot_instructions
+                ? now_kernel_aot - g_perf_last_kernel_aot_instructions
+                : 0u;
+        const uint64_t delta_app_aot =
+            delta_aot >= delta_kernel_aot
+                ? delta_aot - delta_kernel_aot
+                : 0u;
+        const uint64_t delta_jit =
+            now_jit >= g_perf_last_jit_instructions
+                ? now_jit - g_perf_last_jit_instructions
+                : 0u;
+        const uint64_t delta_jit_ref =
+            now_jit_native >= g_perf_last_jit_native_instructions
+                ? now_jit_native - g_perf_last_jit_native_instructions
+                : 0u;
+        const uint64_t delta_jit_fallback =
+            now_jit_fallback >= g_perf_last_jit_fallback_instructions
+                ? now_jit_fallback - g_perf_last_jit_fallback_instructions
+                : 0u;
+        const uint64_t accounted =
+            delta_aot + delta_jit <= delta_instructions
+                ? delta_aot + delta_jit
+                : delta_instructions;
+        const uint64_t delta_interp = delta_instructions - accounted;
         const uint64_t elapsed_us =
             (delta_ticks * 1000000u) / timer_hz;
         const uint64_t mips_milli =
@@ -385,6 +432,22 @@ static void print_stats(void)
         uart_puts("  ");
         uart_put_fixed3(mips_milli);
         uart_puts(" MIPS\n");
+
+        uart_puts("[perf] tiers aot=");
+        uart_put_u64(delta_aot);
+        uart_puts(" kernel=");
+        uart_put_u64(delta_kernel_aot);
+        uart_puts(" app=");
+        uart_put_u64(delta_app_aot);
+        uart_puts(" jit=");
+        uart_put_u64(delta_jit);
+        uart_puts(" native=");
+        uart_put_u64(delta_jit_ref);
+        uart_puts(" jit-fallback=");
+        uart_put_u64(delta_jit_fallback);
+        uart_puts(" interp=");
+        uart_put_u64(delta_interp);
+        uart_putc('\n');
     } else {
         uart_puts("[perf] interval unavailable\n");
     }
@@ -392,7 +455,17 @@ static void print_stats(void)
     uart_puts("[pi0w] total instructions=");
     uart_put_u64(now_instructions);
     uart_puts(" aot=");
-    uart_put_u64(g_sys.runtime.aot_instructions);
+    uart_put_u64(now_aot);
+    uart_puts(" kernel-aot=");
+    uart_put_u64(now_kernel_aot);
+    uart_puts(" jit=");
+    uart_put_u64(now_jit);
+    uart_puts(" native=");
+    uart_put_u64(now_jit_native);
+    uart_puts(" jit-fallback=");
+    uart_put_u64(now_jit_fallback);
+    uart_puts(" bios=");
+    uart_put_u64(g_sys.bios_interpreted_instructions);
     uart_puts(" attaches=");
     uart_put_u64(g_sys.aot_attaches);
     uart_puts(" enters=");
@@ -405,8 +478,37 @@ static void print_stats(void)
     uart_put_hex16(g_sys.runtime.cpu.ip);
     uart_putc('\n');
 
+    if (g_sys.jit != NULL) {
+        uart_puts("[jit-a64] lookups=");
+        uart_put_u64(g_sys.jit->lookups);
+        uart_puts(" hits=");
+        uart_put_u64(g_sys.jit->hits);
+        uart_puts(" misses=");
+        uart_put_u64(g_sys.jit->misses);
+        uart_puts(" compiles=");
+        uart_put_u64(g_sys.jit->compiles);
+        uart_puts(" entries=");
+        uart_put_u64(g_sys.jit->native_entries);
+        uart_puts(" resident=");
+        uart_put_u64(g_sys.jit->resident_entries);
+        uart_puts(" code=");
+        uart_put_u64(g_sys.jit->code_used);
+        uart_puts(" helpers=");
+        uart_put_u64(g_sys.jit->helper_sites);
+        uart_puts(" direct=");
+        uart_put_u64(g_sys.jit->direct_instructions);
+        uart_puts(" flushes=");
+        uart_put_u64(g_sys.jit->flushes);
+        uart_putc('\n');
+    }
+
     g_perf_last_ticks = now_ticks;
     g_perf_last_instructions = now_instructions;
+    g_perf_last_aot_instructions = now_aot;
+    g_perf_last_kernel_aot_instructions = now_kernel_aot;
+    g_perf_last_jit_instructions = now_jit;
+    g_perf_last_jit_native_instructions = now_jit_native;
+    g_perf_last_jit_fallback_instructions = now_jit_fallback;
     g_perf_valid = true;
 }
 
@@ -510,19 +612,24 @@ void kernel_main(void)
     uart_puts("[05] callbacks OK\n");
 
     /*
-     * BRING-UP TEST:
+     * Static AOT test.
      *
-     * Intentionally disable ALL static AOT.
+     * These are the same generated AOT programs used by the portable
+     * microDOS system layer on Pico.  On Pi Zero 2 W they are compiled by
+     * the AArch64 cross-compiler into native Cortex-A53 code.
      *
-     * We want the first Pi boot to prove that the portable
-     * interpreter + DOS environment works independently of
-     * generated native AOT.
+     * Runtime JIT remains disabled for this test.
      */
-    uart_puts("[06] disabling AOT for bring-up\n");
+    uart_puts("[06] enabling static AOT\n");
 
-    md_dos2_system_set_aot(&g_sys, NULL, 0u, false);
+    md_dos2_system_set_kernel_aot(&g_sys, &md_recomp_msdos2_program);
+    md_dos2_system_set_aot(
+        &g_sys,
+        g_programs,
+        sizeof(g_programs) / sizeof(g_programs[0]),
+        true);
 
-    uart_puts("[06] interpreter-only mode selected\n");
+    uart_puts("[06] static AOT selected; AArch64 native JIT v1 enabled\n");
 
     /*
      * Stage 7: load MSDOS.SYS and construct the synthetic
@@ -542,9 +649,24 @@ void kernel_main(void)
     uart_puts("\n");
     uart_puts("  guest:   1 MiB RAM\n");
     uart_puts("  disk:    360 KiB FAT12 RAM disk\n");
-    uart_puts("  AOT:     OFF - diagnostic interpreter boot\n");
-    uart_puts("  JIT:     OFF\n");
-    uart_puts("  keys:    Ctrl+] prints rolling MIPS + execution statistics\n");
+
+    uart_puts("  AOT:     MSDOS.SYS ");
+    uart_put_u64(md_recomp_msdos2_program.compiled_instructions);
+    uart_puts(" compiled, ");
+    uart_put_u64(md_recomp_msdos2_program.hole_instructions);
+    uart_puts(" holes, ");
+    uart_puts(g_sys.kernel_attached ? "attached\n" : "NOT ATTACHED\n");
+
+    uart_puts("  AOT:     ");
+    uart_puts(md_recomp_dos2test_program.name);
+    uart_puts(" ");
+    uart_put_u64(md_recomp_dos2test_program.compiled_instructions);
+    uart_puts(" compiled, ");
+    uart_put_u64(md_recomp_dos2test_program.hole_instructions);
+    uart_puts(" holes\n");
+
+    uart_puts("  JIT:     AArch64 native v1 - emitted A64 direct prefixes + resident trampolines\n");
+    uart_puts("  keys:    Ctrl+] prints rolling MIPS + AOT/JIT/native tier statistics\n");
     uart_puts("\n");
 
     /*
@@ -561,13 +683,16 @@ void kernel_main(void)
      * instruction 300 under that configuration.  Stop single-stepping here
      * and return to the platform-neutral DOS system loop.
      *
-     * Keep AOT/JIT disabled for the interpreter baseline.  Platform timing
-     * stays here in pi0w; the shared DOS/runtime layer only exposes the guest
-     * instruction counter.
+     * Static AOT remains highest priority for MSDOS.SYS and DOS2TEST.COM.
+     * MICRODOS_ENABLE_JIT adds the shared execution router/JIT core for other
+     * segments. On AArch64, jit_core.c now selects the v1 native emitter:
+     * simple direct prefixes execute as generated A64, while the first two
+     * resident shapes execute through emitted A64 tail-call trampolines into
+     * the already-proven shared region helpers.
      */
-    uart_puts("[08] normal interpreter run BEGIN\n");
+    uart_puts("[08] static AOT + AArch64 native JIT v1 run BEGIN\n");
     uart_puts("     md_dos2_system_run() slices = 50000 instructions\n");
-    uart_puts("     Ctrl+] = rolling MIPS sample\n");
+    uart_puts("     Ctrl+] = rolling MIPS + AOT/JIT/native tier sample\n");
 
     pi0_perf_reset();
 
@@ -587,7 +712,7 @@ void kernel_main(void)
             stop = md_dos2_system_run(&g_sys, slice_budget);
 
             if (stop != MD_STOP_NONE) {
-                uart_puts("\n[08] normal interpreter run STOP\n");
+                uart_puts("\n[08] static AOT + AArch64 native JIT v1 run STOP\n");
                 uart_puts("     stop         = ");
                 uart_put_u64((uint64_t)stop);
                 uart_puts("\n     instructions = ");

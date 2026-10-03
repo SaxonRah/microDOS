@@ -36,9 +36,9 @@
  *   - one L1 table
  *   - one L2 table containing 512 x 2 MiB block descriptors
  *
- * The MMU mapping has now been validated with normal GCC AArch64 codegen.
- * Before entering C, stale cache state is invalidated and SCTLR_EL2 enables
- * stage-1 translation plus the data and instruction caches.
+ * The MMU mapping is validated. This variant enables only the instruction
+ * cache; the data cache remains off so D-cache maintenance can be brought up
+ * separately as its own controlled change.
  */
 
 _start:
@@ -181,7 +181,8 @@ pi0_enable_mmu_el2:
      *                   Read/Write Allocate.
      * AttrIdx 1 = 0x00: Device-nGnRnE.
      *
-     * Normal RAM is cacheable once SCTLR_EL2.C is enabled below.
+     * SCTLR_EL2.C remains 0 in this step; RAM is Normal memory but the
+     * data/unified cache remains disabled.
      */
     mov     x0, #0xff
     msr     mair_el2, x0
@@ -213,133 +214,77 @@ pi0_enable_mmu_el2:
     isb
 
     /*
-     * The firmware entered with EL2 I/D caches disabled.  Invalidate any
-     * architecturally visible stale cache state before turning them on.
+     * Bring up the instruction cache as a separate controlled step.
      *
-     * Only core 0 is running, so local I-cache invalidation is sufficient.
+     * Invalidate the local instruction cache first, then preserve all
+     * firmware-provided SCTLR_EL2 bits and set:
+     *
+     *     M (bit 0)   stage-1 MMU
+     *     I (bit 12)  instruction cache
+     *
+     * C (bit 2) remains clear until the microDOS-owned RAM range has been
+     * invalidated by VA below.
      */
-    bl      pi0_invalidate_dcache_all
     ic      iallu
     dsb     sy
     isb
 
-    /*
-     * Preserve the firmware-provided SCTLR_EL2 bits and enable:
-     *
-     *     M (bit 0)   stage-1 MMU
-     *     C (bit 2)   data/unified cache
-     *     I (bit 12)  instruction cache
-     */
     mrs     x0, sctlr_el2
     orr     x0, x0, #1
-    orr     x0, x0, #4
     orr     x0, x0, #0x1000
+    msr     sctlr_el2, x0
+    isb
+
+    /*
+     * Controlled D-cache bring-up.
+     *
+     * The failed earlier experiment attempted a global set/way invalidate.
+     * For this test, invalidate only microDOS-owned Normal RAM by VA:
+     *
+     *     _start .. __image_end
+     *
+     * That range contains the kernel image, BSS, guest RAM, disk RAM,
+     * MMU tables, and stack.  MMU translation is already active here, but
+     * SCTLR_EL2.C is still clear.
+     *
+     * CTR_EL0.DminLine (bits 19:16) is log2(words per D-cache line), so
+     * line_shift = DminLine + 2 gives log2(bytes per line).
+     */
+    mrs     x3, ctr_el0
+    ubfx    x3, x3, #16, #4
+    add     x3, x3, #2
+
+    mov     x4, #1
+    lsl     x4, x4, x3              /* x4 = cache line bytes */
+    sub     x5, x4, #1              /* x5 = line mask */
+
+    ldr     x1, =_start
+    bic     x1, x1, x5              /* align start downward */
+    ldr     x2, =__image_end
+
+9:
+    cmp     x1, x2
+    b.hs    10f
+    dc      ivac, x1
+    add     x1, x1, x4
+    b       9b
+
+10:
+    dsb     sy
+    isb
+
+    /*
+     * Enable the data/unified cache only after the microDOS-owned range has
+     * been invalidated.  Preserve the already-enabled MMU and I-cache bits.
+     */
+    mrs     x0, sctlr_el2
+    orr     x0, x0, #4
     msr     sctlr_el2, x0
     isb
 
     ret
 
 .size pi0_enable_mmu_el2, . - pi0_enable_mmu_el2
-
-
-/*
- * Invalidate one data/unified cache level by set/way.
- *
- * x0 = zero-based cache level
- *
- * This follows the Armv8 cache-maintenance algorithm: select the cache with
- * CSSELR_EL1, derive line/way/set geometry from CCSIDR_EL1, and issue DC ISW
- * for every set/way combination.
- */
-.type pi0_invalidate_dcache_level, %function
-pi0_invalidate_dcache_level:
-    lsl     x12, x0, #1
-    msr     csselr_el1, x12
-    isb
-
-    mrs     x6, ccsidr_el1
-
-    /* log2(bytes per cache line) */
-    and     x2, x6, #7
-    add     x2, x2, #4
-
-    /* ways - 1 */
-    mov     x3, #0x3ff
-    and     x3, x3, x6, lsr #3
-
-    /* bit position used by the way field in DC ISW */
-    clz     w5, w3
-
-    /* sets - 1 */
-    mov     x4, #0x7fff
-    and     x4, x4, x6, lsr #13
-
-.Lcache_set:
-    mov     x6, x3
-
-.Lcache_way:
-    lsl     x7, x6, x5
-    orr     x9, x12, x7
-    lsl     x7, x4, x2
-    orr     x9, x9, x7
-    dc      isw, x9
-
-    subs    x6, x6, #1
-    b.ge    .Lcache_way
-
-    subs    x4, x4, #1
-    b.ge    .Lcache_set
-
-    ret
-
-.size pi0_invalidate_dcache_level, . - pi0_invalidate_dcache_level
-
-
-/*
- * Invalidate every architecturally visible data/unified cache level.
- *
- * CLIDR_EL1 describes which levels contain data or unified caches.  Caches
- * are still disabled while this routine runs.
- */
-.type pi0_invalidate_dcache_all, %function
-pi0_invalidate_dcache_all:
-    dsb     sy
-
-    mrs     x10, clidr_el1
-    lsr     x11, x10, #24
-    and     x11, x11, #7          /* LoC */
-    cbz     x11, .Lcache_done
-
-    mov     x15, lr
-    mov     x0, #0
-
-.Lcache_level:
-    lsl     x12, x0, #1
-    add     x12, x12, x0         /* 3 * level */
-    lsr     x12, x10, x12
-    and     x12, x12, #7         /* cache type */
-
-    cmp     x12, #2
-    b.lt    .Lcache_skip          /* none or instruction-only */
-
-    bl      pi0_invalidate_dcache_level
-
-.Lcache_skip:
-    add     x0, x0, #1
-    cmp     x11, x0
-    b.gt    .Lcache_level
-
-    mov     x0, #0
-    msr     csselr_el1, x0
-    dsb     sy
-    isb
-
-    mov     lr, x15
-
-.Lcache_done:
-    ret
-
-.size pi0_invalidate_dcache_all, . - pi0_invalidate_dcache_all
 
 
 /*

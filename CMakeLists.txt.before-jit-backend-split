@@ -166,7 +166,7 @@ if(MD_BUILD_TESTS)
     # Thumb-2 under qemu-arm, which also checks code shape (fallbacks,
     # resident regions). test_jit.c is the M20.3 spec (LODS/LOOP
     # resident regions); on the host its code-shape checks are skipped.
-    set(MD_JIT_TEST_SOURCES src/runtime/jit_core.c)
+    set(MD_JIT_TEST_SOURCES src/runtime/jit_thumb2.c)
     add_executable(microdos_jit_diff tests/test_jit_diff.c ${MD_JIT_TEST_SOURCES})
     target_link_libraries(microdos_jit_diff PRIVATE microdos::runtime microdos::decode)
     target_include_directories(microdos_jit_diff PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/runtime")
@@ -206,7 +206,7 @@ if(MD_BUILD_TESTS)
     foreach(variant baseline promote lean)
         add_executable(microdos_exec_router_diff_${variant}
             tests/test_exec_router_diff.c src/system/md_dos2_system.c
-            src/host/msdos2_boot.c src/runtime/jit_core.c
+            src/host/msdos2_boot.c src/runtime/jit_thumb2.c
             src/runtime/runtime.c src/runtime/x86_interp.c
             src/runtime/x86_block_cache.c src/runtime/region.c src/runtime/exec_router.c
             "${MD_RECOMP_loop_C}")
@@ -285,7 +285,7 @@ if(MD_BUILD_TESTS)
         foreach(variant baseline promote lean)
             add_executable(microdos_dos2_e2e_router_${variant}
                 tests/test_dos2_e2e.c src/system/md_dos2_system.c src/host/msdos2_boot.c
-                src/runtime/jit_core.c src/runtime/runtime.c src/runtime/x86_interp.c
+                src/runtime/jit_thumb2.c src/runtime/runtime.c src/runtime/x86_interp.c
                 src/runtime/x86_block_cache.c src/runtime/region.c src/runtime/exec_router.c
                 "${MD_RECOMP_dos2test_C}" "${MD_RECOMP_msdos2_C}")
             target_link_libraries(microdos_dos2_e2e_router_${variant} PRIVATE microdos::decode)
