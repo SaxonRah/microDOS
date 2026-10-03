@@ -63,8 +63,9 @@ typedef struct Pi0Console {
 static Pi0Console g_con;
 static uint32_t g_disk_writes;
 
-static uint32_t g_boot_int_trace_count;
-static uint32_t g_con_read_count;
+static uint64_t g_perf_last_ticks;
+static uint64_t g_perf_last_instructions;
+static bool g_perf_valid;
 
 static inline void mmio_write(uintptr_t address, uint32_t value)
 {
@@ -160,12 +161,119 @@ static void uart_put_u64(uint64_t value)
     while (n != 0u) uart_putc_raw((uint8_t)buf[--n]);
 }
 
+static void uart_put_fixed3(uint64_t milli_value)
+{
+    const uint64_t whole = milli_value / 1000u;
+    const unsigned frac = (unsigned)(milli_value % 1000u);
+
+    uart_put_u64(whole);
+    uart_putc_raw('.');
+    uart_putc_raw((uint8_t)('0' + ((frac / 100u) % 10u)));
+    uart_putc_raw((uint8_t)('0' + ((frac / 10u) % 10u)));
+    uart_putc_raw((uint8_t)('0' + (frac % 10u)));
+}
+
 static void uart_put_hex16(uint16_t value)
 {
     static const char hex[] = "0123456789ABCDEF";
     int shift;
     for (shift = 12; shift >= 0; shift -= 4)
         uart_putc_raw((uint8_t)hex[(value >> shift) & 0x0Fu]);
+}
+
+static void uart_put_hex64(uint64_t value)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    int shift;
+    for (shift = 60; shift >= 0; shift -= 4)
+        uart_putc_raw((uint8_t)hex[(value >> shift) & 0x0Fu]);
+}
+
+static inline uint64_t pi0_read_currentel(void)
+{
+    uint64_t value;
+    __asm__ volatile("mrs %0, CurrentEL" : "=r"(value));
+    return value;
+}
+
+static inline uint64_t pi0_read_sctlr(unsigned el)
+{
+    uint64_t value = 0u;
+
+    switch (el) {
+        case 1u:
+            __asm__ volatile("mrs %0, SCTLR_EL1" : "=r"(value));
+            break;
+        case 2u:
+            __asm__ volatile("mrs %0, SCTLR_EL2" : "=r"(value));
+            break;
+        case 3u:
+            __asm__ volatile("mrs %0, SCTLR_EL3" : "=r"(value));
+            break;
+        default:
+            break;
+    }
+
+    return value;
+}
+
+static inline uint64_t pi0_timer_ticks(void)
+{
+    uint64_t value;
+    __asm__ volatile(
+        "isb\n"
+        "mrs %0, CNTPCT_EL0"
+        : "=r"(value)
+        :
+        : "memory");
+    return value;
+}
+
+static inline uint64_t pi0_timer_hz(void)
+{
+    uint64_t value;
+    __asm__ volatile("mrs %0, CNTFRQ_EL0" : "=r"(value));
+    return value;
+}
+
+static void pi0_perf_reset(void)
+{
+    g_perf_last_ticks = pi0_timer_ticks();
+    g_perf_last_instructions = g_sys.runtime.instructions;
+    g_perf_valid = true;
+}
+
+static void pi0_print_cpu_control_state(void)
+{
+    const uint64_t currentel = pi0_read_currentel();
+    const unsigned el = (unsigned)((currentel >> 2) & 3u);
+    uint64_t sctlr = 0u;
+
+    uart_puts("[CPU] CurrentEL raw = 0x");
+    uart_put_hex64(currentel);
+    uart_putc('\n');
+
+    uart_puts("[CPU] EL            = ");
+    uart_put_u64(el);
+    uart_putc('\n');
+
+    if (el >= 1u && el <= 3u) {
+        sctlr = pi0_read_sctlr(el);
+
+        uart_puts("[CPU] SCTLR_EL");
+        uart_put_u64(el);
+        uart_puts("     = 0x");
+        uart_put_hex64(sctlr);
+        uart_putc('\n');
+
+        uart_puts("[CPU] SCTLR.A       = ");
+        uart_put_u64((sctlr >> 1) & 1u);
+        uart_putc('\n');
+    } else {
+        uart_puts("[CPU] SCTLR         = unavailable at EL0\n");
+    }
+
+    uart_putc('\n');
 }
 
 static bool pi0_fetch(Pi0Console *con, bool block, uint8_t *value)
@@ -212,42 +320,14 @@ static bool con_peek(void *user, uint8_t *value)
 static bool con_read(void *user, uint8_t *value)
 {
     Pi0Console *con = (Pi0Console *)user;
-    bool ok;
-
-    ++g_con_read_count;
-
-    uart_puts("\n[CONDBG] con_read ENTER #");
-    uart_put_u64(g_con_read_count);
-    uart_puts(" CS:IP=");
-    uart_put_hex16(g_sys.runtime.cpu.cs);
-    uart_putc_raw(':');
-    uart_put_hex16(g_sys.runtime.cpu.ip);
-    uart_puts(" ins=");
-    uart_put_u64(g_sys.runtime.instructions);
-    uart_puts(" rxready=");
-    uart_put_u64(uart_rx_ready() ? 1u : 0u);
-    uart_putc('\n');
 
     if (con->have_pending) {
         *value = con->pending;
         con->have_pending = false;
-
-        uart_puts("[CONDBG] con_read RETURN pending value=");
-        uart_put_hex16((uint16_t)*value);
-        uart_putc('\n');
         return true;
     }
 
-    uart_puts("[CONDBG] blocking in pi0_fetch(true)\n");
-    ok = pi0_fetch(con, true, value);
-
-    uart_puts("[CONDBG] con_read RETURN ok=");
-    uart_put_u64(ok ? 1u : 0u);
-    uart_puts(" value=");
-    uart_put_hex16((uint16_t)*value);
-    uart_putc('\n');
-
-    return ok;
+    return pi0_fetch(con, true, value);
 }
 
 static void con_flush(void *user)
@@ -276,77 +356,41 @@ static bool disk_write(void *user, uint32_t sector, const uint8_t *data, size_t 
     return true;
 }
 
-static bool pi0_boot_interrupt_debug(MdRuntime *runtime,
-                                     uint8_t vector,
-                                     void *user)
-{
-    MdMsdos2Boot *boot = (MdMsdos2Boot *)user;
-    bool trace = false;
-    bool handled;
-
-    if (vector >= MD_MSDOS2_NATIVE_STRATEGY_INT &&
-        vector <= MD_MSDOS2_NATIVE_POSTINIT_STDIO_FAIL_INT &&
-        g_boot_int_trace_count < 128u) {
-        uint8_t req = 0xFFu;
-
-        ++g_boot_int_trace_count;
-        trace = true;
-
-        if (boot->have_request) {
-            /* DOS 2 request header byte 2 is the command/function. */
-            req = md_x86_read8(&runtime->cpu,
-                               boot->request_segment,
-                               (uint16_t)(boot->request_offset + 2u));
-        }
-
-        uart_puts("\n[INTDBG] ENTER #");
-        uart_put_u64(g_boot_int_trace_count);
-        uart_puts(" vec=");
-        uart_put_hex16((uint16_t)vector);
-        uart_puts(" CS:IP=");
-        uart_put_hex16(runtime->cpu.cs);
-        uart_putc_raw(':');
-        uart_put_hex16(runtime->cpu.ip);
-        uart_puts(" ins=");
-        uart_put_u64(runtime->instructions);
-        uart_puts(" dev=");
-        uart_put_hex16(boot->last_device_offset);
-        uart_puts(" req=");
-        uart_put_hex16((uint16_t)req);
-        uart_puts(" have=");
-        uart_put_u64(boot->have_request ? 1u : 0u);
-        uart_putc('\n');
-    }
-
-    handled = md_msdos2_boot_interrupt(runtime, vector, user);
-
-    if (trace) {
-        uart_puts("[INTDBG] RETURN vec=");
-        uart_put_hex16((uint16_t)vector);
-        uart_puts(" handled=");
-        uart_put_u64(handled ? 1u : 0u);
-        uart_puts(" stop=");
-        uart_put_u64((uint64_t)runtime->stop_reason);
-        uart_puts(" CS:IP=");
-        uart_put_hex16(runtime->cpu.cs);
-        uart_putc_raw(':');
-        uart_put_hex16(runtime->cpu.ip);
-        uart_puts(" ins=");
-        uart_put_u64(runtime->instructions);
-        uart_puts(" lastdev=");
-        uart_put_hex16(boot->last_device_offset);
-        uart_puts(" lastreq=");
-        uart_put_hex16((uint16_t)boot->last_request_function);
-        uart_putc('\n');
-    }
-
-    return handled;
-}
 
 static void print_stats(void)
 {
-    uart_puts("\n[pi0w] instructions=");
-    uart_put_u64(g_sys.runtime.instructions);
+    const uint64_t now_ticks = pi0_timer_ticks();
+    const uint64_t timer_hz = pi0_timer_hz();
+    const uint64_t now_instructions = g_sys.runtime.instructions;
+
+    uart_puts("\n");
+
+    if (g_perf_valid && timer_hz != 0u && now_ticks > g_perf_last_ticks) {
+        const uint64_t delta_ticks = now_ticks - g_perf_last_ticks;
+        const uint64_t delta_instructions =
+            now_instructions >= g_perf_last_instructions
+                ? now_instructions - g_perf_last_instructions
+                : 0u;
+        const uint64_t elapsed_us =
+            (delta_ticks * 1000000u) / timer_hz;
+        const uint64_t mips_milli =
+            elapsed_us != 0u
+                ? (delta_instructions * 1000u) / elapsed_us
+                : 0u;
+
+        uart_puts("[perf] interval ");
+        uart_put_u64(elapsed_us);
+        uart_puts(" us  instructions ");
+        uart_put_u64(delta_instructions);
+        uart_puts("  ");
+        uart_put_fixed3(mips_milli);
+        uart_puts(" MIPS\n");
+    } else {
+        uart_puts("[perf] interval unavailable\n");
+    }
+
+    uart_puts("[pi0w] total instructions=");
+    uart_put_u64(now_instructions);
     uart_puts(" aot=");
     uart_put_u64(g_sys.runtime.aot_instructions);
     uart_puts(" attaches=");
@@ -360,6 +404,10 @@ static void print_stats(void)
     uart_putc_raw(':');
     uart_put_hex16(g_sys.runtime.cpu.ip);
     uart_putc('\n');
+
+    g_perf_last_ticks = now_ticks;
+    g_perf_last_instructions = now_instructions;
+    g_perf_valid = true;
 }
 
 void kernel_main(void)
@@ -371,10 +419,14 @@ void kernel_main(void)
     MdStopReason stop = MD_STOP_NONE;
 
     uart_init();
+    pi0_print_cpu_control_state();
 
     uart_puts("\nmicroDOS - Raspberry Pi Zero 2 W bare metal\n");
     uart_puts("  cpu:     Cortex-A53 / AArch64\n");
     uart_puts("  console: GPIO14/15 mini UART, 115200 8N1\n");
+    uart_puts("  timer:   ARM generic physical counter, ");
+    uart_put_u64(pi0_timer_hz());
+    uart_puts(" Hz\n");
     uart_puts("  host OS: none\n\n");
 
     /*
@@ -421,150 +473,15 @@ void kernel_main(void)
     uart_puts("[03] disk image OK\n");
 
     /*
-     * Stage 4: initialize portable DOS/runtime system.
-     *
-     * With M23 this also exercises the execution-router
-     * initialization path, so this checkpoint is important.
+     * Stage 4: initialize the portable DOS/runtime system through the real
+     * platform-neutral initializer.  This installs the normal
+     * md_msdos2_boot_interrupt hook.
      */
-    {
-        MdHooks hooks;
+    uart_puts("[04] md_dos2_system_init BEGIN\n");
 
-        uart_puts("[04a] memset MdDos2System BEGIN\n");
+    md_dos2_system_init(&g_sys, g_guest, NULL);
 
-        memset(&g_sys, 0, sizeof(g_sys));
-
-        uart_puts("[04a] memset MdDos2System OK\n");
-
-
-        uart_puts("[04b] md_msdos2_boot_init BEGIN\n");
-
-        md_msdos2_boot_init(&g_sys.boot);
-        g_sys.boot.continue_after_dosinit = true;
-
-        uart_puts("[04b] md_msdos2_boot_init OK\n");
-
-
-        uart_puts("[04c] md_exec_router_init BEGIN\n");
-
-        md_exec_router_init(&g_sys.router);
-
-        uart_puts("[04c] md_exec_router_init OK\n");
-
-
-        uart_puts("[04d] hooks setup BEGIN\n");
-
-        memset(&hooks, 0, sizeof(hooks));
-        hooks.interrupt = pi0_boot_interrupt_debug;
-        hooks.user = &g_sys.boot;
-
-        uart_puts("[04d] hooks setup OK\n");
-
-
-        uart_puts("[04e1] runtime memset BEGIN\n");
-        memset(&g_sys.runtime, 0, sizeof(g_sys.runtime));
-        uart_puts("[04e1] runtime memset OK\n");
-
-        uart_puts("[04e2] cpu.memory BEGIN\n");
-        g_sys.runtime.cpu.memory = g_guest;
-        uart_puts("[04e2] cpu.memory OK\n");
-
-        uart_puts("[04e3] flags BEGIN\n");
-        md_x86_set_flags(&g_sys.runtime.cpu, MD_X86_FLAG_ALWAYS1);
-        uart_puts("[04e3] flags OK\n");
-
-        uart_puts("[04e4] epochs BEGIN\n");
-
-        uart_puts("[04e4a] runtime address = ");
-        uart_put_u64((uint64_t)(uintptr_t)&g_sys.runtime);
-        uart_puts("\n[04e4a] code_epoch address = ");
-        uart_put_u64((uint64_t)(uintptr_t)&g_sys.runtime.code_epoch);
-        uart_puts("\n[04e4a] code_write_epoch address = ");
-        uart_put_u64((uint64_t)(uintptr_t)&g_sys.runtime.code_write_epoch);
-        uart_puts("\n");
-
-        uart_puts("[04e4b] code_epoch store BEGIN\n");
-        *(volatile uint32_t *)&g_sys.runtime.code_epoch = 1u;
-        __asm__ volatile("dmb sy" ::: "memory");
-        uart_puts("[04e4b] code_epoch store OK, readback=");
-        uart_put_u64((uint64_t)*(volatile uint32_t *)&g_sys.runtime.code_epoch);
-        uart_puts("\n");
-
-        uart_puts("[04e4c] code_write_epoch store BEGIN\n");
-        *(volatile uint32_t *)&g_sys.runtime.code_write_epoch = 1u;
-        __asm__ volatile("dmb sy" ::: "memory");
-        uart_puts("[04e4c] code_write_epoch store OK, readback=");
-        uart_put_u64((uint64_t)*(volatile uint32_t *)&g_sys.runtime.code_write_epoch);
-        uart_puts("\n");
-
-        uart_puts("[04e4] epochs OK\n");
-
-        uart_puts("[04e5] hooks copy BEGIN\n");
-        g_sys.runtime.hooks = hooks;
-        uart_puts("[04e5] hooks copy OK\n");
-
-        /* Manual expansion of md_runtime_bind_tracking(). */
-
-        uart_puts("[04e6] generation ptr BEGIN\n");
-        g_sys.runtime.cpu.code_page_generation =
-            g_sys.runtime.code_page_generation;
-        uart_puts("[04e6] generation ptr OK\n");
-
-        uart_puts("[04e7] executable ptr BEGIN\n");
-        g_sys.runtime.cpu.code_page_executable =
-            g_sys.runtime.code_page_executable;
-        uart_puts("[04e7] executable ptr OK\n");
-
-        uart_puts("[04e8] write epoch ptr BEGIN\n");
-        g_sys.runtime.cpu.code_write_epoch =
-            &g_sys.runtime.code_write_epoch;
-        uart_puts("[04e8] write epoch ptr OK\n");
-
-        uart_puts("[04e9] AOT guard ptr BEGIN\n");
-        g_sys.runtime.cpu.aot_guards =
-            g_sys.runtime.aot_slots;
-        uart_puts("[04e9] AOT guard ptr OK\n");
-
-        uart_puts("[04e10] owner memset BEGIN\n");
-        memset(g_sys.runtime.aot_page_owner,
-            0,
-            sizeof(g_sys.runtime.aot_page_owner));
-        uart_puts("[04e10] owner memset OK\n");
-
-        uart_puts("[04e11] owner ptr BEGIN\n");
-        g_sys.runtime.cpu.aot_page_owner =
-            g_sys.runtime.aot_page_owner;
-        uart_puts("[04e11] owner ptr OK\n");
-
-        uart_puts("[04e12] live bits memset BEGIN\n");
-        memset(g_sys.runtime.aot_live_bits,
-            0,
-            sizeof(g_sys.runtime.aot_live_bits));
-        uart_puts("[04e12] live bits memset OK\n");
-
-        uart_puts("[04e13] live pool BEGIN\n");
-        g_sys.runtime.aot_live_pool_used = 0u;
-        uart_puts("[04e13] live pool OK\n");
-
-        uart_puts("[04e14] live bits ptr BEGIN\n");
-        g_sys.runtime.cpu.aot_live_bits =
-            g_sys.runtime.aot_live_bits;
-        uart_puts("[04e14] live bits ptr OK\n");
-
-        uart_puts("[04e15] guard count BEGIN\n");
-        g_sys.runtime.cpu.aot_guard_count = 0u;
-        uart_puts("[04e15] guard count OK\n");
-
-        uart_puts("[04e] manual md_runtime_init OK\n");
-
-
-        uart_puts("[04f] cache setup BEGIN\n");
-
-        g_sys.cache = NULL;
-
-        uart_puts("[04f] cache setup OK\n");
-    }
-
-    uart_puts("[04] manual md_dos2_system_init OK\n");
+    uart_puts("[04] md_dos2_system_init OK\n");
 
     /*
      * Stage 5: platform callbacks.
@@ -627,213 +544,64 @@ void kernel_main(void)
     uart_puts("  disk:    360 KiB FAT12 RAM disk\n");
     uart_puts("  AOT:     OFF - diagnostic interpreter boot\n");
     uart_puts("  JIT:     OFF\n");
-    uart_puts("  keys:    Ctrl+] prints execution statistics\n");
+    uart_puts("  keys:    Ctrl+] prints rolling MIPS + execution statistics\n");
     uart_puts("\n");
 
     /*
-     * Stage 8 diagnostic:
+     * Stage 8:
      *
-     * Do NOT enter md_dos2_system_run() yet.  The previous trace proved that
-     * all bootstrap/device interrupts through instruction 90 return normally,
-     * then the direct run loop stops making observable progress.
+     * The Pi memory-type failure is now understood and fixed at startup:
      *
-     * Step the canonical interpreter one instruction at a time instead.  This
-     * tells us whether one instruction semantic itself blocks, or whether the
-     * GNU direct-threaded run loop is the failing layer.
+     *   - EL2 stage-1 MMU enabled by start.S.
+     *   - ordinary RAM is mapped as Normal memory.
+     *   - 0x3F000000..0x3FFFFFFF remains Device-nGnRnE for peripherals.
+     *   - GCC uses its normal AArch64 code generation; -mstrict-align is OFF.
+     *
+     * The real md_interp_step() Group-3/F6 path has been proven through
+     * instruction 300 under that configuration.  Stop single-stepping here
+     * and return to the platform-neutral DOS system loop.
+     *
+     * Keep AOT/JIT disabled for the interpreter baseline.  Platform timing
+     * stays here in pi0w; the shared DOS/runtime layer only exposes the guest
+     * instruction counter.
      */
-    uart_puts("[08] STEP diagnostic BEGIN\n");
-    uart_puts("     tracing instructions 80 through 300\n");
+    uart_puts("[08] normal interpreter run BEGIN\n");
+    uart_puts("     md_dos2_system_run() slices = 50000 instructions\n");
+    uart_puts("     Ctrl+] = rolling MIPS sample\n");
 
-    while (g_sys.runtime.stop_reason == MD_STOP_NONE &&
-           g_sys.runtime.instructions < 300u) {
-        MdRuntime *rt = &g_sys.runtime;
-        const uint64_t before = rt->instructions;
-        const uint16_t cs = rt->cpu.cs;
-        const uint16_t ip = rt->cpu.ip;
-        const uint8_t opcode = md_x86_read8(&rt->cpu, cs, ip);
+    pi0_perf_reset();
 
-        if (opcode == 0xF6u) {
+    {
+        const uint64_t slice_budget = 50000u;
+
+        for (;;) {
             /*
-             * The previous F6 dump proved the live instruction is:
-             *
-             *   F6 44 04 08    TEST byte ptr [SI+04h],08h
-             *
-             * with DS=0800h and SI=0020h, so the operand is at 0800:0024.
-             *
-             * The normal md_interp_step() never returned from this instruction
-             * on the Pi.  Probe each semantic sub-operation separately, printing
-             * before and after every potentially interesting operation.  Then
-             * manually commit the architecturally equivalent TEST and continue
-             * stepping.  This tells us whether the failure is the guest-memory
-             * read, lazy-flag update/materialization, or specifically the
-             * interpreter's Group-3 dispatch path.
+             * Ctrl+] is consumed by the console shim and requests a statistics
+             * snapshot.  There is no automatic periodic stats output.
              */
-            const uint8_t modrm =
-                md_x86_read8(&rt->cpu, cs, (uint16_t)(ip + 1u));
-            const int8_t disp =
-                (int8_t)md_x86_read8(&rt->cpu, cs, (uint16_t)(ip + 2u));
-            const uint8_t imm =
-                md_x86_read8(&rt->cpu, cs, (uint16_t)(ip + 3u));
-            const uint16_t ea_off =
-                (uint16_t)(rt->cpu.r[MD_X86_SI] + (int16_t)disp);
-            const uint16_t ea_seg = rt->cpu.ds;
-            uint8_t value;
-            uint8_t result;
-            uint16_t flags_after;
+            if (g_con.stats_requested) {
+                g_con.stats_requested = false;
+                print_stats();
+            }
 
-            uart_puts("\n[F6STAGE] BEGIN ins=");
-            uart_put_u64(before + 1u);
-            uart_puts(" CS:IP=");
-            uart_put_hex16(cs);
-            uart_putc_raw(':');
-            uart_put_hex16(ip);
-            uart_putc('\n');
+            stop = md_dos2_system_run(&g_sys, slice_budget);
 
-            uart_puts("[F6STAGE] bytes=");
-            uart_put_hex16((uint16_t)opcode);
-            uart_putc_raw(' ');
-            uart_put_hex16((uint16_t)modrm);
-            uart_putc_raw(' ');
-            uart_put_hex16((uint16_t)(uint8_t)disp);
-            uart_putc_raw(' ');
-            uart_put_hex16((uint16_t)imm);
-            uart_puts("  TEST byte [SI+disp8],imm8\n");
-
-            uart_puts("[F6STAGE] mod=");
-            uart_put_u64((uint64_t)(modrm >> 6));
-            uart_puts(" ext=");
-            uart_put_u64((uint64_t)((modrm >> 3) & 7u));
-            uart_puts(" rm=");
-            uart_put_u64((uint64_t)(modrm & 7u));
-            uart_putc('\n');
-
-            uart_puts("[F6STAGE] EA=");
-            uart_put_hex16(ea_seg);
-            uart_putc_raw(':');
-            uart_put_hex16(ea_off);
-            uart_puts(" linear=");
-            uart_put_u64((uint64_t)md_x86_linear(ea_seg, ea_off));
-            uart_putc('\n');
-
-            uart_puts("[F6STAGE] flags pre: raw=");
-            uart_put_hex16(rt->cpu.flags_raw);
-            uart_puts(" lazy_op=");
-            uart_put_u64((uint64_t)rt->cpu.lazy_op);
-            uart_puts(" lazy_a=");
-            uart_put_hex16(rt->cpu.lazy_a);
-            uart_puts(" lazy_b=");
-            uart_put_hex16(rt->cpu.lazy_b);
-            uart_puts(" lazy_res=");
-            uart_put_hex16(rt->cpu.lazy_res);
-            uart_putc('\n');
-
-            uart_puts("[F6STAGE A] operand read BEGIN\n");
-            value = md_x86_read8(&rt->cpu, ea_seg, ea_off);
-            uart_puts("[F6STAGE A] operand read OK value=");
-            uart_put_hex16((uint16_t)value);
-            uart_putc('\n');
-
-            result = (uint8_t)(value & imm);
-            uart_puts("[F6STAGE B] AND OK result=");
-            uart_put_hex16((uint16_t)result);
-            uart_putc('\n');
-
-            uart_puts("[F6STAGE C] md_x86_logic8 BEGIN\n");
-            (void)md_x86_logic8(&rt->cpu, result);
-            uart_puts("[F6STAGE C] md_x86_logic8 OK lazy_op=");
-            uart_put_u64((uint64_t)rt->cpu.lazy_op);
-            uart_puts(" lazy_res=");
-            uart_put_hex16(rt->cpu.lazy_res);
-            uart_putc('\n');
-
-            uart_puts("[F6STAGE D] flags materialize BEGIN\n");
-            flags_after = md_x86_flags(&rt->cpu);
-            uart_puts("[F6STAGE D] flags materialize OK FLAGS=");
-            uart_put_hex16(flags_after);
-            uart_puts(" lazy_op=");
-            uart_put_u64((uint64_t)rt->cpu.lazy_op);
-            uart_putc('\n');
-
-            /*
-             * Commit the four-byte TEST manually.  TEST changes flags only;
-             * it does not modify the operand.  md_interp_step() normally bumps
-             * the instruction counter before executing the opcode.
-             */
-            rt->cpu.ip = (uint16_t)(ip + 4u);
-            rt->instructions = before + 1u;
-
-            uart_puts("[F6STAGE E] manual TEST commit OK CS:IP=");
-            uart_put_hex16(rt->cpu.cs);
-            uart_putc_raw(':');
-            uart_put_hex16(rt->cpu.ip);
-            uart_puts(" ins=");
-            uart_put_u64(rt->instructions);
-            uart_putc('\n');
-
-            uart_puts("[F6STAGE] bypassing only this F6; resume md_interp_step\n");
-            continue;
-        }
-
-        if (before >= 80u) {
-            uart_puts("\n[STEP] BEFORE ins=");
-            uart_put_u64(before + 1u);
-            uart_puts(" CS:IP=");
-            uart_put_hex16(cs);
-            uart_putc_raw(':');
-            uart_put_hex16(ip);
-            uart_puts(" OP=");
-            uart_put_hex16((uint16_t)opcode);
-
-            uart_puts(" AX=");
-            uart_put_hex16(rt->cpu.r[MD_X86_AX]);
-            uart_puts(" BX=");
-            uart_put_hex16(rt->cpu.r[MD_X86_BX]);
-            uart_puts(" CX=");
-            uart_put_hex16(rt->cpu.r[MD_X86_CX]);
-            uart_puts(" DX=");
-            uart_put_hex16(rt->cpu.r[MD_X86_DX]);
-            uart_puts(" SI=");
-            uart_put_hex16(rt->cpu.r[MD_X86_SI]);
-            uart_puts(" DI=");
-            uart_put_hex16(rt->cpu.r[MD_X86_DI]);
-            uart_puts(" DS=");
-            uart_put_hex16(rt->cpu.ds);
-            uart_puts(" ES=");
-            uart_put_hex16(rt->cpu.es);
-            uart_puts(" SS:SP=");
-            uart_put_hex16(rt->cpu.ss);
-            uart_putc_raw(':');
-            uart_put_hex16(rt->cpu.r[MD_X86_SP]);
-            uart_putc('\n');
-        }
-
-        stop = md_interp_step(rt);
-
-        if (before >= 80u) {
-            uart_puts("[STEP] AFTER  ins=");
-            uart_put_u64(rt->instructions);
-            uart_puts(" stop=");
-            uart_put_u64((uint64_t)stop);
-            uart_puts(" CS:IP=");
-            uart_put_hex16(rt->cpu.cs);
-            uart_putc_raw(':');
-            uart_put_hex16(rt->cpu.ip);
-            uart_putc('\n');
+            if (stop != MD_STOP_NONE) {
+                uart_puts("\n[08] normal interpreter run STOP\n");
+                uart_puts("     stop         = ");
+                uart_put_u64((uint64_t)stop);
+                uart_puts("\n     instructions = ");
+                uart_put_u64(g_sys.runtime.instructions);
+                uart_puts("\n     CS:IP        = ");
+                uart_put_hex16(g_sys.runtime.cpu.cs);
+                uart_putc_raw(':');
+                uart_put_hex16(g_sys.runtime.cpu.ip);
+                uart_putc('\n');
+                print_stats();
+                break;
+            }
         }
     }
-
-    uart_puts("\n[08] STEP diagnostic END\n");
-    uart_puts("     instructions = ");
-    uart_put_u64(g_sys.runtime.instructions);
-    uart_puts("\n     stop         = ");
-    uart_put_u64((uint64_t)g_sys.runtime.stop_reason);
-    uart_puts("\n     CS:IP        = ");
-    uart_put_hex16(g_sys.runtime.cpu.cs);
-    uart_putc_raw(':');
-    uart_put_hex16(g_sys.runtime.cpu.ip);
-    uart_putc('\n');
-
-    print_stats();
 
     for (;;) {
         __asm__ volatile("wfe");
