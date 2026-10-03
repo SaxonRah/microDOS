@@ -50,12 +50,6 @@ _Static_assert((MD_JIT_HOTNESS_SLOTS & (MD_JIT_HOTNESS_SLOTS - 1u)) == 0u,
 #define MD_JIT_STAT(expr_) do { } while (0)
 #endif
 
-/* Generated functions use low ARM registers only:
- *   r4 = MdRuntime/MdX86 *, r5 = MdJitBlock *, r6 = retired, r7 = budget
- *   r0-r3 = temporaries
- *
- * Keeping runtime==cpu is intentional: MdRuntime begins with MdX86. */
-
 enum MdJitCfState {
     MD_JIT_CF_RAW = 0,      /* flags_raw contains the preserved CF */
     MD_JIT_CF_ZERO,
@@ -382,15 +376,7 @@ static int md_jit_loop_taken(MdRuntime *runtime, const MdJitOp *op)
 
 /* Native helpers (BLX targets). Same contract as md_jit_control_one: no
    retirement, the generated code counts the instruction in r6. */
-static void md_jit_sem_one(MdRuntime *runtime, MdJitBlock *block, unsigned index)
-{
-    md_jit_sem_apply(runtime, &block->ops[index]);
-}
 
-static unsigned md_jit_loop_one(MdRuntime *runtime, MdJitBlock *block, unsigned index)
-{
-    return (unsigned)md_jit_loop_taken(runtime, &block->ops[index]);
-}
 
 /* Reference/host path. On RP2350 M19.1 does not call this for direct ops; it
  * exists to keep the predecoded representation independently executable and
@@ -616,35 +602,464 @@ static void md_jit_store8_slow(MdRuntime *runtime, uint32_t linear, uint8_t valu
     md_x86_write8_linear(&runtime->cpu, linear, value);
 }
 
-/*
+/* -------------------------------------------------------------------------
+ * Architecture-neutral JIT admission / shape helpers.
+ *
+ * Thumb-2 was the first native backend, so these helpers originally lived
+ * inside its emitter file. They are shared policy/IR logic and belong here.
+ * ------------------------------------------------------------------------- */
+
+static int md_jit_direct_alu(unsigned operation)
+{
+    return operation == 0u || operation == 1u || operation == 4u ||
+           operation == 5u || operation == 6u || operation == 7u;
+}
+
+static int md_jit_find_op_ip(const MdJitBlock *block, uint16_t ip)
+{
+    unsigned i;
+    for (i = 0u; i < block->op_count; ++i) if (block->ops[i].ip == ip) return (int)i;
+    return -1;
+}
+
+static unsigned md_jit_direct_prefix(const MdJitBlock *block, int *materialize)
+{
+    unsigned i, direct = 0u;
+    enum MdJitCfState cf = MD_JIT_CF_RAW;
+    int needs_materialize = 0;
+    /* Decide how far direct lowering can proceed without duplicating subtle
+       flag semantics. ADD/SUB leave CF lazy-unknown; a following INC/DEC
+       would need md_x86_cf(), so that boundary remains canonical for now. */
+    for (i = 0u; i < block->op_count; ++i) {
+        const MdJitOp *op = &block->ops[i];
+        int ok = 1;
+        switch ((MdJitOpKind)op->kind) {
+            case MD_JIT_OP_MOV_R8_IMM:
+            case MD_JIT_OP_MOV_R16_IMM:
+            case MD_JIT_OP_MOV_AL_SI:
+            case MD_JIT_OP_MOV_SI_AL:
+            case MD_JIT_OP_CALL_NEAR:
+            case MD_JIT_OP_RET_NEAR:
+            case MD_JIT_OP_RET_NEAR_IMM:
+            case MD_JIT_OP_RET_FAR:
+            case MD_JIT_OP_RET_FAR_IMM:
+            case MD_JIT_OP_INT:
+            case MD_JIT_OP_IRET:
+            case MD_JIT_OP_NOP:
+            case MD_JIT_OP_HLT:
+                break;
+            case MD_JIT_OP_INC_R16:
+            case MD_JIT_OP_DEC_R16:
+                needs_materialize = 1;
+                if (cf == MD_JIT_CF_LAZY_UNKNOWN) ok = 0;
+                break;
+            case MD_JIT_OP_ALU_ACC_IMM:
+            case MD_JIT_OP_GRP1_R16_IMM:
+                if (!md_jit_direct_alu(op->aux)) ok = 0;
+                else if (op->aux == 1u || op->aux == 4u || op->aux == 6u) cf = MD_JIT_CF_ZERO;
+                else cf = MD_JIT_CF_LAZY_UNKNOWN;
+                break;
+            case MD_JIT_OP_JCC:
+                /* JNZ after INC/DEC; internal back-edge or external exit
+                   (th_emit_jnz handles both). */
+                if (op->aux != 5u || i == 0u ||
+                    (block->ops[i - 1u].kind != MD_JIT_OP_DEC_R16 &&
+                     block->ops[i - 1u].kind != MD_JIT_OP_INC_R16)) ok = 0;
+                break;
+            case MD_JIT_OP_LODS:
+            case MD_JIT_OP_LOOP:
+                break;                       /* helper-backed (M20.3) */
+            case MD_JIT_OP_ALU_RR16:
+            case MD_JIT_OP_ALU_RR8:
+                cf = (op->aux == 1u || op->aux == 4u || op->aux == 6u) ? MD_JIT_CF_ZERO
+                                                                     : MD_JIT_CF_LAZY_UNKNOWN;
+                break;
+            case MD_JIT_OP_JMP:
+                if (md_jit_find_op_ip(block, op->target) < 0) {
+                    /* External direct jumps still execute natively, then
+                       return to the dispatcher at their exact target. */
+                }
+                break;
+            case MD_JIT_OP_FALLBACK:
+            default:
+                ok = 0;
+                break;
+        }
+        if (!ok) break;
+        ++direct;
+    }
+    *materialize = needs_materialize;
+    return direct;
+}
+
+static int md_jit_is_resident_loop(const MdJitBlock *block)
+{
+    const MdJitOp *o = block->ops;
+    return block->op_count == 3u &&
+           o[0].kind == MD_JIT_OP_MOV_R16_IMM && o[0].reg == MD_X86_CX && o[0].imm != 0u &&
+           o[1].kind == MD_JIT_OP_DEC_R16 && o[1].reg == MD_X86_CX &&
+           o[2].kind == MD_JIT_OP_JCC && o[2].aux == 5u &&
+           o[2].target == o[1].ip;
+}
+
+static int md_jit_is_resident_memloop(const MdJitBlock *block)
+{
+    const MdJitOp *o = block->ops;
+    return block->op_count == 9u &&
+           o[0].kind == MD_JIT_OP_MOV_R16_IMM && o[0].reg == MD_X86_CX && o[0].imm != 0u &&
+           o[1].kind == MD_JIT_OP_MOV_R16_IMM && o[1].reg == MD_X86_SI && o[1].imm == 0x8000u &&
+           o[2].kind == MD_JIT_OP_MOV_AL_SI &&
+           o[3].kind == MD_JIT_OP_ALU_ACC_IMM && o[3].reg == 0u && o[3].aux == 0u &&
+           o[4].kind == MD_JIT_OP_MOV_SI_AL &&
+           o[5].kind == MD_JIT_OP_GRP1_R16_IMM && o[5].reg == MD_X86_SI && o[5].aux == 0u &&
+           o[6].kind == MD_JIT_OP_GRP1_R16_IMM && o[6].reg == MD_X86_SI && o[6].aux == 1u && o[6].imm == 0x8000u &&
+           o[7].kind == MD_JIT_OP_DEC_R16 && o[7].reg == MD_X86_CX &&
+           o[8].kind == MD_JIT_OP_JCC && o[8].aux == 5u && o[8].target == o[2].ip &&
+           o[3].imm <= 255u && o[5].imm <= 255u;
+}
+
+static int md_jit_op_modifies_reg(const MdJitOp *op, unsigned reg)
+{
+    if (op == NULL) return 0;
+    switch ((MdJitOpKind)op->kind) {
+        case MD_JIT_OP_MOV_R16_IMM:
+        case MD_JIT_OP_INC_R16:
+        case MD_JIT_OP_DEC_R16:
+        case MD_JIT_OP_GRP1_R16_IMM:
+            return op->reg == (reg & 7u) && op->aux != 7u;
+        case MD_JIT_OP_MOV_R8_IMM:
+            return (reg == MD_X86_AX) && ((op->reg & 3u) == MD_X86_AX);
+        case MD_JIT_OP_ALU_ACC_IMM:
+            return reg == MD_X86_AX && op->aux != 7u;
+        case MD_JIT_OP_MOV_AL_SI:
+            return reg == MD_X86_AX;
+        case MD_JIT_OP_LODS:
+            return reg == MD_X86_AX || reg == MD_X86_SI;
+        case MD_JIT_OP_ALU_RR16:
+            return op->reg == (reg & 7u) && op->aux != 7u;
+        case MD_JIT_OP_ALU_RR8:
+            return ((op->reg & 3u) == (reg & 7u)) && reg < 4u && op->aux != 7u;
+        case MD_JIT_OP_LOOP:
+            return reg == MD_X86_CX && op->aux != 3u;
+        default:
+            return 0;
+    }
+}
+
+static int md_jit_region_reg_supported(unsigned reg)
+{
+    switch (reg & 7u) {
+        case MD_X86_AX:
+        case MD_X86_BX:
+        case MD_X86_CX:
+        case MD_X86_SI:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static int md_jit_generic_op_supported(const MdJitOp *op)
+{
+    if (op == NULL) return 0;
+    switch ((MdJitOpKind)op->kind) {
+        case MD_JIT_OP_MOV_R16_IMM:
+        case MD_JIT_OP_INC_R16:
+        case MD_JIT_OP_DEC_R16:
+            return md_jit_region_reg_supported(op->reg);
+        case MD_JIT_OP_MOV_R8_IMM:
+            return op->reg == 0u;                 /* AL only for now */
+        case MD_JIT_OP_ALU_ACC_IMM:
+            return op->aux == 0u || op->aux == 1u || op->aux == 4u ||
+                   op->aux == 5u || op->aux == 6u;
+        case MD_JIT_OP_GRP1_R16_IMM:
+            return md_jit_region_reg_supported(op->reg) &&
+                   (op->aux == 0u || op->aux == 1u || op->aux == 4u ||
+                    op->aux == 5u || op->aux == 6u);
+        case MD_JIT_OP_MOV_AL_SI:
+        case MD_JIT_OP_MOV_SI_AL:
+        case MD_JIT_OP_NOP:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static enum MdJitCfState md_jit_generic_cf_after(const MdJitBlock *block, unsigned final_dec)
+{
+    enum MdJitCfState cf = MD_JIT_CF_RAW;
+    unsigned i;
+    for (i = 0u; i < final_dec; ++i) {
+        const MdJitOp *op = &block->ops[i];
+        if (op->kind == MD_JIT_OP_ALU_ACC_IMM || op->kind == MD_JIT_OP_GRP1_R16_IMM) {
+            if (op->aux == 1u || op->aux == 4u || op->aux == 6u) cf = MD_JIT_CF_ZERO;
+            else if (op->aux == 0u || op->aux == 5u || op->aux == 7u) cf = MD_JIT_CF_LAZY_UNKNOWN;
+        }
+    }
+    return cf;
+}
+
+static int md_jit_generic_si_window(const MdJitBlock *block, unsigned loop_start,
+                                    unsigned final_dec, int *has_memory, int *has_store)
+{
+    int known_high = loop_start == 0u;
+    unsigned i;
+    *has_memory = 0;
+    *has_store = 0;
+
+    for (i = 0u; i < loop_start; ++i) {
+        const MdJitOp *op = &block->ops[i];
+        if (op->kind == MD_JIT_OP_MOV_R16_IMM && op->reg == MD_X86_SI) {
+            known_high = (op->imm & 0x8000u) != 0u;
+        } else if (md_jit_op_modifies_reg(op, MD_X86_SI)) {
+            return 0;                              /* setup no longer provable */
+        }
+        if (op->kind == MD_JIT_OP_MOV_AL_SI || op->kind == MD_JIT_OP_MOV_SI_AL) return 0;
+    }
+    if (!known_high) return 0;
+
+    for (i = loop_start; i < final_dec; ++i) {
+        const MdJitOp *op = &block->ops[i];
+        if (op->kind == MD_JIT_OP_MOV_AL_SI || op->kind == MD_JIT_OP_MOV_SI_AL) {
+            if (!known_high) return 0;
+            *has_memory = 1;
+            if (op->kind == MD_JIT_OP_MOV_SI_AL) *has_store = 1;
+            continue;
+        }
+        if (!md_jit_op_modifies_reg(op, MD_X86_SI)) continue;
+
+        if (op->kind == MD_JIT_OP_MOV_R16_IMM) {
+            known_high = (op->imm & 0x8000u) != 0u;
+        } else if (op->kind == MD_JIT_OP_GRP1_R16_IMM && op->reg == MD_X86_SI) {
+            switch (op->aux) {
+                case 1u: /* OR */
+                    if ((op->imm & 0x8000u) != 0u) known_high = 1;
+                    break;
+                case 4u: /* AND */
+                    if ((op->imm & 0x8000u) == 0u) known_high = 0;
+                    break;
+                default:
+                    known_high = 0;                /* ADD/SUB/XOR can cross */
+                    break;
+            }
+        } else {
+            known_high = 0;
+        }
+    }
+    return known_high;
+}
+
+static int md_jit_cfg_cmp_supported(const MdJitOp *op)
+{
+    if (op->kind == MD_JIT_OP_ALU_ACC_IMM && op->aux == 7u) return op->reg <= 1u;
+    if (op->kind == MD_JIT_OP_GRP1_R16_IMM && op->aux == 7u)
+        return md_jit_region_reg_supported(op->reg);
+    return 0;
+}
+
+static int md_jit_shape_cfg(const MdJitBlock *block, unsigned *out_start, uint32_t *out_trips, unsigned *out_edges)
+{
+    const unsigned n = block->op_count;
+    unsigned final_dec, loop_start, i, forward_edges = 0u;
+    int cx_setup = -1;
+    uint32_t trips = 0u;
+    enum MdJitCfState final_cf;
+    if (n < 6u) return 0;
+    if (block->ops[n - 1u].kind != MD_JIT_OP_JCC || block->ops[n - 1u].aux != 5u) return 0;
+    final_dec = n - 2u;
+    if (block->ops[final_dec].kind != MD_JIT_OP_DEC_R16 || block->ops[final_dec].reg != MD_X86_CX) return 0;
+    {
+        const int li = md_jit_find_op_ip(block, block->ops[n - 1u].target);
+        if (li < 0 || (unsigned)li >= final_dec) return 0;
+        loop_start = (unsigned)li;
+    }
+
+    /* Establish CX once before the loop; no memory in CFG-v1.  Internal Jccs
+       must be JE/JNE immediately after a CMP and target a later op in-region. */
+    for (i = 0u; i < final_dec; ++i) {
+        const MdJitOp *op = &block->ops[i];
+        if (op->kind == MD_JIT_OP_MOV_AL_SI || op->kind == MD_JIT_OP_MOV_SI_AL) return 0;
+        if (md_jit_op_modifies_reg(op, MD_X86_CX)) {
+            if (i < loop_start && op->kind == MD_JIT_OP_MOV_R16_IMM && op->reg == MD_X86_CX && cx_setup < 0) {
+                cx_setup = (int)i;
+                trips = op->imm;
+            } else return 0;
+        }
+        if (op->kind == MD_JIT_OP_JCC) {
+            int ti;
+            if (i == 0u || (op->aux != 4u && op->aux != 5u) || !md_jit_cfg_cmp_supported(&block->ops[i - 1u])) return 0;
+            ti = md_jit_find_op_ip(block, op->target);
+            if (ti < 0 || (unsigned)ti <= i || (unsigned)ti > final_dec) return 0;
+            ++forward_edges;
+            continue;
+        }
+        if (md_jit_cfg_cmp_supported(op)) {
+            if (i + 1u >= final_dec || block->ops[i + 1u].kind != MD_JIT_OP_JCC) return 0;
+            continue;
+        }
+        if (!md_jit_generic_op_supported(op)) return 0;
+    }
+    if ((cx_setup < 0 && loop_start != 0u) || (cx_setup >= 0 && trips == 0u) || forward_edges == 0u) return 0;
+
+    /* Require a deterministic CF at the final DEC. A logic op after every
+       branch path is sufficient and is easy to prove conservatively. */
+    final_cf = md_jit_generic_cf_after(block, final_dec);
+    if (final_cf != MD_JIT_CF_ZERO) return 0;
+    *out_start = loop_start; *out_trips = trips; *out_edges = forward_edges;
+    return 1;
+}
+
+static int md_jit_shape_counted(const MdJitBlock *block, unsigned *out_start, uint32_t *out_trips, enum MdJitCfState *out_cf, int *out_memory, int *out_store)
+{
+    const unsigned n = block->op_count;
+    unsigned final_dec, loop_start, i;
+    int cx_setup = -1, has_memory = 0, has_store = 0;
+    uint32_t trips = 0u;
+    enum MdJitCfState final_cf;
+    if (n < 3u) return 0;
+    if (block->ops[n - 1u].kind != MD_JIT_OP_JCC || block->ops[n - 1u].aux != 5u) return 0;
+    final_dec = n - 2u;
+    if (block->ops[final_dec].kind != MD_JIT_OP_DEC_R16 || block->ops[final_dec].reg != MD_X86_CX) return 0;
+    {
+        const int li = md_jit_find_op_ip(block, block->ops[n - 1u].target);
+        if (li < 0 || (unsigned)li >= final_dec) return 0;
+        loop_start = (unsigned)li;
+    }
+
+    /* CX must be established exactly once before the loop, so the whole-region
+       budget can be proven before any guest state changes. */
+    for (i = 0u; i < final_dec; ++i) {
+        const MdJitOp *op = &block->ops[i];
+        if (!md_jit_generic_op_supported(op)) return 0;
+        if (md_jit_op_modifies_reg(op, MD_X86_CX)) {
+            if (i < loop_start && op->kind == MD_JIT_OP_MOV_R16_IMM && op->reg == MD_X86_CX && cx_setup < 0) {
+                cx_setup = (int)i;
+                trips = op->imm;
+            } else {
+                return 0;
+            }
+        }
+    }
+    if ((cx_setup < 0 && loop_start != 0u) || (cx_setup >= 0 && trips == 0u)) return 0;
+
+    final_cf = md_jit_generic_cf_after(block, final_dec);
+    if (final_cf == MD_JIT_CF_LAZY_UNKNOWN) return 0;
+
+    /* If memory is used, prove an 8000h..FFFFh [SI] window. */
+    for (i = 0u; i < final_dec; ++i) {
+        if (block->ops[i].kind == MD_JIT_OP_MOV_AL_SI || block->ops[i].kind == MD_JIT_OP_MOV_SI_AL) {
+            if (!md_jit_generic_si_window(block, loop_start, final_dec, &has_memory, &has_store)) return 0;
+            break;
+        }
+    }
+
+    *out_start = loop_start; *out_trips = trips; *out_cf = final_cf;
+    *out_memory = has_memory; *out_store = has_store;
+    return 1;
+}
+
+static int md_jit_lods_reg_supported(unsigned reg)
+{
+    switch (reg & 7u) {
+        case MD_X86_AX:
+        case MD_X86_CX:
+        case MD_X86_SI:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static int md_jit_shape_lodsloop(const MdJitBlock *block, unsigned *out_start)
+{
+    const unsigned n = block->op_count;
+    const MdJitOp *last;
+    int has_lods = 0, li;
+    unsigned loop_start, i;
+    if (n < 2u || n > 32u) return 0;
+    last = &block->ops[n - 1u];
+    if (last->kind != MD_JIT_OP_LOOP || last->aux != 2u) return 0;
+    li = md_jit_find_op_ip(block, last->target);
+    if (li < 0 || (unsigned)li >= n - 1u) return 0;
+    loop_start = (unsigned)li;
+    for (i = 0u; i + 1u < n; ++i) {
+        const MdJitOp *op = &block->ops[i];
+        if (op->kind == MD_JIT_OP_LODS) { if (i >= loop_start) has_lods = 1; continue; }
+        if (op->kind == MD_JIT_OP_NOP) continue;
+        if (op->kind != MD_JIT_OP_ALU_RR16) return 0;
+        if ((op->reg & 7u) == MD_X86_SP || (op->imm & 7u) == MD_X86_SP) return 0;
+        if (!md_jit_lods_reg_supported(op->reg) &&
+            !md_jit_lods_reg_supported(op->imm) &&
+            (op->reg & 7u) != (op->imm & 7u)) return 0;
+        if (op->aux == 2u || op->aux == 3u) return 0;
+    }
+    if (!has_lods) return 0;
+    *out_start = loop_start;
+    return 1;
+}
+
+static int md_jit_persist_ops(MdJit *jit, MdJitBlock *block)
+{
+    size_t at, bytes;
+    unsigned si;
+
+    if (jit == NULL || block == NULL || block->ops == NULL || block->op_count == 0u) return 0;
+
+    block->profile_ip = block->ip;
+    block->profile_opcode = block->ops[0].opcode;
+    if (block->direct_prefix_ops != 0u) {
+        si = (unsigned)block->direct_prefix_ops - 1u;
+        if (si < block->op_count) {
+            block->profile_ip = block->ops[si].ip;
+            block->profile_opcode = block->ops[si].opcode;
+        }
+    }
+
+#if !defined(__arm__) && !defined(__thumb__)
+    block->keep_ops = 1u;
+#endif
+
+    if (!block->keep_ops) {
+        block->ops = NULL;
+        return 1;
+    }
+
+    bytes = (size_t)block->op_count * sizeof(MdJitOp);
+    at = (jit->code_used + 3u) & ~(size_t)3u;
+    if (at + bytes > jit->code_size) return 0;
+
+    memcpy(jit->code + at, block->ops, bytes);
+    block->ops = (MdJitOp *)(void *)(jit->code + at);
+    jit->code_used = at + bytes;
+    return 1;
+}
+
+/* Shared resident-region helper entrypoints used by native backends. */
+static uint32_t md_jit_shared_dec(MdRuntime *rt, MdJitBlock *block, uint32_t budget)
+{
+    unsigned reg = md_x86_read8(&rt->cpu, block->cs, block->ip) & 7u;
+    return md_region_try_dec_jnz(rt, reg, block->ip, block->end_ip, budget);
+}
+
+static uint32_t md_jit_shared_checksum(MdRuntime *rt, MdJitBlock *block, uint32_t budget)
+{
+    return md_region_try_lodsw_add_dx_ax_loop(rt, block->ip, block->end_ip, budget);
+}
+
+/* -------------------------------------------------------------------------
  * Native backend selector.
  *
- * Stage 1 deliberately keeps the backend included into the shared JIT
- * translation unit. This preserves all original static helper relationships,
- * optimizer visibility, ABI, data layout, admission policy and fallback
- * behavior while creating a clean architecture-backend boundary.
- *
- * AArch64 gets a sibling backend only after the existing Thumb-2 path has
- * passed the host and RP2350 validation suite unchanged.
- */
-/*
- * Transitional backend split:
- * - the existing Thumb include still supplies the shared shape/persistence
- *   helpers extracted during stage 1;
- * - AArch64 overlays only the native emitter;
- * - Pico continues to call md_jit_emit_thumb() unchanged.
- *
- * A later cleanup moves the remaining architecture-neutral shape helpers out
- * of jit_thumb2_backend.inc once both native emitters are proven.
- */
-#include "jit_thumb2_backend.inc"
-
+ * Host/reference and RP2350 builds use the Thumb-2 backend. AArch64 builds
+ * include only the AArch64 emitter.
+ * ------------------------------------------------------------------------- */
 #if defined(__aarch64__)
 #include "jit_aarch64_backend.inc"
 #define MD_JIT_EMIT_ARCH md_jit_emit_aarch64
 #else
+#include "jit_thumb2_backend.inc"
 #define MD_JIT_EMIT_ARCH md_jit_emit_thumb
 #endif
+
 static int md_jit_block_current(const MdJitBlock *block, const MdRuntime *runtime)
 {
     if (!block->valid || block->code_epoch != runtime->code_epoch) return 0;
