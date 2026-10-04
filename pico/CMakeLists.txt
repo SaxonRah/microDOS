@@ -177,6 +177,19 @@ endfunction()
 
 # Benchmark firmware: name, code_in_sram, sys_khz
 # M19 adds the runtime Thumb translator plus the shared structural decoder.
+# Native v2 architecture benchmark. This deliberately does not link
+# the old runtime JIT or AOT generated sources.
+function(md_pico_nativev2_bench target code_in_sram sys_khz)
+    add_executable(${target}
+        "${CMAKE_CURRENT_LIST_DIR}/microdos_nativev2_bench.c"
+        "${MD_ROOT}/src/runtime/native_v2.c"
+        "${MD_ROOT}/src/decode/x86_decode.c")
+    md_pico_common(${target} ${code_in_sram})
+    target_compile_definitions(${target} PRIVATE
+        MICRODOS_PICO_SYS_KHZ=${sys_khz})
+    pico_set_program_name(${target} "microDOS Native v2")
+endfunction()
+
 function(md_pico_bench target code_in_sram sys_khz)
     add_executable(${target}
         "${CMAKE_CURRENT_LIST_DIR}/microdos_bench.c"
@@ -231,6 +244,17 @@ foreach(t microdos_pico_g128_psram microdos_pico_g128_sram)
 endforeach()
 target_compile_definitions(microdos_pico_g128_psram PRIVATE MICRODOS_PICO_GUEST_SRAM=0)
 target_compile_definitions(microdos_pico_g128_sram  PRIVATE MICRODOS_PICO_GUEST_SRAM=1)
+
+md_pico_nativev2_bench(microdos_nativev2_bench 1 300000)
+
+# Native v2 USB-only smoke test: no decoder/compiler/generated code and
+# no overclock. Used to isolate USB stdio from the native engine.
+add_executable(microdos_nativev2_usbsmoke
+    "${CMAKE_CURRENT_LIST_DIR}/microdos_nativev2_usbsmoke.c")
+md_pico_common(microdos_nativev2_usbsmoke 1)
+target_compile_definitions(microdos_nativev2_usbsmoke PRIVATE
+    MICRODOS_PICO_SYS_KHZ=0)
+pico_set_program_name(microdos_nativev2_usbsmoke "microDOS NV2 USB smoke")
 
 md_pico_bench(microdos_bench     1 300000)
 md_pico_bench(microdos_bench_150 1 0)

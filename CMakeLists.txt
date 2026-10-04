@@ -187,6 +187,15 @@ if(MD_BUILD_TESTS)
     target_link_libraries(microdos_region_tests PRIVATE microdos::runtime)
     add_test(NAME region COMMAND microdos_region_tests)
 
+    # Native v2: host-side decode/lowering/code-shape test. Generated
+    # Thumb bytes are not executed on the desktop.
+    add_executable(microdos_native_v2_tests
+        tests/test_native_v2.c src/runtime/native_v2.c)
+    target_link_libraries(microdos_native_v2_tests PRIVATE microdos::decode)
+    target_include_directories(microdos_native_v2_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/include")
+    add_test(NAME native_v2_phase1 COMMAND microdos_native_v2_tests)
+
     # Generated AOT must produce the same checksum result/count/flags.
     add_executable(microdos_region_aot_tests tests/test_region_aot.c
         "${MD_RECOMP_checksum_C}" "${MD_RECOMP_checksum_H}")
