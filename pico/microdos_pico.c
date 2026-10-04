@@ -18,6 +18,12 @@
 #ifndef MICRODOS_PICO_JIT
 #define MICRODOS_PICO_JIT 0
 #endif
+#ifndef MICRODOS_PICO_NATIVE_V2
+#define MICRODOS_PICO_NATIVE_V2 0
+#endif
+#ifndef MICRODOS_NATIVE_V2_BACKEDGE_PROFILE
+#define MICRODOS_NATIVE_V2_BACKEDGE_PROFILE 0
+#endif
 #if MICRODOS_PICO_JIT
 #include "microdos/jit.h"
 #endif
@@ -107,6 +113,7 @@ typedef struct PicoPerf {
     uint64_t jit_owned_instructions;
     uint64_t jit_native_instructions;
     uint64_t jit_fallback_instructions;
+    uint64_t native_v2_instructions;
     uint64_t bios_interpreted_instructions;
     uint64_t cache_hits;
     uint64_t cache_misses;
@@ -297,6 +304,11 @@ static void md_perf_snapshot(PicoPerf *p)
     p->jit_owned_instructions = g_sys.jit_instructions;
     p->jit_native_instructions = g_sys.jit_native_instructions;
     p->jit_fallback_instructions = g_sys.jit_fallback_instructions;
+#if MICRODOS_PICO_NATIVE_V2
+    p->native_v2_instructions = g_sys.native_v2_instructions;
+#else
+    p->native_v2_instructions = 0u;
+#endif
     p->bios_interpreted_instructions = g_sys.bios_interpreted_instructions;
 #if MICRODOS_PICO_CACHE
     p->cache_hits = g_cache.hits;
@@ -350,8 +362,10 @@ static void md_perf_report(const char *label, const PicoPerf *now, const PicoPer
     const uint64_t jnative = md_u64_delta(now->jit_native_instructions, from->jit_native_instructions);
     const uint64_t jfallback = md_u64_delta(now->jit_fallback_instructions, from->jit_fallback_instructions);
     const uint64_t jowned = md_u64_delta(now->jit_owned_instructions, from->jit_owned_instructions);
+    const uint64_t nv2 = md_u64_delta(now->native_v2_instructions, from->native_v2_instructions);
     const uint64_t bios = md_u64_delta(now->bios_interpreted_instructions, from->bios_interpreted_instructions);
-    const uint64_t interp = instr > aot + jnative ? instr - aot - jnative : 0u;
+    const uint64_t native_total = aot + jnative + nv2;
+    const uint64_t interp = instr > native_total ? instr - native_total : 0u;
     const uint64_t interp_other = interp > bios ? interp - bios : 0u;
 
     md_say("[perf] --- %s ---\n", label);
@@ -360,9 +374,10 @@ static void md_perf_report(const char *label, const PicoPerf *now, const PicoPer
            (double)active / 1e6, (double)sleep / 1e6, (double)out / 1e6, (double)in / 1e6, (double)disk / 1e6);
     md_say("[perf] instructions %llu   active %.3f MIPS\n",
            (unsigned long long)instr, active ? (double)instr/(double)active : 0.0);
-    md_say("[perf] tiers: static-aot %llu (%.1f%%)   jit-native %llu (%.1f%%)   interpreted %llu (%.1f%%)\n",
+    md_say("[perf] tiers: static-aot %llu (%.1f%%)   old-jit %llu (%.1f%%)   native-v2 %llu (%.1f%%)   interpreted %llu (%.1f%%)\n",
            (unsigned long long)aot, instr ? 100.0*(double)aot/(double)instr : 0.0,
            (unsigned long long)jnative, instr ? 100.0*(double)jnative/(double)instr : 0.0,
+           (unsigned long long)nv2, instr ? 100.0*(double)nv2/(double)instr : 0.0,
            (unsigned long long)interp, instr ? 100.0*(double)interp/(double)instr : 0.0);
     md_say("[perf] interpreted split: bios %llu   other %llu\n",
            (unsigned long long)bios, (unsigned long long)interp_other);
@@ -482,11 +497,11 @@ static void md_stats(uint64_t start_us)
     PicoPerf now=g_perf, zero;
     memset(&zero,0,sizeof(zero));
     md_perf_snapshot(&now);
-    md_say("\n[perf] config: M23, clk %lu MHz, code %s, block cache %s, kernel AOT %s, runtime JIT %s, guest %s\n",
+    md_say("\n[perf] config: M23, clk %lu MHz, code %s, block cache %s, kernel AOT %s, old JIT %s, Native v2 %s, guest %s\n",
            (unsigned long)(clock_get_hz(clk_sys)/1000000u),
            MICRODOS_PICO_CODE_IN_SRAM?"SRAM (copy_to_ram)":"flash XIP",
            MICRODOS_PICO_CACHE?"ON":"OFF", g_sys.kernel_attached?"ON":"OFF",
-           MICRODOS_PICO_JIT?"ON":"OFF",
+           MICRODOS_PICO_JIT?"ON":"OFF", MICRODOS_PICO_NATIVE_V2?"ON":"OFF",
            MICRODOS_PICO_GUEST_SRAM?"SRAM":"PSRAM");
     md_perf_report("since boot",&now,&zero,start_us);
     md_perf_report("since previous Ctrl+]",&now,&g_perf_mark,g_perf_mark.at_us?g_perf_mark.at_us:start_us);
@@ -505,6 +520,94 @@ static void md_stats(uint64_t start_us)
 #endif
         md_jit_report("since boot",&now,&zero);
         md_jit_report("since previous Ctrl+]",&now,&g_perf_mark);
+    }
+#endif
+#if MICRODOS_PICO_NATIVE_V2
+    {
+        const MdNativeV2Runtime *nv = &g_sys.native_v2;
+        unsigned i;
+
+        md_say("[native-v2] retired=%llu entries=%llu lookups=%llu hit/miss=%llu/%llu "
+               "rejected-hit=%llu probes=%llu compiles=%llu\n",
+               (unsigned long long)nv->retired,
+               (unsigned long long)nv->entries,
+               (unsigned long long)nv->lookups,
+               (unsigned long long)nv->cache_hits,
+               (unsigned long long)nv->cache_misses,
+               (unsigned long long)nv->rejected_hits,
+               (unsigned long long)nv->probes,
+               (unsigned long long)nv->compiles);
+        md_say("[native-v2] reject compile=%llu store=%llu store-guard=%llu stack-guard=%llu muldiv-guard=%llu stale=%llu budget=%llu short=%llu runtime=%llu\n",
+               (unsigned long long)nv->compile_rejects,
+               (unsigned long long)nv->store_rejects,
+               (unsigned long long)nv->store_guard_rejects,
+               (unsigned long long)nv->stack_guard_rejects,
+               (unsigned long long)nv->muldiv_guard_rejects,
+               (unsigned long long)nv->stale_code,
+               (unsigned long long)nv->budget_rejects,
+               (unsigned long long)nv->short_rejects,
+               (unsigned long long)nv->runtime_fallbacks);
+        md_say("[native-v2] chunks entries=%llu iterations=%llu\n",
+               (unsigned long long)nv->chunked_entries,
+               (unsigned long long)nv->chunked_iterations);
+
+        for (i = 0u; i < MD_NATIVE_V2_RT_SLOTS; ++i) {
+            const MdNativeV2RuntimeSlot *s = &nv->slot[i];
+
+            if (s->state == MD_NV2_RT_COMPILED && s->entries != 0u) {
+                md_say("[native-v2] slot%u %04X:%04X bytes=%u ops=%u "
+                       "phase=%u dyn=%u base=%u chunk=%u counter=%u entries=%lu retired=%llu\n",
+                       i, s->cs, s->ip,
+                       (unsigned)s->guest_size,
+                       (unsigned)s->code.op_count,
+                       (unsigned)s->code.phase,
+                       (unsigned)s->code.dynamic_retire,
+                       (unsigned)s->code.retire_base_ops,
+                       (unsigned)s->code.chunkable_loop,
+                       (unsigned)s->counter_reg,
+                       (unsigned long)s->entries,
+                       (unsigned long long)s->retired);
+            } else if (s->state == MD_NV2_RT_REJECTED) {
+                unsigned j;
+                md_say("[native-v2] reject-slot%u %04X:%04X reason=%s status=%s code=",
+                       i, s->cs, s->ip,
+                       md_native_v2_reject_reason_name(s->reject_reason),
+                       md_native_v2_status_name((MdNativeV2Status)s->reject_status));
+                for (j = 0u; j < s->reject_bytes_len; ++j)
+                    md_say("%02X%s", s->reject_bytes[j],
+                           j + 1u == s->reject_bytes_len ? "" : " ");
+                md_say("\n");
+            }
+        }
+    }
+#endif
+#if MICRODOS_NATIVE_V2_BACKEDGE_PROFILE
+    {
+        const MdRuntime *rt = &g_sys.runtime;
+        unsigned i;
+
+        md_say("[native-v2-profile] backward-taken=%llu\n",
+               (unsigned long long)rt->native_v2_backedge_hits);
+
+        for (i = 0u; i < MD_NATIVE_V2_BACKEDGE_SLOTS; ++i) {
+            const MdNativeV2BackedgeSite *s = &rt->native_v2_backedge[i];
+            unsigned j;
+
+            if (s->hits == 0u)
+                continue;
+
+            md_say("[native-v2-profile] edge%u hits=%lu op=%02X "
+                   "%04X:%04X -> %04X code=",
+                   i,
+                   (unsigned long)s->hits,
+                   (unsigned)s->opcode,
+                   s->cs, s->source_ip, s->target_ip);
+
+            for (j = 0u; j < s->bytes_len; ++j)
+                md_say("%02X%s", s->bytes[j],
+                       j + 1u == s->bytes_len ? "" : " ");
+            md_say("\n");
+        }
     }
 #endif
     g_perf_mark=now;
@@ -557,8 +660,11 @@ int main(void)
 #else
     md_say("  aot:     DOS2TEST.COM: not compiled in this firmware\n");
 #endif
-    md_say("  config:  code %s, block cache %s, runtime JIT %s\n",MICRODOS_PICO_CODE_IN_SRAM?"SRAM (copy_to_ram)":"flash XIP",MICRODOS_PICO_CACHE?"ON":"OFF",MICRODOS_PICO_JIT?"ON":"OFF");
-    md_say("  keys:    Ctrl+] -> M20.2.1 tier/JIT statistics (boot + interval)\n");
+    md_say("  config:  code %s, block cache %s, old JIT %s, Native v2 %s\n",
+           MICRODOS_PICO_CODE_IN_SRAM?"SRAM (copy_to_ram)":"flash XIP",
+           MICRODOS_PICO_CACHE?"ON":"OFF", MICRODOS_PICO_JIT?"ON":"OFF",
+           MICRODOS_PICO_NATIVE_V2?"ON":"OFF");
+    md_say("  keys:    Ctrl+] -> tier/native statistics (boot + interval)\n");
 
     start_us=time_us_64();
     for(;;){

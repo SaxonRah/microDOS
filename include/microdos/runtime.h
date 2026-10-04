@@ -36,6 +36,23 @@ typedef struct MdRuntime MdRuntime;
 struct MdBlockCache;
 typedef struct MdBlockCache MdBlockCache;
 
+#if defined(MICRODOS_ENABLE_NATIVE_V2) && defined(MICRODOS_NATIVE_V2_BACKEDGE_PROFILE)
+#ifndef MD_NATIVE_V2_BACKEDGE_SLOTS
+#define MD_NATIVE_V2_BACKEDGE_SLOTS 64u
+#endif
+#define MD_NATIVE_V2_BACKEDGE_BYTES 32u
+
+typedef struct MdNativeV2BackedgeSite {
+    uint16_t cs;
+    uint16_t source_ip;
+    uint16_t target_ip;
+    uint8_t opcode;
+    uint8_t bytes_len;
+    uint32_t hits;
+    uint8_t bytes[MD_NATIVE_V2_BACKEDGE_BYTES];
+} MdNativeV2BackedgeSite;
+#endif
+
 typedef bool (*MdInterruptHook)(MdRuntime *runtime, uint8_t vector, void *user);
 typedef uint8_t (*MdPortIn8Hook)(MdRuntime *runtime, uint16_t port, void *user);
 typedef void (*MdPortOut8Hook)(MdRuntime *runtime, uint16_t port, uint8_t value, void *user);
@@ -57,6 +74,18 @@ struct MdRuntime {
     uint32_t fault_linear;
     uint8_t fault_opcode;
     uint8_t exit_code;
+
+#ifdef MICRODOS_ENABLE_NATIVE_V2
+    uint16_t native_v2_backedge_cs;
+    uint16_t native_v2_backedge_ip;
+    uint8_t native_v2_backedge_hit;
+    uint8_t _native_v2_pad[3];
+    uint32_t native_v2_suppress_bloom[2];
+#if defined(MICRODOS_NATIVE_V2_BACKEDGE_PROFILE)
+    uint64_t native_v2_backedge_hits;
+    MdNativeV2BackedgeSite native_v2_backedge[MD_NATIVE_V2_BACKEDGE_SLOTS];
+#endif
+#endif
 
 #if MICRODOS_TRANSLATION_SUPPORT
     /* code_epoch invalidates an entire external cache after image/reset events.

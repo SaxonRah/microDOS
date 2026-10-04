@@ -38,6 +38,9 @@ void md_dos2_system_init(MdDos2System *sys, uint8_t *memory, MdBlockCache *cache
     hooks.interrupt = md_msdos2_boot_interrupt;
     hooks.user = &sys->boot;
     md_runtime_init(&sys->runtime, memory, &hooks);
+#ifdef MICRODOS_ENABLE_NATIVE_V2
+    md_native_v2_runtime_init(&sys->native_v2);
+#endif
 
 #ifdef MICRODOS_ENABLE_JIT
     md_jit_init(&g_md_system_jit, g_md_system_jit_code, sizeof(g_md_system_jit_code));
@@ -80,6 +83,10 @@ bool md_dos2_system_start(MdDos2System *sys, const uint8_t *msdos_sys, size_t si
         return false;
     }
     md_exec_router_init(&sys->router);
+#ifdef MICRODOS_ENABLE_NATIVE_V2
+    md_native_v2_runtime_init(&sys->native_v2);
+    sys->native_v2_instructions = 0u;
+#endif
 #ifdef MICRODOS_ENABLE_JIT
     if (sys->jit != NULL) md_jit_reset(sys->jit);
 #endif
@@ -174,7 +181,13 @@ MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
 {
     MdRuntime *rt = &sys->runtime;
 
-#if !MICRODOS_SYSTEM_ENABLE_AOT && !MICRODOS_SYSTEM_ENABLE_CACHE && !defined(MICRODOS_ENABLE_JIT)
+#ifdef MICRODOS_ENABLE_NATIVE_V2
+    rt->native_v2_backedge_hit = 0u;
+    rt->native_v2_suppress_bloom[0] = 0u;
+    rt->native_v2_suppress_bloom[1] = 0u;
+#endif
+
+#if !MICRODOS_SYSTEM_ENABLE_AOT && !MICRODOS_SYSTEM_ENABLE_CACHE && !defined(MICRODOS_ENABLE_JIT) && !defined(MICRODOS_ENABLE_NATIVE_V2)
     MdStopReason st = md_interp_run(rt, budget);
     if (st == MD_STOP_BUDGET) {
         rt->stop_reason = MD_STOP_NONE;
@@ -190,6 +203,27 @@ MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
 
         if (used >= budget) break;
         left = budget - used;
+
+#ifdef MICRODOS_ENABLE_NATIVE_V2
+        if (rt->native_v2_backedge_hit) {
+            const unsigned bit =
+                ((unsigned)rt->native_v2_backedge_cs ^
+                 (unsigned)rt->native_v2_backedge_ip) & 63u;
+            const uint32_t mask = (uint32_t)1u << (bit & 31u);
+            MdNativeV2RunResult nv2_result;
+
+            rt->native_v2_backedge_hit = 0u;
+
+            if (rt->cpu.cs != sys->boot.bios_segment &&
+                md_native_v2_runtime_try_execute(
+                    &sys->native_v2, rt, left, &nv2_result)) {
+                sys->native_v2_instructions += nv2_result.retired;
+                continue;
+            }
+
+            rt->native_v2_suppress_bloom[bit >> 5] |= mask;
+        }
+#endif
 
 #if MICRODOS_SYSTEM_ENABLE_CACHE
         if (sys->cache != NULL) {
@@ -326,8 +360,15 @@ MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
 
         {
             const uint64_t before = rt->instructions;
+            const int was_bios = rt->cpu.cs == sys->boot.bios_segment;
             (void)md_interp_run_until_cs_change(rt, left);
-            md_exec_router_record(&sys->router, MD_EXEC_TIER_INTERP, rt->instructions - before);
+            md_exec_router_record(&sys->router, MD_EXEC_TIER_INTERP,
+                                  rt->instructions - before);
+#ifdef MICRODOS_ENABLE_NATIVE_V2
+            if (was_bios)
+                sys->bios_interpreted_instructions +=
+                    rt->instructions - before;
+#endif
         }
         if (rt->stop_reason == MD_STOP_BUDGET) {
             rt->stop_reason = MD_STOP_NONE;

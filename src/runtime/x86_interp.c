@@ -1266,6 +1266,79 @@ static inline int md_execute_opcode(MdRuntime *runtime, uint8_t opcode, uint16_t
 }
 
 #if defined(MD_THREADED_DISPATCH) && (defined(__GNUC__) || defined(__clang__))
+
+#if defined(MICRODOS_ENABLE_NATIVE_V2) && defined(MICRODOS_NATIVE_V2_BACKEDGE_PROFILE)
+static inline void md_nv2_profile_backedge(MdRuntime *runtime,
+                                           uint8_t opcode,
+                                           uint16_t source_ip,
+                                           uint16_t target_ip)
+{
+    MdNativeV2BackedgeSite *set;
+    MdNativeV2BackedgeSite *slot = NULL;
+    MdNativeV2BackedgeSite *weakest = NULL;
+    unsigned hash;
+    unsigned base;
+    unsigned i;
+
+    ++runtime->native_v2_backedge_hits;
+
+    hash = ((unsigned)runtime->cpu.cs * 33u) ^
+           ((unsigned)target_ip * 17u) ^
+           (unsigned)source_ip ^
+           (unsigned)opcode;
+    base = hash & (MD_NATIVE_V2_BACKEDGE_SLOTS - 4u);
+    base &= ~3u;
+    set = &runtime->native_v2_backedge[base];
+
+    for (i = 0u; i < 4u; ++i) {
+        MdNativeV2BackedgeSite *s = &set[i];
+
+        if (s->hits != 0u &&
+            s->cs == runtime->cpu.cs &&
+            s->source_ip == source_ip &&
+            s->target_ip == target_ip &&
+            s->opcode == opcode) {
+            ++s->hits;
+            return;
+        }
+
+        if (s->hits == 0u && slot == NULL)
+            slot = s;
+
+        if (weakest == NULL || s->hits < weakest->hits)
+            weakest = s;
+    }
+
+    if (slot == NULL)
+        slot = weakest;
+
+    if (slot != NULL) {
+        const uint32_t linear =
+            md_x86_linear(runtime->cpu.cs, target_ip);
+        unsigned n = MD_NATIVE_V2_BACKEDGE_BYTES;
+
+        memset(slot, 0, sizeof(*slot));
+        slot->cs = runtime->cpu.cs;
+        slot->source_ip = source_ip;
+        slot->target_ip = target_ip;
+        slot->opcode = opcode;
+        slot->hits = 1u;
+
+        if (linear + n > MD_X86_ADDRESS_SPACE)
+            n = (unsigned)(MD_X86_ADDRESS_SPACE - linear);
+
+        slot->bytes_len = (uint8_t)n;
+        if (n != 0u)
+            memcpy(slot->bytes, runtime->cpu.memory + linear, n);
+    }
+}
+#define MD_NV2_PROFILE_BACKEDGE(op_, source_, target_) \
+    md_nv2_profile_backedge(runtime, (uint8_t)(op_), \
+                            (uint16_t)(source_), (uint16_t)(target_))
+#else
+#define MD_NV2_PROFILE_BACKEDGE(op_, source_, target_) ((void)0)
+#endif
+
 /* M16: one threaded loop serves both md_interp_run() and
    md_interp_run_until_cs_change() (watch_cs != 0: return MD_STOP_NONE as
    soon as CS differs from its value on entry). Per-instruction counters are
@@ -1424,7 +1497,10 @@ op_pop_r16:
 op_jz8: {
     const int8_t rel = (int8_t)md_fetch8(runtime);
     if (md_x86_zf(&runtime->cpu)) {
-        runtime->cpu.ip = (uint16_t)(runtime->cpu.ip + rel);
+        const uint16_t target = (uint16_t)(runtime->cpu.ip + rel);
+        runtime->cpu.ip = target;
+        if (rel < 0)
+            MD_NV2_PROFILE_BACKEDGE(opcode, ip_before, target);
     }
     MD_NEXT();
 }
@@ -1432,7 +1508,23 @@ op_jz8: {
 op_jnz8: {
     const int8_t rel = (int8_t)md_fetch8(runtime);
     if (!md_x86_zf(&runtime->cpu)) {
-        runtime->cpu.ip = (uint16_t)(runtime->cpu.ip + rel);
+        const uint16_t target = (uint16_t)(runtime->cpu.ip + rel);
+        runtime->cpu.ip = target;
+        if (rel < 0)
+            MD_NV2_PROFILE_BACKEDGE(opcode, ip_before, target);
+#ifdef MICRODOS_ENABLE_NATIVE_V2
+        if (rel < 0) {
+            const unsigned bit =
+                ((unsigned)runtime->cpu.cs ^ (unsigned)target) & 63u;
+            const uint32_t mask = (uint32_t)1u << (bit & 31u);
+            if ((runtime->native_v2_suppress_bloom[bit >> 5] & mask) == 0u) {
+                runtime->native_v2_backedge_cs = runtime->cpu.cs;
+                runtime->native_v2_backedge_ip = target;
+                runtime->native_v2_backedge_hit = 1u;
+                goto md_exit;
+            }
+        }
+#endif
     }
     MD_NEXT();
 }
@@ -1440,7 +1532,10 @@ op_jnz8: {
 op_jcc8: {
     const int8_t rel = (int8_t)md_fetch8(runtime);
     if (md_x86_condition(&runtime->cpu, opcode & 0x0Fu)) {
-        runtime->cpu.ip = (uint16_t)(runtime->cpu.ip + rel);
+        const uint16_t target = (uint16_t)(runtime->cpu.ip + rel);
+        runtime->cpu.ip = target;
+        if (rel < 0)
+            MD_NV2_PROFILE_BACKEDGE(opcode, ip_before, target);
     }
     MD_NEXT();
 }
@@ -1767,9 +1862,32 @@ op_mov_rm:
     md_op_mov_rm_r(runtime, opcode, NULL);
     MD_NEXT();
 
-op_loop:
+op_loop: {
+#ifdef MICRODOS_ENABLE_NATIVE_V2
+    const int8_t rel = (int8_t)md_x86_read8(
+        &runtime->cpu, runtime->cpu.cs, runtime->cpu.ip);
+    const uint16_t fallthrough = (uint16_t)(runtime->cpu.ip + 1u);
+    const uint16_t target = (uint16_t)(fallthrough + rel);
+#endif
     md_op_loop(runtime, opcode);
+#ifdef MICRODOS_ENABLE_NATIVE_V2
+    if (rel < 0 && runtime->cpu.ip == target) {
+        MD_NV2_PROFILE_BACKEDGE(opcode, ip_before, target);
+        if (opcode == 0xE2u) {
+            const unsigned bit =
+                ((unsigned)runtime->cpu.cs ^ (unsigned)target) & 63u;
+            const uint32_t mask = (uint32_t)1u << (bit & 31u);
+            if ((runtime->native_v2_suppress_bloom[bit >> 5] & mask) == 0u) {
+                runtime->native_v2_backedge_cs = runtime->cpu.cs;
+                runtime->native_v2_backedge_ip = target;
+                runtime->native_v2_backedge_hit = 1u;
+                goto md_exit;
+            }
+        }
+    }
+#endif
     MD_NEXT();
+}
 
 op_string:
     md_op_string(runtime, opcode, NULL);
@@ -1815,7 +1933,10 @@ op_call16: {
 
 op_jmp16: {
     const int16_t rel = (int16_t)md_fetch16(runtime);
-    runtime->cpu.ip = (uint16_t)(runtime->cpu.ip + rel);
+    const uint16_t target = (uint16_t)(runtime->cpu.ip + rel);
+    runtime->cpu.ip = target;
+    if (rel < 0)
+        MD_NV2_PROFILE_BACKEDGE(opcode, ip_before, target);
     MD_NEXT();
 }
 
@@ -1832,7 +1953,10 @@ op_int: {
 
 op_jmp8: {
     const int8_t rel = (int8_t)md_fetch8(runtime);
-    runtime->cpu.ip = (uint16_t)(runtime->cpu.ip + rel);
+    const uint16_t target = (uint16_t)(runtime->cpu.ip + rel);
+    runtime->cpu.ip = target;
+    if (rel < 0)
+        MD_NV2_PROFILE_BACKEDGE(opcode, ip_before, target);
     MD_NEXT();
 }
 

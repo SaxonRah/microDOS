@@ -214,6 +214,31 @@ md_pico_dos(microdos_pico_nokernel 1 0 300000 0 0 0 0 0     0)
 target_compile_definitions(microdos_pico_nokernel PRIVATE
     MD_X86_TRACK_WRITES=0
     MICRODOS_TRANSLATION_SUPPORT=0)
+
+# Native v2 Phase 3A: first real-DOS target.
+md_pico_dos(microdos_pico_nativev2 1 0 300000 0 0 0 0 0 0)
+target_sources(microdos_pico_nativev2 PRIVATE
+    "${MD_ROOT}/src/runtime/native_v2.c"
+    "${MD_ROOT}/src/runtime/native_v2_runtime.c"
+    "${MD_ROOT}/src/decode/x86_decode.c")
+target_compile_definitions(microdos_pico_nativev2 PRIVATE
+    MICRODOS_ENABLE_NATIVE_V2=1
+    MICRODOS_PICO_NATIVE_V2=1
+    MD_X86_TRACK_WRITES=0
+    MICRODOS_TRANSLATION_SUPPORT=0)
+
+# Phase 3C: same live Native-v2 target plus real taken-backedge profiling.
+md_pico_dos(microdos_pico_nativev2_profile 1 0 300000 0 0 0 0 0 0)
+target_sources(microdos_pico_nativev2_profile PRIVATE
+    "${MD_ROOT}/src/runtime/native_v2.c"
+    "${MD_ROOT}/src/runtime/native_v2_runtime.c"
+    "${MD_ROOT}/src/decode/x86_decode.c")
+target_compile_definitions(microdos_pico_nativev2_profile PRIVATE
+    MICRODOS_ENABLE_NATIVE_V2=1
+    MICRODOS_PICO_NATIVE_V2=1
+    MICRODOS_NATIVE_V2_BACKEDGE_PROFILE=1
+    MD_X86_TRACK_WRITES=0
+    MICRODOS_TRANSLATION_SUPPORT=0)
 md_pico_dos(microdos_pico_region   1 1 300000 0 0 0 0 0     0)
 target_compile_definitions(microdos_pico_region PRIVATE MD_CACHE_PROFILE=0)
 
@@ -246,6 +271,16 @@ target_compile_definitions(microdos_pico_g128_psram PRIVATE MICRODOS_PICO_GUEST_
 target_compile_definitions(microdos_pico_g128_sram  PRIVATE MICRODOS_PICO_GUEST_SRAM=1)
 
 md_pico_nativev2_bench(microdos_nativev2_bench 1 300000)
+
+# Native v2 Phase 2D: steady-state SRAM/PSRAM locality map.
+add_executable(microdos_nativev2_locality
+    "${CMAKE_CURRENT_LIST_DIR}/microdos_nativev2_locality.c"
+    "${MD_ROOT}/src/runtime/native_v2.c"
+    "${MD_ROOT}/src/decode/x86_decode.c")
+md_pico_common(microdos_nativev2_locality 1)
+target_compile_definitions(microdos_nativev2_locality PRIVATE
+    MICRODOS_PICO_SYS_KHZ=300000)
+pico_set_program_name(microdos_nativev2_locality "microDOS Native v2 locality")
 
 # Native v2 USB-only smoke test: no decoder/compiler/generated code and
 # no overclock. Used to isolate USB stdio from the native engine.
