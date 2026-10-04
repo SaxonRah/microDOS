@@ -82,11 +82,11 @@ echo.
 echo Firmware in %MD_ROOT%\build-pico\out\ :
 echo   microdos_pico.uf2             DOS, AOT kernel reference, 300 MHz
 echo   microdos_pico_150.uf2         DOS, AOT kernel reference, 150 MHz
-echo   microdos_pico_nokernel.uf2    DOS, canonical threaded kernel, 300 MHz
-echo   microdos_pico_region.uf2      DOS, resident decoded-cache kernel, 300 MHz
-echo   microdos_pico_jitkernel.uf2   DOS, runtime-JIT kernel, lean profiling, 300 MHz
+echo   microdos_pico_nokernel.uf2    DOS, pure threaded interpreter, 300 MHz
+echo   microdos_pico_region.uf2      DOS, decoded-cache/region engine, 300 MHz
+echo   microdos_pico_jitkernel.uf2   DOS, minimal adaptive interpreter+region-JIT, 300 MHz
 echo   microdos_pico_jit.uf2         DOS, AOT kernel + lean JIT apps, 300 MHz
-echo   microdos_pico_jit_profile.uf2 DOS, AOT kernel + profiled JIT apps, 300 MHz
+echo   microdos_pico_jit_profile.uf2 DOS, profiled no-AOT adaptive hybrid, 300 MHz
 echo   microdos_pico_g128_psram.uf2  DOS, 128 KiB guest in PSRAM, 300 MHz
 echo   microdos_pico_g128_sram.uf2   DOS, 128 KiB guest in SRAM, 300 MHz
 echo   microdos_bench.uf2            benchmark matrix incl. M21 checksum, 300 MHz

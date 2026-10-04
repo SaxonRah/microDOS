@@ -15,6 +15,13 @@ static MdJit g_md_system_jit;
 
 #include <string.h>
 
+#ifndef MICRODOS_SYSTEM_ENABLE_AOT
+#define MICRODOS_SYSTEM_ENABLE_AOT 1
+#endif
+#ifndef MICRODOS_SYSTEM_ENABLE_CACHE
+#define MICRODOS_SYSTEM_ENABLE_CACHE 1
+#endif
+
 #define MD_DOS2_KERNEL_SIZE 16690u
 #define MD_DOS2_AOT_CHUNK 65536u
 
@@ -37,11 +44,16 @@ void md_dos2_system_init(MdDos2System *sys, uint8_t *memory, MdBlockCache *cache
     sys->jit = &g_md_system_jit;
 #endif
 
+#if MICRODOS_SYSTEM_ENABLE_CACHE
     sys->cache = cache;
     if (cache != NULL) {
         md_block_cache_init(cache);
         md_runtime_set_block_cache(&sys->runtime, cache);
     }
+#else
+    (void)cache;
+    sys->cache = NULL;
+#endif
 }
 
 void md_dos2_system_set_aot(MdDos2System *sys, const MdAotProgram *const *programs,
@@ -72,10 +84,12 @@ bool md_dos2_system_start(MdDos2System *sys, const uint8_t *msdos_sys, size_t si
     if (sys->jit != NULL) md_jit_reset(sys->jit);
 #endif
     md_msdos2_boot_prepare_cpu(&sys->runtime, &sys->boot, msdos_sys, size);
+#if MICRODOS_SYSTEM_ENABLE_AOT
     if (sys->aot_enabled && sys->kernel_program != NULL) {
         sys->kernel_attached = sys->kernel_program->attach(&sys->runtime, sys->boot.dos_segment);
         if (sys->kernel_attached) ++sys->aot_attaches;
     }
+#endif
     return true;
 }
 
@@ -87,6 +101,7 @@ void md_dos2_system_set_kernel_aot(MdDos2System *sys, const MdAotProgram *kernel
 
 /* Returns the program whose compiled code may run at the current CS:IP,
    attaching it first when DOS has just started it at XXXX:0100. */
+#if MICRODOS_SYSTEM_ENABLE_AOT || MICRODOS_SYSTEM_ENABLE_CACHE
 static const MdAotProgram *md_aot_candidate(MdDos2System *sys)
 {
     MdRuntime *rt = &sys->runtime;
@@ -153,9 +168,20 @@ static const MdAotProgram *md_aot_here(MdDos2System *sys)
     return NULL;
 }
 
+#endif
+
 MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
 {
     MdRuntime *rt = &sys->runtime;
+
+#if !MICRODOS_SYSTEM_ENABLE_AOT && !MICRODOS_SYSTEM_ENABLE_CACHE && !defined(MICRODOS_ENABLE_JIT)
+    MdStopReason st = md_interp_run(rt, budget);
+    if (st == MD_STOP_BUDGET) {
+        rt->stop_reason = MD_STOP_NONE;
+        return MD_STOP_NONE;
+    }
+    return st;
+#else
     const uint64_t start = rt->instructions;
 
     while (rt->stop_reason == MD_STOP_NONE) {
@@ -165,6 +191,7 @@ MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
         if (used >= budget) break;
         left = budget - used;
 
+#if MICRODOS_SYSTEM_ENABLE_CACHE
         if (sys->cache != NULL) {
             /* Cache mode keeps the M14 shape: predicate-driven hand-off. */
             if (sys->aot_enabled && md_aot_stop(rt, sys)) {
@@ -195,7 +222,9 @@ MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
             }
             continue;
         }
+#endif
 
+#if MICRODOS_SYSTEM_ENABLE_AOT
         if (sys->aot_enabled) {
             /* Static AOT remains the highest-priority native tier. */
             const MdAotProgram *prog = md_aot_here(sys);
@@ -226,6 +255,7 @@ MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
                 continue;
             }
         }
+#endif
 
 #ifdef MICRODOS_ENABLE_JIT
         if (sys->jit != NULL && rt->cpu.cs == sys->boot.bios_segment) {
@@ -277,7 +307,9 @@ MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
                 md_exec_router_sample(site);
 #if MD_EXEC_ENABLE_PROMOTION
                 if (rt->cpu.cs != sys->boot.bios_segment &&
+#if MICRODOS_SYSTEM_ENABLE_AOT
                     !(sys->aot_enabled && md_aot_here(sys) != NULL) &&
+#endif
                     md_exec_router_should_probe(site)) {
                     MdJitProbe probe;
                     if (md_jit_probe(sys->jit, rt, site->cs, site->ip, &probe) &&
@@ -303,4 +335,5 @@ MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
         }
     }
     return rt->stop_reason;
+#endif
 }

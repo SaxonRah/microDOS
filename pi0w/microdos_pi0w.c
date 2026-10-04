@@ -13,8 +13,23 @@
  * tail-call trampolines into the proven shared region helpers.
  */
 #include "md_dos2_system.h"
+
+#ifndef MICRODOS_PI0W_KERNEL_AOT
+#define MICRODOS_PI0W_KERNEL_AOT 1
+#endif
+#ifndef MICRODOS_PI0W_DOS2TEST_AOT
+#define MICRODOS_PI0W_DOS2TEST_AOT 1
+#endif
+#ifndef MICRODOS_PI0W_JIT
+#define MICRODOS_PI0W_JIT 1
+#endif
+
+#if MICRODOS_PI0W_DOS2TEST_AOT
 #include "dos2test_recomp.h"
+#endif
+#if MICRODOS_PI0W_KERNEL_AOT
 #include "msdos2_recomp.h"
+#endif
 #include "microdos/ops.h"
 #include "microdos/jit.h"
 
@@ -44,7 +59,6 @@
 #define MD_GUEST_BYTES (1u << 20)
 #define MD_DISK_BYTES  (720u * 512u)
 #define MD_SLICE       200000u
-
 extern const uint8_t md_blob_msdos_sys[], md_blob_msdos_sys_end[];
 extern const uint8_t md_blob_disk[], md_blob_disk_end[];
 
@@ -52,9 +66,11 @@ static uint8_t g_guest[MD_GUEST_BYTES] __attribute__((aligned(64)));
 static uint8_t g_disk[MD_DISK_BYTES] __attribute__((aligned(64)));
 
 static MdDos2System g_sys;
+#if MICRODOS_PI0W_DOS2TEST_AOT
 static const MdAotProgram *const g_programs[] = {
     &md_recomp_dos2test_program
 };
+#endif
 
 typedef struct Pi0Console {
     bool have_pending;
@@ -370,6 +386,179 @@ static bool disk_write(void *user, uint32_t sector, const uint8_t *data, size_t 
 }
 
 
+#if MD_INTERP_OPCODE_PROFILE
+static void print_unpref_modrm_profile(void)
+{
+    static const uint8_t row_opcode[6] = {0x33u,0x83u,0x88u,0x8Bu,0xF6u,0xF7u};
+    const uint32_t *counts = md_interp_unpref_modrm_profile_counts();
+    uint16_t top_key[32] = {0};
+    uint32_t top_count[32] = {0};
+    unsigned row, modrm, rank;
+
+    for (row = 0; row < 6u; ++row) {
+        for (modrm = 0; modrm < 256u; ++modrm) {
+            const uint32_t count = counts[row * 256u + modrm];
+            if (count == 0u) continue;
+            for (rank = 0; rank < 32u; ++rank) {
+                if (count > top_count[rank]) {
+                    unsigned move;
+                    for (move = 31u; move > rank; --move) {
+                        top_count[move] = top_count[move - 1u];
+                        top_key[move] = top_key[move - 1u];
+                    }
+                    top_count[rank] = count;
+                    top_key[rank] = (uint16_t)((row << 8) | modrm);
+                    break;
+                }
+            }
+        }
+    }
+
+    uart_puts("[umprof] top unprefixed opcode -> ModR/M pairs since previous Ctrl+]:\n");
+    for (rank = 0; rank < 32u && top_count[rank] != 0u; ++rank) {
+        const unsigned r = (unsigned)(top_key[rank] >> 8);
+        const unsigned m = (unsigned)(top_key[rank] & 0xFFu);
+        uart_puts("  ");
+        uart_put_hex16((uint16_t)row_opcode[r]);
+        uart_puts(" -> ");
+        uart_put_hex16((uint16_t)m);
+        uart_puts("  ");
+        uart_put_u64((uint64_t)top_count[rank]);
+        uart_putc('\n');
+    }
+}
+#endif
+
+#if MD_INTERP_OPCODE_PROFILE
+static void print_hot_modrm_profile(void)
+{
+    static const uint8_t row_prefix[10] = {
+        0x36u,0x36u,0x36u,0x36u,0x36u,0x2Eu,0x2Eu,0x26u,0x26u,0x26u
+    };
+    static const uint8_t row_opcode[10] = {
+        0x8Cu,0xFFu,0xC7u,0x80u,0x8Bu,0xFFu,0x8Fu,0x8Au,0x03u,0x2Bu
+    };
+    const uint32_t *counts = md_interp_hot_modrm_profile_counts();
+    uint16_t top_key[32] = {0};
+    uint32_t top_count[32] = {0};
+    unsigned row, modrm, rank;
+
+    for (row = 0; row < 10u; ++row) {
+        for (modrm = 0; modrm < 256u; ++modrm) {
+            const uint32_t count = counts[row * 256u + modrm];
+            if (count == 0u) continue;
+            for (rank = 0; rank < 32u; ++rank) {
+                if (count > top_count[rank]) {
+                    unsigned move;
+                    for (move = 31u; move > rank; --move) {
+                        top_count[move] = top_count[move - 1u];
+                        top_key[move] = top_key[move - 1u];
+                    }
+                    top_count[rank] = count;
+                    top_key[rank] = (uint16_t)((row << 8) | modrm);
+                    break;
+                }
+            }
+        }
+    }
+
+    uart_puts("[eaprof] top prefix -> opcode -> ModR/M triples since previous Ctrl+]:\n");
+    for (rank = 0; rank < 32u && top_count[rank] != 0u; ++rank) {
+        const unsigned r = (unsigned)(top_key[rank] >> 8);
+        const unsigned m = (unsigned)(top_key[rank] & 0xFFu);
+        uart_puts("  ");
+        uart_put_hex16((uint16_t)row_prefix[r]);
+        uart_puts(" -> ");
+        uart_put_hex16((uint16_t)row_opcode[r]);
+        uart_puts(" -> ");
+        uart_put_hex16((uint16_t)m);
+        uart_puts("  ");
+        uart_put_u64((uint64_t)top_count[rank]);
+        uart_putc('\n');
+    }
+}
+#endif
+
+#if MD_INTERP_OPCODE_PROFILE
+static void print_prefix_profile(void)
+{
+    static const uint8_t prefixes[7] = {0x26u,0x2Eu,0x36u,0x3Eu,0xF0u,0xF2u,0xF3u};
+    const uint32_t *counts = md_interp_prefix_profile_counts();
+    uint16_t top_key[24] = {0};
+    uint32_t top_count[24] = {0};
+    unsigned row, op, rank;
+
+    for (row = 0; row < 7u; ++row) {
+        for (op = 0; op < 256u; ++op) {
+            const uint32_t count = counts[row * 256u + op];
+            if (count == 0u) continue;
+            for (rank = 0; rank < 24u; ++rank) {
+                if (count > top_count[rank]) {
+                    unsigned move;
+                    for (move = 23u; move > rank; --move) {
+                        top_count[move] = top_count[move - 1u];
+                        top_key[move] = top_key[move - 1u];
+                    }
+                    top_count[rank] = count;
+                    top_key[rank] = (uint16_t)((row << 8) | op);
+                    break;
+                }
+            }
+        }
+    }
+
+    uart_puts("[preprof] top prefix -> final opcode pairs since previous Ctrl+]:\n");
+    for (rank = 0; rank < 24u && top_count[rank] != 0u; ++rank) {
+        const unsigned r = (unsigned)(top_key[rank] >> 8);
+        const unsigned opcode = (unsigned)(top_key[rank] & 0xFFu);
+        uart_puts("  ");
+        uart_put_hex16((uint16_t)prefixes[r]);
+        uart_puts(" -> ");
+        uart_put_hex16((uint16_t)opcode);
+        uart_puts("  ");
+        uart_put_u64((uint64_t)top_count[rank]);
+        uart_putc('\n');
+    }
+}
+#endif
+
+#if MD_INTERP_OPCODE_PROFILE
+static void print_opcode_profile(void)
+{
+    const uint32_t *counts = md_interp_opcode_profile_counts();
+    uint8_t top_op[16] = {0};
+    uint32_t top_count[16] = {0};
+    unsigned op, rank;
+
+    for (op = 0; op < 256u; ++op) {
+        const uint32_t count = counts[op];
+        if (count == 0u) continue;
+        for (rank = 0; rank < 16u; ++rank) {
+            if (count > top_count[rank]) {
+                unsigned move;
+                for (move = 15u; move > rank; --move) {
+                    top_count[move] = top_count[move - 1u];
+                    top_op[move] = top_op[move - 1u];
+                }
+                top_count[rank] = count;
+                top_op[rank] = (uint8_t)op;
+                break;
+            }
+        }
+    }
+
+    uart_puts("[opprof] top primary opcode bytes since previous Ctrl+]:\n");
+    for (rank = 0; rank < 16u && top_count[rank] != 0u; ++rank) {
+        uart_puts("  0x");
+        uart_put_hex16((uint16_t)top_op[rank]);
+        uart_puts("  ");
+        uart_put_u64((uint64_t)top_count[rank]);
+        uart_putc('\n');
+    }
+    md_interp_opcode_profile_reset();
+}
+#endif
+
 static void print_stats(void)
 {
     const uint64_t now_ticks = pi0_timer_ticks();
@@ -478,6 +667,7 @@ static void print_stats(void)
     uart_put_hex16(g_sys.runtime.cpu.ip);
     uart_putc('\n');
 
+#if MICRODOS_PI0W_JIT
     if (g_sys.jit != NULL) {
         uart_puts("[jit-a64] lookups=");
         uart_put_u64(g_sys.jit->lookups);
@@ -501,6 +691,7 @@ static void print_stats(void)
         uart_put_u64(g_sys.jit->flushes);
         uart_putc('\n');
     }
+#endif
 
     g_perf_last_ticks = now_ticks;
     g_perf_last_instructions = now_instructions;
@@ -510,6 +701,12 @@ static void print_stats(void)
     g_perf_last_jit_native_instructions = now_jit_native;
     g_perf_last_jit_fallback_instructions = now_jit_fallback;
     g_perf_valid = true;
+#if MD_INTERP_OPCODE_PROFILE
+    print_hot_modrm_profile();
+    print_prefix_profile();
+    print_unpref_modrm_profile();
+    print_opcode_profile();
+#endif
 }
 
 void kernel_main(void)
@@ -620,16 +817,26 @@ void kernel_main(void)
      *
      * Runtime JIT remains disabled for this test.
      */
-    uart_puts("[06] enabling static AOT\n");
+    uart_puts("[06] configuring execution tiers\n");
 
+#if MICRODOS_PI0W_KERNEL_AOT
     md_dos2_system_set_kernel_aot(&g_sys, &md_recomp_msdos2_program);
+#endif
+#if MICRODOS_PI0W_DOS2TEST_AOT
     md_dos2_system_set_aot(
         &g_sys,
         g_programs,
         sizeof(g_programs) / sizeof(g_programs[0]),
         true);
+#else
+    md_dos2_system_set_aot(
+        &g_sys,
+        NULL,
+        0u,
+        MICRODOS_PI0W_KERNEL_AOT != 0);
+#endif
 
-    uart_puts("[06] static AOT selected; AArch64 native JIT v1 enabled\n");
+    uart_puts("[06] execution tiers configured\n");
 
     /*
      * Stage 7: load MSDOS.SYS and construct the synthetic
@@ -650,13 +857,18 @@ void kernel_main(void)
     uart_puts("  guest:   1 MiB RAM\n");
     uart_puts("  disk:    360 KiB FAT12 RAM disk\n");
 
+#if MICRODOS_PI0W_KERNEL_AOT
     uart_puts("  AOT:     MSDOS.SYS ");
     uart_put_u64(md_recomp_msdos2_program.compiled_instructions);
     uart_puts(" compiled, ");
     uart_put_u64(md_recomp_msdos2_program.hole_instructions);
     uart_puts(" holes, ");
     uart_puts(g_sys.kernel_attached ? "attached\n" : "NOT ATTACHED\n");
+#else
+    uart_puts("  AOT:     MSDOS.SYS OFF\n");
+#endif
 
+#if MICRODOS_PI0W_DOS2TEST_AOT
     uart_puts("  AOT:     ");
     uart_puts(md_recomp_dos2test_program.name);
     uart_puts(" ");
@@ -664,8 +876,15 @@ void kernel_main(void)
     uart_puts(" compiled, ");
     uart_put_u64(md_recomp_dos2test_program.hole_instructions);
     uart_puts(" holes\n");
+#else
+    uart_puts("  AOT:     DOS2TEST.COM OFF\n");
+#endif
 
-    uart_puts("  JIT:     AArch64 native v1 - emitted A64 direct prefixes + resident trampolines\n");
+#if MICRODOS_PI0W_JIT
+    uart_puts("  JIT:     AArch64 adaptive native regions\n");
+#else
+    uart_puts("  JIT:     OFF (canonical threaded interpreter)\n");
+#endif
     uart_puts("  keys:    Ctrl+] prints rolling MIPS + AOT/JIT/native tier statistics\n");
     uart_puts("\n");
 
@@ -690,8 +909,7 @@ void kernel_main(void)
      * resident shapes execute through emitted A64 tail-call trampolines into
      * the already-proven shared region helpers.
      */
-    uart_puts("[08] static AOT + AArch64 native JIT v1 run BEGIN\n");
-    uart_puts("     md_dos2_system_run() slices = 50000 instructions\n");
+    uart_puts("[08] adaptive execution run BEGIN\n");    uart_puts("     md_dos2_system_run() slices = 50000 instructions\n");
     uart_puts("     Ctrl+] = rolling MIPS + AOT/JIT/native tier sample\n");
 
     pi0_perf_reset();
@@ -712,7 +930,7 @@ void kernel_main(void)
             stop = md_dos2_system_run(&g_sys, slice_budget);
 
             if (stop != MD_STOP_NONE) {
-                uart_puts("\n[08] static AOT + AArch64 native JIT v1 run STOP\n");
+                uart_puts("\n[08] adaptive execution run STOP\n");
                 uart_puts("     stop         = ");
                 uart_put_u64((uint64_t)stop);
                 uart_puts("\n     instructions = ");

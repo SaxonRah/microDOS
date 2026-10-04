@@ -29,7 +29,7 @@ file(TO_CMAKE_PATH "${MICRODOS_PI0W_DISK}" MICRODOS_PI0W_DISK)
 configure_file("${CMAKE_CURRENT_LIST_DIR}/md_pi0w_blobs.S.in"
                "${CMAKE_CURRENT_BINARY_DIR}/md_pi0w_blobs.S" @ONLY)
 
-add_executable(microdos_pi0w.elf
+set(MD_PI0W_DOS_BASE_SOURCES
     "${CMAKE_CURRENT_LIST_DIR}/start.S"
     "${CMAKE_CURRENT_LIST_DIR}/microdos_pi0w.c"
     "${CMAKE_CURRENT_LIST_DIR}/mini_libc.c"
@@ -37,76 +37,125 @@ add_executable(microdos_pi0w.elf
 
     "${MD_ROOT}/src/runtime/runtime.c"
     "${MD_ROOT}/src/runtime/x86_interp.c"
-    "${MD_ROOT}/src/runtime/x86_block_cache.c"
-    "${MD_ROOT}/src/runtime/region.c"
     "${MD_ROOT}/src/runtime/exec_router.c"
-    "${MD_ROOT}/src/runtime/jit_core.c"
-    "${MD_ROOT}/src/decode/x86_decode.c"
     "${MD_ROOT}/src/system/md_dos2_system.c"
     "${MD_ROOT}/src/host/msdos2_boot.c"
-
-    "${MD_GENERATED}/dos2test_recomp.c"
-    "${MD_GENERATED}/msdos2_recomp.c"
 )
 
-target_include_directories(microdos_pi0w.elf PRIVATE
-    "${MD_ROOT}/include"
-    "${MD_ROOT}/src/runtime"
-    "${MD_ROOT}/src/system"
-    "${MD_ROOT}/src/host"
-    "${MD_GENERATED}"
-)
+function(md_pi0w_dos target output kernel_aot app_aot jit profile direct jit_bytes)
+    add_executable(${target} ${MD_PI0W_DOS_BASE_SOURCES})
 
-target_compile_definitions(microdos_pi0w.elf PRIVATE
-    NDEBUG=1
-    MD_THREADED_DISPATCH=1
-    MICRODOS_PI0W_BAREMETAL=1
+    if(jit)
+        target_sources(${target} PRIVATE
+            "${MD_ROOT}/src/runtime/region.c"
+            "${MD_ROOT}/src/runtime/jit_core.c"
+            "${MD_ROOT}/src/decode/x86_decode.c")
+    elseif(kernel_aot OR app_aot)
+        # Generated AOT can call resident region helpers.
+        target_sources(${target} PRIVATE "${MD_ROOT}/src/runtime/region.c")
+    endif()
 
-    # AArch64 JIT v1:
-    #
-    # Shared JIT/router policy remains common with Pico. jit_core.c selects
-    # jit_aarch64_backend.inc on __aarch64__. The first native slice emits
-    # A64 direct prefixes plus small resident-helper trampolines.
-    MICRODOS_ENABLE_JIT=1
-    MICRODOS_PI0W_JIT_AARCH64=1
-    MICRODOS_SYSTEM_JIT_CODE_BYTES=24576
-    MD_JIT_LEGACY_HOTNESS=0
-    MD_JIT_PROFILE=1
-    MD_EXEC_PROFILE=1
-    MD_EXEC_ENABLE_PROMOTION=1
-    MD_EXEC_ENABLE_DIRECT=1
-)
+    if(kernel_aot OR app_aot)
+        # Generated AOT contains a link-time fallback reference to the decoded
+        # cache runner. The runtime cache remains disabled for this target.
+        target_sources(${target} PRIVATE "${MD_ROOT}/src/runtime/x86_block_cache.c")
+    endif()
 
-target_compile_options(microdos_pi0w.elf PRIVATE
-    -O2
-    -Wall
-    -Wextra
-    -Wno-unused-parameter
-    -ffunction-sections
-    -fdata-sections
-)
+    if(app_aot)
+        target_sources(${target} PRIVATE "${MD_GENERATED}/dos2test_recomp.c")
+    endif()
+    if(kernel_aot)
+        target_sources(${target} PRIVATE "${MD_GENERATED}/msdos2_recomp.c")
+    endif()
 
-target_link_options(microdos_pi0w.elf PRIVATE
-    -nostdlib
-    -static
-    "-T${CMAKE_CURRENT_LIST_DIR}/linker.ld"
-    -Wl,--gc-sections
-    -Wl,--build-id=none
-    "-Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/microdos_pi0w.map"
-)
+    if(kernel_aot OR app_aot)
+        set(enable_aot 1)
+    else()
+        set(enable_aot 0)
+    endif()
 
-# libgcc supplies any compiler runtime helpers emitted by GCC; no hosted libc
-# or operating-system ABI is linked.
-target_link_libraries(microdos_pi0w.elf PRIVATE gcc)
+    target_include_directories(${target} PRIVATE
+        "${MD_ROOT}/include"
+        "${MD_ROOT}/src/runtime"
+        "${MD_ROOT}/src/system"
+        "${MD_ROOT}/src/host"
+        "${MD_GENERATED}"
+    )
 
-add_custom_command(TARGET microdos_pi0w.elf POST_BUILD
-    COMMAND "${CMAKE_OBJCOPY}" -O binary
-            "$<TARGET_FILE:microdos_pi0w.elf>"
-            "${CMAKE_CURRENT_BINARY_DIR}/kernel8.img"
-    COMMAND "${CMAKE_SIZE}" "$<TARGET_FILE:microdos_pi0w.elf>"
-    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/kernel8.img"
-    COMMENT "Producing Raspberry Pi Zero 2 W bare-metal kernel8.img"
-)
+    target_compile_definitions(${target} PRIVATE
+        NDEBUG=1
+        MD_THREADED_DISPATCH=1
+        MICRODOS_PI0W_BAREMETAL=1
+        MICRODOS_PI0W_JIT=${jit}
+        MICRODOS_PI0W_KERNEL_AOT=${kernel_aot}
+        MICRODOS_PI0W_DOS2TEST_AOT=${app_aot}
+        MICRODOS_SYSTEM_ENABLE_AOT=${enable_aot}
+        MICRODOS_SYSTEM_ENABLE_CACHE=0
+        MD_EXEC_PROFILE=${profile}
+    )
+
+    if(jit)
+        target_compile_definitions(${target} PRIVATE
+            MICRODOS_ENABLE_JIT=1
+            MICRODOS_PI0W_JIT_AARCH64=1
+            MICRODOS_SYSTEM_JIT_CODE_BYTES=${jit_bytes}
+            MD_JIT_BLOCK_SLOTS=64
+            MD_JIT_LEGACY_HOTNESS=0
+            MD_JIT_PROFILE=${profile}
+            MD_EXEC_ENABLE_PROMOTION=1
+            MD_EXEC_ENABLE_DIRECT=${direct})
+    endif()
+
+    target_compile_options(${target} PRIVATE
+        -O2
+        -Wall
+        -Wextra
+        -Wno-unused-parameter
+        -ffunction-sections
+        -fdata-sections
+    )
+
+    string(REPLACE ".elf" "" map_name "${target}")
+    target_link_options(${target} PRIVATE
+        -nostdlib
+        -static
+        "-T${CMAKE_CURRENT_LIST_DIR}/linker.ld"
+        -Wl,--gc-sections
+        -Wl,--build-id=none
+        "-Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/${map_name}.map"
+    )
+
+    target_link_libraries(${target} PRIVATE gcc)
+
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND "${CMAKE_OBJCOPY}" -O binary
+                "$<TARGET_FILE:${target}>"
+                "${CMAKE_CURRENT_BINARY_DIR}/${output}"
+        COMMAND "${CMAKE_SIZE}" "$<TARGET_FILE:${target}>"
+        BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/${output}"
+        COMMENT "Producing ${output}"
+    )
+endfunction()
+
+md_pi0w_dos(microdos_pi0w.elf kernel8.img 1 1 1 1 1 24576)
+
+# True minimum baseline: canonical threaded interpreter only.
+md_pi0w_dos(microdos_pi0w_threaded.elf kernel8_threaded.img 0 0 0 0 0 0)
+target_compile_definitions(microdos_pi0w_threaded.elf PRIVATE
+    MD_X86_TRACK_WRITES=0
+    MICRODOS_TRANSLATION_SUPPORT=0)
+
+# Temporary opcode-mix profiler: same minimal interpreter, counters only.
+md_pi0w_dos(microdos_pi0w_threaded_profile.elf kernel8_threaded_profile.img 0 0 0 0 0 0)
+target_compile_definitions(microdos_pi0w_threaded_profile.elf PRIVATE
+    MD_X86_TRACK_WRITES=0
+    MICRODOS_TRANSLATION_SUPPORT=0
+    MD_INTERP_OPCODE_PROFILE=1)
+
+
+# Adaptive candidates.
+md_pi0w_dos(microdos_pi0w_hybrid.elf kernel8_hybrid.img 0 0 1 0 0 12288)
+md_pi0w_dos(microdos_pi0w_hybrid_profile.elf kernel8_hybrid_profile.img 0 0 1 1 0 12288)
 
 
 # ---------------------------------------------------------------------------

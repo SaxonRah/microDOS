@@ -4,6 +4,126 @@
 #include <stddef.h>
 #include <string.h>
 
+#if MD_INTERP_OPCODE_PROFILE
+static uint32_t g_md_opcode_profile[256];
+static uint32_t g_md_unpref_modrm_profile[6u * 256u];
+static uint32_t g_md_prefix_profile[7u * 256u];
+static uint32_t g_md_hot_modrm_profile[10u * 256u];
+
+const uint32_t *md_interp_opcode_profile_counts(void)
+{
+    return g_md_opcode_profile;
+}
+
+const uint32_t *md_interp_unpref_modrm_profile_counts(void)
+{
+    return g_md_unpref_modrm_profile;
+}
+
+const uint32_t *md_interp_prefix_profile_counts(void)
+{
+    return g_md_prefix_profile;
+}
+
+const uint32_t *md_interp_hot_modrm_profile_counts(void)
+{
+    return g_md_hot_modrm_profile;
+}
+
+void md_interp_opcode_profile_reset(void)
+{
+    memset(g_md_opcode_profile, 0, sizeof(g_md_opcode_profile));
+    memset(g_md_unpref_modrm_profile, 0, sizeof(g_md_unpref_modrm_profile));
+    memset(g_md_prefix_profile, 0, sizeof(g_md_prefix_profile));
+    memset(g_md_hot_modrm_profile, 0, sizeof(g_md_hot_modrm_profile));
+}
+
+#define MD_OPCODE_PROFILE_HIT(op) (++g_md_opcode_profile[(uint8_t)(op)])
+
+static inline unsigned md_unpref_modrm_profile_row(uint8_t opcode)
+{
+    switch (opcode) {
+        case 0x33u: return 0u;
+        case 0x83u: return 1u;
+        case 0x88u: return 2u;
+        case 0x8Bu: return 3u;
+        case 0xF6u: return 4u;
+        case 0xF7u: return 5u;
+        default: return 6u;
+    }
+}
+
+static inline void md_unpref_modrm_profile_hit(uint8_t opcode, uint8_t modrm)
+{
+    const unsigned row = md_unpref_modrm_profile_row(opcode);
+    if (row < 6u) ++g_md_unpref_modrm_profile[row * 256u + modrm];
+}
+
+#define MD_UNPREF_MODRM_PROFILE_HIT(op, modrm) \
+    md_unpref_modrm_profile_hit((uint8_t)(op), (uint8_t)(modrm))
+
+static inline unsigned md_prefix_profile_row(uint8_t prefix)
+{
+    switch (prefix) {
+        case 0x26u: return 0u;
+        case 0x2Eu: return 1u;
+        case 0x36u: return 2u;
+        case 0x3Eu: return 3u;
+        case 0xF0u: return 4u;
+        case 0xF2u: return 5u;
+        case 0xF3u: return 6u;
+        default: return 7u;
+    }
+}
+
+static inline void md_prefix_profile_hit(uint8_t prefix, uint8_t opcode)
+{
+    const unsigned row = md_prefix_profile_row(prefix);
+    if (row < 7u) ++g_md_prefix_profile[row * 256u + opcode];
+}
+
+#define MD_PREFIX_PROFILE_HIT(prefix, op) md_prefix_profile_hit((uint8_t)(prefix), (uint8_t)(op))
+
+static inline unsigned md_hot_modrm_profile_row(uint8_t prefix, uint8_t opcode)
+{
+    if (prefix == 0x36u) {
+        switch (opcode) {
+            case 0x8Cu: return 0u;
+            case 0xFFu: return 1u;
+            case 0xC7u: return 2u;
+            case 0x80u: return 3u;
+            case 0x8Bu: return 4u;
+            default: return 10u;
+        }
+    }
+    if (prefix == 0x2Eu) {
+        if (opcode == 0xFFu) return 5u;
+        if (opcode == 0x8Fu) return 6u;
+        return 10u;
+    }
+    if (prefix == 0x26u) {
+        if (opcode == 0x8Au) return 7u;
+        if (opcode == 0x03u) return 8u;
+        if (opcode == 0x2Bu) return 9u;
+    }
+    return 10u;
+}
+
+static inline void md_hot_modrm_profile_hit(uint8_t prefix, uint8_t opcode, uint8_t modrm)
+{
+    const unsigned row = md_hot_modrm_profile_row(prefix, opcode);
+    if (row < 10u) ++g_md_hot_modrm_profile[row * 256u + modrm];
+}
+
+#define MD_HOT_MODRM_PROFILE_HIT(prefix, op, modrm) \
+    md_hot_modrm_profile_hit((uint8_t)(prefix), (uint8_t)(op), (uint8_t)(modrm))
+#else
+#define MD_OPCODE_PROFILE_HIT(op) ((void)0)
+#define MD_UNPREF_MODRM_PROFILE_HIT(op, modrm) ((void)0)
+#define MD_PREFIX_PROFILE_HIT(prefix, op) ((void)0)
+#define MD_HOT_MODRM_PROFILE_HIT(prefix, op, modrm) ((void)0)
+#endif
+
 typedef struct MdOperand {
     uint8_t is_register;
     uint8_t reg;
@@ -865,6 +985,9 @@ static inline int md_execute_prefixed(MdRuntime *runtime, uint8_t first_prefix,
         }
         opcode = md_fetch8(runtime);
     }
+    MD_PREFIX_PROFILE_HIT(prefix.segment_override, opcode);
+    MD_PREFIX_PROFILE_HIT(prefix.repeat, opcode);
+    if (prefix.lock) MD_PREFIX_PROFILE_HIT(0xF0u, opcode);
     return md_execute_opcode(runtime, opcode, ip_before, &prefix);
 }
 
@@ -1158,6 +1281,10 @@ static MdStopReason md_interp_run_threaded(MdRuntime *runtime, uint32_t instruct
     uint32_t remaining = instruction_budget;
     uint32_t done = 0u;
     const uint16_t cs0 = runtime->cpu.cs;
+    MdX86 *const opcode_cpu = &runtime->cpu;
+    uint8_t *const opcode_memory = opcode_cpu->memory;
+    uint32_t opcode_cs_base = ((uint32_t)opcode_cpu->cs) << 4;
+    uint32_t stack_ss_base = ((uint32_t)opcode_cpu->ss) << 4;
     unsigned i;
 
     if (!initialized) {
@@ -1168,7 +1295,11 @@ static MdStopReason md_interp_run_threaded(MdRuntime *runtime, uint32_t instruct
         for (i = 0x48u; i <= 0x4Fu; ++i) dispatch[i] = &&op_dec_r16;
         for (i = 0x50u; i <= 0x57u; ++i) dispatch[i] = &&op_push_r16;
         for (i = 0x58u; i <= 0x5Fu; ++i) dispatch[i] = &&op_pop_r16;
+        dispatch[0x50] = &&op_push_ax;
+        dispatch[0x58] = &&op_pop_ax;
         for (i = 0x70u; i <= 0x7Fu; ++i) dispatch[i] = &&op_jcc8;
+        dispatch[0x74] = &&op_jz8;
+        dispatch[0x75] = &&op_jnz8;
         /* M16: direct entries for the opcodes that dominate the MS-DOS 2.0
            kernel/COMMAND.COM mix (profiled on DOS2TEST). They call the same
            md_op_* semantics as md_execute_opcode, skipping its range-test
@@ -1187,6 +1318,9 @@ static MdStopReason md_interp_run_threaded(MdRuntime *runtime, uint32_t instruct
         dispatch[0x07] = &&op_pop_sreg;
         dispatch[0x17] = &&op_pop_sreg;
         dispatch[0x1F] = &&op_pop_sreg;
+        dispatch[0x16] = &&op_push_ss_hot;
+        dispatch[0x1F] = &&op_pop_ds_hot;
+        dispatch[0x07] = &&op_pop_es_hot;
         dispatch[0xC3] = &&op_ret;
         dispatch[0xE8] = &&op_call16;
         dispatch[0xE9] = &&op_jmp16;
@@ -1201,6 +1335,8 @@ static MdStopReason md_interp_run_threaded(MdRuntime *runtime, uint32_t instruct
         dispatch[0xCD] = &&op_int;
         dispatch[0xEB] = &&op_jmp8;
         dispatch[0xF4] = &&op_hlt;
+        dispatch[0xF6] = &&op_group3;
+        dispatch[0xF7] = &&op_group3;
         initialized = 1;
     }
 
@@ -1210,6 +1346,8 @@ static MdStopReason md_interp_run_threaded(MdRuntime *runtime, uint32_t instruct
    (a per-instruction check cost ~35% on the DEC/JNZ benchmark). */
 #define MD_NEXT_CS() do { \
         if (watch_cs && runtime->cpu.cs != cs0) goto md_exit; \
+        opcode_cs_base = ((uint32_t)opcode_cpu->cs) << 4; \
+        stack_ss_base = ((uint32_t)opcode_cpu->ss) << 4; \
         MD_NEXT(); \
     } while (0)
 
@@ -1218,12 +1356,38 @@ static MdStopReason md_interp_run_threaded(MdRuntime *runtime, uint32_t instruct
         if (remaining == 0u) { runtime->stop_reason = MD_STOP_BUDGET; goto md_exit; } \
         --remaining; \
         ++done; \
-        ip_before = runtime->cpu.ip; \
-        opcode = md_fetch8(runtime); \
+        ip_before = opcode_cpu->ip; \
+        opcode = opcode_memory[(opcode_cs_base + (uint32_t)ip_before) & MD_X86_ADDRESS_MASK]; \
+        opcode_cpu->ip = (uint16_t)(ip_before + 1u); \
+        MD_OPCODE_PROFILE_HIT(opcode); \
         goto *dispatch[opcode]; \
     } while (0)
 
     MD_NEXT();
+
+#if defined(MD_X86_TRACK_WRITES) && !MD_X86_TRACK_WRITES
+#define MD_STACK_PUSH16_FAST(value_) do { \
+        const uint16_t md_stack_value_ = (uint16_t)(value_); \
+        const uint16_t md_stack_sp_ = (uint16_t)(opcode_cpu->r[MD_X86_SP] - 2u); \
+        const uint32_t md_stack_a0_ = (stack_ss_base + (uint32_t)md_stack_sp_) & MD_X86_ADDRESS_MASK; \
+        opcode_cpu->r[MD_X86_SP] = md_stack_sp_; \
+        opcode_memory[md_stack_a0_] = (uint8_t)md_stack_value_; \
+        opcode_memory[(md_stack_a0_ + 1u) & MD_X86_ADDRESS_MASK] = (uint8_t)(md_stack_value_ >> 8); \
+    } while (0)
+#define MD_STACK_POP16_FAST(dst_) do { \
+        const uint16_t md_stack_sp_ = opcode_cpu->r[MD_X86_SP]; \
+        const uint32_t md_stack_a0_ = (stack_ss_base + (uint32_t)md_stack_sp_) & MD_X86_ADDRESS_MASK; \
+        (dst_) = (uint16_t)((uint16_t)opcode_memory[md_stack_a0_] | \
+                 ((uint16_t)opcode_memory[(md_stack_a0_ + 1u) & MD_X86_ADDRESS_MASK] << 8)); \
+        opcode_cpu->r[MD_X86_SP] = (uint16_t)(md_stack_sp_ + 2u); \
+    } while (0)
+#else
+#define MD_STACK_PUSH16_FAST(value_) \
+    md_x86_push(opcode_cpu, (uint16_t)(value_))
+#define MD_STACK_POP16_FAST(dst_) do { \
+        (dst_) = md_x86_pop(opcode_cpu); \
+    } while (0)
+#endif
 
 op_mov_r8_imm:
     md_op_mov_r8_imm(runtime, opcode);
@@ -1241,6 +1405,14 @@ op_dec_r16:
     md_op_dec_r16(runtime, opcode);
     MD_NEXT();
 
+op_push_ax:
+    MD_STACK_PUSH16_FAST(opcode_cpu->r[MD_X86_AX]);
+    MD_NEXT();
+
+op_pop_ax:
+    MD_STACK_POP16_FAST(opcode_cpu->r[MD_X86_AX]);
+    MD_NEXT();
+
 op_push_r16:
     md_x86_push_reg(&runtime->cpu, opcode & 7u);
     MD_NEXT();
@@ -1248,6 +1420,22 @@ op_push_r16:
 op_pop_r16:
     runtime->cpu.r[opcode & 7u] = md_x86_pop(&runtime->cpu);
     MD_NEXT();
+
+op_jz8: {
+    const int8_t rel = (int8_t)md_fetch8(runtime);
+    if (md_x86_zf(&runtime->cpu)) {
+        runtime->cpu.ip = (uint16_t)(runtime->cpu.ip + rel);
+    }
+    MD_NEXT();
+}
+
+op_jnz8: {
+    const int8_t rel = (int8_t)md_fetch8(runtime);
+    if (!md_x86_zf(&runtime->cpu)) {
+        runtime->cpu.ip = (uint16_t)(runtime->cpu.ip + rel);
+    }
+    MD_NEXT();
+}
 
 op_jcc8: {
     const int8_t rel = (int8_t)md_fetch8(runtime);
@@ -1257,11 +1445,229 @@ op_jcc8: {
     MD_NEXT();
 }
 
-op_prefix:
+op_prefix: {
+    /* Real DOS overwhelmingly uses a single segment override.  Avoid the
+       general prefix parser for that hot case, but leave repeated/mixed
+       prefixes, REP and LOCK on the fully general path below. */
+    if (opcode == 0x26u || opcode == 0x2Eu || opcode == 0x36u || opcode == 0x3Eu) {
+        const uint8_t next_opcode = md_x86_read8(&runtime->cpu,
+                                                  runtime->cpu.cs,
+                                                  runtime->cpu.ip);
+        if (!md_is_prefix_byte(next_opcode)) {
+            MdPrefixState prefix = { opcode, 0u, 0u };
+            (void)md_fetch8(runtime);  /* consume the already-peeked opcode */
+#if MD_INTERP_OPCODE_PROFILE
+            MD_PREFIX_PROFILE_HIT(opcode, next_opcode);
+#endif
+
+#if MD_INTERP_OPCODE_PROFILE
+            {
+                const unsigned hot_row = md_hot_modrm_profile_row(opcode, next_opcode);
+                if (hot_row < 10u) {
+                    const uint8_t modrm = md_x86_read8(&runtime->cpu,
+                                                       runtime->cpu.cs,
+                                                       runtime->cpu.ip);
+                    MD_HOT_MODRM_PROFILE_HIT(opcode, next_opcode, modrm);
+                }
+            }
+#endif
+
+            /* Profile-guided hot pairs.  Reuse the exact existing helpers;
+               only skip md_execute_opcode()'s classification chain. */
+            /* Profile-guided exact ModR/M templates.
+               These eleven byte patterns account for ~10.8% of the measured
+               COMMAND/DOS stream. Peek first so every non-match falls back
+               without consuming anything. */
+            {
+                const uint8_t hot_modrm = md_x86_read8(&runtime->cpu,
+                                                       runtime->cpu.cs,
+                                                       runtime->cpu.ip);
+
+                if (opcode == 0x2Eu && next_opcode == 0xFFu && hot_modrm == 0x36u) {
+                    uint16_t disp;
+                    uint16_t value;
+                    (void)md_fetch8(runtime);
+                    disp = md_fetch16(runtime);
+                    value = md_x86_read16(&runtime->cpu, runtime->cpu.cs, disp);
+                    md_x86_push(&runtime->cpu, value);
+                    MD_NEXT();
+                }
+
+                if (opcode == 0x2Eu && next_opcode == 0x8Fu && hot_modrm == 0x06u) {
+                    uint16_t disp;
+                    uint16_t value;
+                    (void)md_fetch8(runtime);
+                    disp = md_fetch16(runtime);
+                    value = md_x86_pop(&runtime->cpu);
+                    md_x86_write16(&runtime->cpu, runtime->cpu.cs, disp, value);
+                    MD_NEXT();
+                }
+
+                if (opcode == 0x36u && next_opcode == 0xFFu && hot_modrm == 0x1Eu) {
+                    uint16_t disp;
+                    uint16_t target_ip;
+                    uint16_t target_cs;
+                    uint16_t return_ip;
+                    (void)md_fetch8(runtime);
+                    disp = md_fetch16(runtime);
+                    target_ip = md_x86_read16(&runtime->cpu, runtime->cpu.ss, disp);
+                    target_cs = md_x86_read16(&runtime->cpu, runtime->cpu.ss,
+                                              (uint16_t)(disp + 2u));
+                    return_ip = runtime->cpu.ip;
+                    md_x86_push(&runtime->cpu, runtime->cpu.cs);
+                    md_x86_push(&runtime->cpu, return_ip);
+                    runtime->cpu.cs = target_cs;
+                    runtime->cpu.ip = target_ip;
+                    MD_NEXT_CS();
+                }
+
+                if (opcode == 0x36u && next_opcode == 0xC7u && hot_modrm == 0x06u) {
+                    uint16_t disp;
+                    uint16_t imm;
+                    (void)md_fetch8(runtime);
+                    disp = md_fetch16(runtime);
+                    imm = md_fetch16(runtime);
+                    md_x86_write16(&runtime->cpu, runtime->cpu.ss, disp, imm);
+                    MD_NEXT();
+                }
+
+                if (opcode == 0x36u && next_opcode == 0x80u && hot_modrm == 0x3Eu) {
+                    uint16_t disp;
+                    uint8_t lhs;
+                    uint8_t rhs;
+                    (void)md_fetch8(runtime);
+                    disp = md_fetch16(runtime);
+                    lhs = md_x86_read8(&runtime->cpu, runtime->cpu.ss, disp);
+                    rhs = md_fetch8(runtime);
+                    (void)md_alu8(&runtime->cpu, 7u, lhs, rhs);
+                    MD_NEXT();
+                }
+
+                if (opcode == 0x36u && next_opcode == 0x8Cu &&
+                    (hot_modrm == 0x1Eu || hot_modrm == 0x16u)) {
+                    uint16_t disp;
+                    uint16_t value;
+                    (void)md_fetch8(runtime);
+                    disp = md_fetch16(runtime);
+                    value = hot_modrm == 0x1Eu ? runtime->cpu.ds : runtime->cpu.ss;
+                    md_x86_write16(&runtime->cpu, runtime->cpu.ss, disp, value);
+                    MD_NEXT();
+                }
+
+                if (opcode == 0x36u && next_opcode == 0x8Bu && hot_modrm == 0x3Eu) {
+                    uint16_t disp;
+                    (void)md_fetch8(runtime);
+                    disp = md_fetch16(runtime);
+                    runtime->cpu.r[MD_X86_DI] =
+                        md_x86_read16(&runtime->cpu, runtime->cpu.ss, disp);
+                    MD_NEXT();
+                }
+
+                if (opcode == 0x26u && next_opcode == 0x8Au && hot_modrm == 0x05u) {
+                    (void)md_fetch8(runtime);
+                    md_x86_set_reg8(&runtime->cpu, 0u,
+                                    md_x86_read8(&runtime->cpu, runtime->cpu.es,
+                                                 runtime->cpu.r[MD_X86_DI]));
+                    MD_NEXT();
+                }
+
+                if (opcode == 0x26u &&
+                    (next_opcode == 0x03u || next_opcode == 0x2Bu) &&
+                    hot_modrm == 0x45u) {
+                    int8_t disp;
+                    uint16_t rhs;
+                    unsigned alu_op;
+                    (void)md_fetch8(runtime);
+                    disp = (int8_t)md_fetch8(runtime);
+                    rhs = md_x86_read16(&runtime->cpu, runtime->cpu.es,
+                                        (uint16_t)(runtime->cpu.r[MD_X86_DI] + disp));
+                    alu_op = next_opcode == 0x03u ? 0u : 5u;
+                    runtime->cpu.r[MD_X86_AX] =
+                        md_alu16(&runtime->cpu, alu_op,
+                                 runtime->cpu.r[MD_X86_AX], rhs);
+                    MD_NEXT();
+                }
+            }
+
+            if (opcode == 0x36u) { /* SS: */
+                switch (next_opcode) {
+                    case 0xA3u: {
+                        const uint16_t off = md_fetch16(runtime);
+                        md_x86_write16(&runtime->cpu, runtime->cpu.ss, off,
+                                       runtime->cpu.r[MD_X86_AX]);
+                        MD_NEXT_CS();
+                    }
+                    case 0x8Cu:
+                        md_op_mov_sreg(runtime, next_opcode, ip_before, &prefix);
+                        MD_NEXT_CS();
+                    case 0xFFu:
+                        md_op_group45(runtime, next_opcode, ip_before, &prefix);
+                        MD_NEXT_CS();
+                    case 0xC7u:
+                        md_op_mov_rm_imm(runtime, next_opcode, ip_before, &prefix);
+                        MD_NEXT_CS();
+                    case 0x80u:
+                        md_op_group1_imm(runtime, next_opcode, &prefix);
+                        MD_NEXT_CS();
+                    case 0x8Bu:
+                        md_op_mov_rm_r(runtime, next_opcode, &prefix);
+                        MD_NEXT_CS();
+                    case 0xA1u: {
+                        const uint16_t off = md_fetch16(runtime);
+                        runtime->cpu.r[MD_X86_AX] =
+                            md_x86_read16(&runtime->cpu, runtime->cpu.ss, off);
+                        MD_NEXT_CS();
+                    }
+                    default:
+                        break;
+                }
+            } else if (opcode == 0x2Eu) { /* CS: */
+                if (next_opcode == 0xFFu) {
+                    md_op_group45(runtime, next_opcode, ip_before, &prefix);
+                    MD_NEXT_CS();
+                }
+                if (next_opcode == 0x8Fu) {
+                    md_op_pop_rm(runtime, ip_before, &prefix);
+                    MD_NEXT_CS();
+                }
+            } else if (opcode == 0x26u) { /* ES: */
+                if (next_opcode == 0x8Au) {
+                    md_op_mov_rm_r(runtime, next_opcode, &prefix);
+                    MD_NEXT_CS();
+                }
+                if (next_opcode == 0x03u || next_opcode == 0x2Bu) {
+                    md_op_alu_rm_r(runtime, next_opcode, &prefix);
+                    MD_NEXT_CS();
+                }
+            }
+
+            (void)md_execute_opcode(runtime, next_opcode, ip_before, &prefix);
+            MD_NEXT_CS();
+        }
+    }
     (void)md_execute_prefixed(runtime, opcode, ip_before);
     MD_NEXT_CS();
+}
 
 op_alu_rm:
+#if MD_INTERP_OPCODE_PROFILE
+    if (md_unpref_modrm_profile_row(opcode) < 6u) {
+        MD_UNPREF_MODRM_PROFILE_HIT(
+            opcode,
+            md_x86_read8(&runtime->cpu, runtime->cpu.cs, runtime->cpu.ip));
+    }
+#endif
+    /* Profile-guided exact unprefixed ALU template. */
+    if (opcode == 0x33u &&
+        md_x86_read8(&runtime->cpu, runtime->cpu.cs, runtime->cpu.ip) == 0xDBu) {
+        (void)md_fetch8(runtime);
+        runtime->cpu.r[MD_X86_BX] =
+            md_alu16(&runtime->cpu, 6u,
+                     runtime->cpu.r[MD_X86_BX],
+                     runtime->cpu.r[MD_X86_BX]);
+        MD_NEXT();
+    }
+
     md_op_alu_rm_r(runtime, opcode, NULL);
     MD_NEXT();
 
@@ -1270,10 +1676,94 @@ op_alu_acc:
     MD_NEXT();
 
 op_group1:
+#if MD_INTERP_OPCODE_PROFILE
+    if (md_unpref_modrm_profile_row(opcode) < 6u) {
+        MD_UNPREF_MODRM_PROFILE_HIT(
+            opcode,
+            md_x86_read8(&runtime->cpu, runtime->cpu.cs, runtime->cpu.ip));
+    }
+#endif
+    /* Profile-guided exact unprefixed 83h templates. */
+    if (opcode == 0x83u) {
+        const uint8_t hot_modrm =
+            md_x86_read8(&runtime->cpu, runtime->cpu.cs, runtime->cpu.ip);
+
+        if (hot_modrm == 0xFFu || hot_modrm == 0xFBu) {
+            uint16_t lhs;
+            uint16_t rhs;
+            (void)md_fetch8(runtime);
+            lhs = hot_modrm == 0xFFu
+                ? runtime->cpu.r[MD_X86_DI]
+                : runtime->cpu.r[MD_X86_BX];
+            rhs = (uint16_t)(int16_t)(int8_t)md_fetch8(runtime);
+            (void)md_alu16(&runtime->cpu, 7u, lhs, rhs);
+            MD_NEXT();
+        }
+
+        if (hot_modrm == 0xC7u || hot_modrm == 0xC6u) {
+            uint16_t rhs;
+            uint16_t *dst;
+            (void)md_fetch8(runtime);
+            rhs = (uint16_t)(int16_t)(int8_t)md_fetch8(runtime);
+            dst = hot_modrm == 0xC7u
+                ? &runtime->cpu.r[MD_X86_DI]
+                : &runtime->cpu.r[MD_X86_SI];
+            *dst = md_alu16(&runtime->cpu, 0u, *dst, rhs);
+            MD_NEXT();
+        }
+    }
+
     md_op_group1_imm(runtime, opcode, NULL);
     MD_NEXT();
 
 op_mov_rm:
+#if MD_INTERP_OPCODE_PROFILE
+    if (md_unpref_modrm_profile_row(opcode) < 6u) {
+        MD_UNPREF_MODRM_PROFILE_HIT(
+            opcode,
+            md_x86_read8(&runtime->cpu, runtime->cpu.cs, runtime->cpu.ip));
+    }
+#endif
+    /* Profile-guided exact unprefixed MOV templates. */
+    {
+        const uint8_t hot_modrm =
+            md_x86_read8(&runtime->cpu, runtime->cpu.cs, runtime->cpu.ip);
+
+        if (opcode == 0x8Bu && hot_modrm == 0x44u) {
+            int8_t disp;
+            (void)md_fetch8(runtime);
+            disp = (int8_t)md_fetch8(runtime);
+            runtime->cpu.r[MD_X86_AX] =
+                md_x86_read16(&runtime->cpu, runtime->cpu.ds,
+                              (uint16_t)(runtime->cpu.r[MD_X86_SI] + disp));
+            MD_NEXT();
+        }
+
+        if (opcode == 0x8Bu && hot_modrm == 0xFBu) {
+            (void)md_fetch8(runtime);
+            runtime->cpu.r[MD_X86_DI] = runtime->cpu.r[MD_X86_BX];
+            MD_NEXT();
+        }
+
+        if (opcode == 0x8Bu && hot_modrm == 0xF7u) {
+            (void)md_fetch8(runtime);
+            runtime->cpu.r[MD_X86_SI] = runtime->cpu.r[MD_X86_DI];
+            MD_NEXT();
+        }
+
+        if (opcode == 0x88u &&
+            (hot_modrm == 0x1Eu || hot_modrm == 0x0Eu || hot_modrm == 0x2Eu)) {
+            uint16_t disp;
+            unsigned reg8;
+            (void)md_fetch8(runtime);
+            disp = md_fetch16(runtime);
+            reg8 = hot_modrm == 0x1Eu ? 3u : (hot_modrm == 0x0Eu ? 1u : 5u);
+            md_x86_write8(&runtime->cpu, runtime->cpu.ds, disp,
+                          md_x86_get_reg8(&runtime->cpu, reg8));
+            MD_NEXT();
+        }
+    }
+
     md_op_mov_rm_r(runtime, opcode, NULL);
     MD_NEXT();
 
@@ -1285,26 +1775,41 @@ op_string:
     md_op_string(runtime, opcode, NULL);
     MD_NEXT();
 
+op_push_ss_hot:
+    MD_STACK_PUSH16_FAST(opcode_cpu->ss);
+    MD_NEXT();
+
+op_pop_ds_hot:
+    MD_STACK_POP16_FAST(opcode_cpu->ds);
+    MD_NEXT();
+
+op_pop_es_hot:
+    MD_STACK_POP16_FAST(opcode_cpu->es);
+    MD_NEXT();
+
 op_push_sreg:
-    md_x86_push(&runtime->cpu, md_get_sreg(&runtime->cpu, (opcode >> 3) & 3u));
+    MD_STACK_PUSH16_FAST(md_get_sreg(opcode_cpu, (opcode >> 3) & 3u));
     MD_NEXT();
 
 op_pop_sreg: {
-    const uint16_t v = md_x86_pop(&runtime->cpu);
-    if (opcode == 0x07u) runtime->cpu.es = v;
-    else if (opcode == 0x17u) runtime->cpu.ss = v;
-    else runtime->cpu.ds = v;
+    uint16_t v;
+    MD_STACK_POP16_FAST(v);
+    if (opcode == 0x07u) opcode_cpu->es = v;
+    else if (opcode == 0x17u) {
+        opcode_cpu->ss = v;
+        stack_ss_base = ((uint32_t)opcode_cpu->ss) << 4;
+    } else opcode_cpu->ds = v;
     MD_NEXT();
 }
 
 op_ret:
-    runtime->cpu.ip = md_x86_pop(&runtime->cpu);
+    MD_STACK_POP16_FAST(opcode_cpu->ip);
     MD_NEXT();
 
 op_call16: {
     const int16_t rel = (int16_t)md_fetch16(runtime);
-    md_x86_push(&runtime->cpu, runtime->cpu.ip);
-    runtime->cpu.ip = (uint16_t)(runtime->cpu.ip + rel);
+    MD_STACK_PUSH16_FAST(opcode_cpu->ip);
+    opcode_cpu->ip = (uint16_t)(opcode_cpu->ip + rel);
     MD_NEXT();
 }
 
@@ -1335,6 +1840,59 @@ op_hlt:
     runtime->stop_reason = MD_STOP_HALT;
     goto md_exit;
 
+op_group3:
+#if MD_INTERP_OPCODE_PROFILE
+    if (md_unpref_modrm_profile_row(opcode) < 6u) {
+        MD_UNPREF_MODRM_PROFILE_HIT(
+            opcode,
+            md_x86_read8(&runtime->cpu, runtime->cpu.cs, runtime->cpu.ip));
+    }
+#endif
+    /* Profile-guided exact unprefixed Group-3 templates. */
+    {
+        const uint8_t hot_modrm =
+            md_x86_read8(&runtime->cpu, runtime->cpu.cs, runtime->cpu.ip);
+
+        if (opcode == 0xF6u && hot_modrm == 0x44u) {
+            int8_t disp;
+            uint8_t lhs;
+            uint8_t rhs;
+            (void)md_fetch8(runtime);
+            disp = (int8_t)md_fetch8(runtime);
+            lhs = md_x86_read8(&runtime->cpu, runtime->cpu.ds,
+                               (uint16_t)(runtime->cpu.r[MD_X86_SI] + disp));
+            rhs = md_fetch8(runtime);
+            (void)md_x86_logic8(&runtime->cpu, (uint8_t)(lhs & rhs));
+            MD_NEXT();
+        }
+
+        if (opcode == 0xF6u && hot_modrm == 0xD4u) {
+            const uint8_t ah = md_x86_get_reg8(&runtime->cpu, 4u);
+            (void)md_fetch8(runtime);
+            md_x86_set_reg8(&runtime->cpu, 4u, (uint8_t)~ah);
+            MD_NEXT();
+        }
+
+        if (opcode == 0xF6u && hot_modrm == 0xE3u) {
+            const uint8_t bl = md_x86_get_reg8(&runtime->cpu, 3u);
+            (void)md_fetch8(runtime);
+            md_muldiv_core(runtime, 0xF6u, 4u, bl, ip_before);
+            MD_NEXT();
+        }
+
+        if (opcode == 0xF7u && hot_modrm == 0xC7u) {
+            uint16_t imm;
+            (void)md_fetch8(runtime);
+            imm = md_fetch16(runtime);
+            (void)md_x86_logic16(&runtime->cpu,
+                                 (uint16_t)(runtime->cpu.r[MD_X86_DI] & imm));
+            MD_NEXT();
+        }
+    }
+
+    md_op_group3(runtime, opcode, ip_before, NULL);
+    MD_NEXT();
+
 op_generic:
     (void)md_execute_opcode(runtime, opcode, ip_before, NULL);
     MD_NEXT_CS();
@@ -1343,6 +1901,8 @@ md_exit:
     runtime->instructions += done;
     return runtime->stop_reason;
 
+#undef MD_STACK_PUSH16_FAST
+#undef MD_STACK_POP16_FAST
 #undef MD_NEXT
 #undef MD_NEXT_CS
 }

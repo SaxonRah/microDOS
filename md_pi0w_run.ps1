@@ -1,5 +1,6 @@
-﻿param(
+param(
     [string]$Repo = "C:\microDOS",
+    [string]$KernelImage = "",
     [int]$CaptureSeconds = 60,
     [switch]$NoBuild,
     [switch]$Interactive
@@ -9,7 +10,8 @@ $ErrorActionPreference = "Stop"
 
 $Repo = (Resolve-Path $Repo).Path
 $BuildScript = Join-Path $Repo "md_pi0w_baremetal.ps1"
-$BuiltKernel = Join-Path $Repo "build-pi0w\out\kernel8.img"
+$DefaultKernel = Join-Path $Repo "build-pi0w\out\kernel8.img"
+$BuiltKernel = $DefaultKernel
 $UsbDir = Join-Path $Repo "build-pi0w\usbboot"
 $UsbKernel = Join-Path $UsbDir "kernel8.img"
 $RpiBoot = "C:\Program Files (x86)\Raspberry Pi\rpiboot.exe"
@@ -27,6 +29,14 @@ if (-not $NoBuild) {
     }
 }
 
+if ($KernelImage -ne "") {
+    if ([System.IO.Path]::IsPathRooted($KernelImage)) {
+        $BuiltKernel = [System.IO.Path]::GetFullPath($KernelImage)
+    } else {
+        $BuiltKernel = [System.IO.Path]::GetFullPath((Join-Path $Repo $KernelImage))
+    }
+}
+
 if (-not (Test-Path $BuiltKernel)) {
     throw "Built kernel not found: $BuiltKernel"
 }
@@ -35,6 +45,7 @@ Write-Host ""
 Write-Host "=== STAGE ==="
 Copy-Item $BuiltKernel $UsbKernel -Force
 $kernel = Get-Item $UsbKernel
+Write-Host ("source: {0}" -f $BuiltKernel)
 Write-Host ("kernel8.img: {0} bytes  {1}" -f $kernel.Length, $kernel.LastWriteTime)
 
 Get-Process rpiboot -ErrorAction SilentlyContinue | Stop-Process -Force

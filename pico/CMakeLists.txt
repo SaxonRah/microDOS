@@ -82,13 +82,9 @@ configure_file("${CMAKE_CURRENT_LIST_DIR}/md_pico_blobs.S.in"
 set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/md_pico_blobs.S" PROPERTIES
     OBJECT_DEPENDS "${MICRODOS_PICO_KERNEL};${MICRODOS_PICO_DISK}")
 
-option(MD_EXEC_ENABLE_PROMOTION "M23 promote proven hot regions (requires hardware validation)" OFF)
-option(MD_EXEC_ENABLE_DIRECT "M23 admit high-coverage direct blocks (requires phase tuning)" OFF)
-
-set(MD_RUNTIME_SOURCES
+set(MD_RUNTIME_BASE_SOURCES
     "${MD_ROOT}/src/runtime/runtime.c"
     "${MD_ROOT}/src/runtime/x86_interp.c"
-    "${MD_ROOT}/src/runtime/x86_block_cache.c"
     "${MD_ROOT}/src/runtime/region.c"
     "${MD_ROOT}/src/runtime/exec_router.c")
 
@@ -120,14 +116,23 @@ endfunction()
 # DOS firmware: name, code_in_sram, block_cache, sys_khz (0 = SDK default),
 # kernel_aot (1 = link compiled MSDOS.SYS), jit (1 = runtime translator for
 # segments with no matching static AOT image).
-function(md_pico_dos target code_in_sram cache sys_khz kernel_aot jit)
+function(md_pico_dos target code_in_sram cache sys_khz kernel_aot app_aot jit promote direct jit_bytes)
     add_executable(${target}
         "${CMAKE_CURRENT_LIST_DIR}/microdos_pico.c"
         "${CMAKE_CURRENT_BINARY_DIR}/md_pico_blobs.S"
         "${MD_ROOT}/src/system/md_dos2_system.c"
         "${MD_ROOT}/src/host/msdos2_boot.c"
-        ${MD_RUNTIME_SOURCES}
-        "${MD_GENERATED}/dos2test_recomp.c")
+        ${MD_RUNTIME_BASE_SOURCES})
+
+    if(cache OR kernel_aot OR app_aot)
+        # dosrecomp AOT fallback contains a link-time reference to
+        # md_interp_run_cached_until(). AOT references therefore need the
+        # implementation even when the runtime cache itself is disabled.
+        target_sources(${target} PRIVATE "${MD_ROOT}/src/runtime/x86_block_cache.c")
+    endif()
+    if(app_aot)
+        target_sources(${target} PRIVATE "${MD_GENERATED}/dos2test_recomp.c")
+    endif()
     if(kernel_aot)
         target_sources(${target} PRIVATE "${MD_GENERATED}/msdos2_recomp.c")
     endif()
@@ -136,23 +141,36 @@ function(md_pico_dos target code_in_sram cache sys_khz kernel_aot jit)
             "${MD_ROOT}/src/runtime/jit_core.c"
             "${MD_ROOT}/src/decode/x86_decode.c")
     endif()
+
+    if(kernel_aot OR app_aot)
+        set(enable_aot 1)
+    else()
+        set(enable_aot 0)
+    endif()
+
     md_pico_common(${target} ${code_in_sram})
-    target_compile_definitions(${target} PRIVATE MICRODOS_PICO_CACHE=${cache}
-                               MICRODOS_PICO_SYS_KHZ=${sys_khz}
-                               MICRODOS_PICO_KERNEL_AOT=${kernel_aot}
-                               MICRODOS_PICO_JIT=${jit})
-    if(jit)
-        target_compile_definitions(${target} PRIVATE MICRODOS_ENABLE_JIT=1 MD_JIT_LEGACY_HOTNESS=0 MD_JIT_BLOCK_SLOTS=64 MD_JIT_HOT_THRESHOLD=2 MD_JIT_HOTNESS_SLOTS=64 MICRODOS_SYSTEM_JIT_CODE_BYTES=24576)
-    endif()
-    if(NOT jit)
-        target_compile_definitions(${target} PRIVATE MD_EXEC_PROFILE=0)
-    endif()
+    target_compile_definitions(${target} PRIVATE
+        MICRODOS_PICO_CACHE=${cache}
+        MICRODOS_PICO_SYS_KHZ=${sys_khz}
+        MICRODOS_PICO_KERNEL_AOT=${kernel_aot}
+        MICRODOS_PICO_DOS2TEST_AOT=${app_aot}
+        MICRODOS_PICO_JIT=${jit}
+        MICRODOS_SYSTEM_ENABLE_CACHE=${cache}
+        MICRODOS_SYSTEM_ENABLE_AOT=${enable_aot})
+
     if(jit)
         target_compile_definitions(${target} PRIVATE
-            MD_EXEC_ENABLE_PROMOTION=$<BOOL:${MD_EXEC_ENABLE_PROMOTION}>
-            MD_EXEC_ENABLE_DIRECT=$<BOOL:${MD_EXEC_ENABLE_DIRECT}>)
+            MICRODOS_ENABLE_JIT=1
+            MD_JIT_LEGACY_HOTNESS=0
+            MD_JIT_BLOCK_SLOTS=64
+            MD_JIT_HOT_THRESHOLD=2
+            MD_JIT_HOTNESS_SLOTS=64
+            MICRODOS_SYSTEM_JIT_CODE_BYTES=${jit_bytes}
+            MD_EXEC_ENABLE_PROMOTION=${promote}
+            MD_EXEC_ENABLE_DIRECT=${direct})
         pico_set_program_name(${target} "microDOS JIT")
     else()
+        target_compile_definitions(${target} PRIVATE MD_EXEC_PROFILE=0)
         pico_set_program_name(${target} "microDOS")
     endif()
 endfunction()
@@ -162,7 +180,8 @@ endfunction()
 function(md_pico_bench target code_in_sram sys_khz)
     add_executable(${target}
         "${CMAKE_CURRENT_LIST_DIR}/microdos_bench.c"
-        ${MD_RUNTIME_SOURCES}
+        ${MD_RUNTIME_BASE_SOURCES}
+        "${MD_ROOT}/src/runtime/x86_block_cache.c"
         "${MD_ROOT}/src/runtime/jit_core.c"
         "${MD_ROOT}/src/decode/x86_decode.c"
         "${MD_GENERATED}/loop_recomp.c"
@@ -173,38 +192,42 @@ function(md_pico_bench target code_in_sram sys_khz)
     pico_set_program_name(${target} "microDOS bench")
 endfunction()
 
-# M16 defaults come from the M15 measurements: code in SRAM (+33% on DOS),
-# block cache off (+60% on DOS). The other variants stay for comparison.
-# M18: 300 MHz is the default (soak-tested); the compiled kernel stays on.
-# M20.2: the proven M18 default stays unchanged. microdos_pico_jit is the profiling
-# full-DOS hybrid: static kernel/DOS2TEST AOT first, runtime JIT for COMMAND.COM
-# and arbitrary segments with no matching static image.
-md_pico_dos(microdos_pico          1 0 300000 1 0)   # AOT kernel reference
-md_pico_dos(microdos_pico_150      1 0 0      1 0)   # rated-clock comparison
-md_pico_dos(microdos_pico_nokernel 1 0 300000 0 0)   # canonical threaded kernel A/B
+# Explicit size/performance comparison images.
+md_pico_dos(microdos_pico          1 0 300000 1 1 0 0 0     0)
+md_pico_dos(microdos_pico_150      1 0      0 1 1 0 0 0     0)
 
-# M21 full-DOS convergence images.
-md_pico_dos(microdos_pico_region      1 1 300000 0 0) # decoded cache + resident C regions
+# Pure execution baselines.
+md_pico_dos(microdos_pico_nokernel 1 0 300000 0 0 0 0 0     0)
+target_compile_definitions(microdos_pico_nokernel PRIVATE
+    MD_X86_TRACK_WRITES=0
+    MICRODOS_TRANSLATION_SUPPORT=0)
+md_pico_dos(microdos_pico_region   1 1 300000 0 0 0 0 0     0)
 target_compile_definitions(microdos_pico_region PRIVATE MD_CACHE_PROFILE=0)
 
-md_pico_dos(microdos_pico_jitkernel   1 0 300000 0 1) # runtime JIT owns the DOS kernel
-target_compile_definitions(microdos_pico_jitkernel PRIVATE MD_JIT_PROFILE=0 MD_EXEC_PROFILE=0)
+# Minimal adaptive candidate: threaded by default, JIT only proven hot regions.
+md_pico_dos(microdos_pico_jitkernel 1 0 300000 0 0 1 1 0 12288)
+target_compile_definitions(microdos_pico_jitkernel PRIVATE
+    MD_JIT_PROFILE=0 MD_EXEC_PROFILE=0)
 
-md_pico_dos(microdos_pico_jit         1 0 300000 1 1) # AOT kernel + lean JIT applications
-target_compile_definitions(microdos_pico_jit PRIVATE MD_JIT_PROFILE=0 MD_EXEC_PROFILE=0)
+# AOT + adaptive region-JIT comparison.
+md_pico_dos(microdos_pico_jit 1 0 300000 1 1 1 1 0 24576)
+target_compile_definitions(microdos_pico_jit PRIVATE
+    MD_JIT_PROFILE=0 MD_EXEC_PROFILE=0)
 
-md_pico_dos(microdos_pico_jit_profile 1 0 300000 1 1) # same hybrid, full M20/M21 telemetry
-target_compile_definitions(microdos_pico_jit_profile PRIVATE MD_JIT_PROFILE=1 MD_EXEC_PROFILE=1)
+# Instrumented build of the same no-AOT adaptive policy.
+md_pico_dos(microdos_pico_jit_profile 1 0 300000 0 0 1 1 0 12288)
+target_compile_definitions(microdos_pico_jit_profile PRIVATE
+    MD_JIT_PROFILE=1 MD_EXEC_PROFILE=1)
 
 # M21.1 memory-placement A/B: identical firmwares (compiled kernel, no cache,
 # no JIT, 300 MHz, 128 KiB guest, DOS told it has 128 KiB, DOS2TEST not
 # precompiled so the SRAM variant fits) except for where guest RAM lives.
 # DOS2TEST's MIPS difference is the real PSRAM penalty for DOS.
-md_pico_dos(microdos_pico_g128_psram 1 0 300000 1 0)
-md_pico_dos(microdos_pico_g128_sram  1 0 300000 1 0)
+md_pico_dos(microdos_pico_g128_psram 1 0 300000 1 0 0 0 0 0)
+md_pico_dos(microdos_pico_g128_sram  1 0 300000 1 0 0 0 0 0)
 foreach(t microdos_pico_g128_psram microdos_pico_g128_sram)
     target_compile_definitions(${t} PRIVATE MD_X86_ADDRESS_BITS=17u
-        MD_MSDOS2_DEFAULT_MEMORY_PARAGRAPHS=0x2000u MICRODOS_PICO_DOS2TEST_AOT=0)
+        MD_MSDOS2_DEFAULT_MEMORY_PARAGRAPHS=0x2000u)
 endforeach()
 target_compile_definitions(microdos_pico_g128_psram PRIVATE MICRODOS_PICO_GUEST_SRAM=0)
 target_compile_definitions(microdos_pico_g128_sram  PRIVATE MICRODOS_PICO_GUEST_SRAM=1)

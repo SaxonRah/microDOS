@@ -31,6 +31,13 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Translation-only telemetry is absent from the minimal interpreter runtime. */
+#if MICRODOS_TRANSLATION_SUPPORT
+#define MD_RUNTIME_AOT_EVICTIONS(rt) ((rt)->aot_evictions)
+#else
+#define MD_RUNTIME_AOT_EVICTIONS(rt) 0u
+#endif
+
 /* Guest RAM spans the whole guest address space (1 MiB by default;
    M21.1 A/B firmware uses a 128 KiB space). MICRODOS_PICO_GUEST_SRAM places
    it in SRAM instead of PSRAM, for measuring the PSRAM penalty. */
@@ -55,7 +62,9 @@ static uint8_t __uninitialized_psram("md_disk") __attribute__((aligned(16)))
     g_disk[MD_DISK_BYTES];
 
 static MdDos2System g_sys;
+#if MICRODOS_PICO_CACHE
 static MdBlockCache g_cache;
+#endif
 #if MICRODOS_PICO_DOS2TEST_AOT
 static const MdAotProgram *const g_programs[] = { &md_recomp_dos2test_program };
 #define MD_PICO_PROGRAM_COUNT 1u
@@ -289,10 +298,17 @@ static void md_perf_snapshot(PicoPerf *p)
     p->jit_native_instructions = g_sys.jit_native_instructions;
     p->jit_fallback_instructions = g_sys.jit_fallback_instructions;
     p->bios_interpreted_instructions = g_sys.bios_interpreted_instructions;
+#if MICRODOS_PICO_CACHE
     p->cache_hits = g_cache.hits;
     p->cache_misses = g_cache.misses;
     p->cache_invalidations = g_cache.invalidations;
     p->cache_fallback = g_cache.fallback_instructions;
+#else
+    p->cache_hits = 0u;
+    p->cache_misses = 0u;
+    p->cache_invalidations = 0u;
+    p->cache_fallback = 0u;
+#endif
     p->idle_sleeps = g_con.idle_sleeps;
     p->at_us = time_us_64();
 #if MICRODOS_PICO_JIT
@@ -480,7 +496,7 @@ static void md_stats(uint64_t start_us)
            (unsigned long long)g_sys.attached_steps);
     md_say("[perf] aot: attaches=%lu enters=%lu evictions=%lu   disk writes %lu   CS:IP=%04X:%04X\n",
            (unsigned long)g_sys.aot_attaches,(unsigned long)g_sys.aot_enters,
-           (unsigned long)g_sys.runtime.aot_evictions,(unsigned long)g_disk_writes,
+           (unsigned long)MD_RUNTIME_AOT_EVICTIONS(&g_sys.runtime),(unsigned long)g_disk_writes,
            g_sys.runtime.cpu.cs,g_sys.runtime.cpu.ip);
 #if MICRODOS_PICO_JIT
     if (g_sys.jit) {
@@ -517,7 +533,11 @@ int main(void)
     memset(g_guest,0,MD_GUEST_BYTES); memcpy(g_disk,md_blob_disk,MD_DISK_BYTES);
     md_say("  disk:    360 KiB image copied from flash to PSRAM (writes are lost at reset)\n");
 
-    md_dos2_system_init(&g_sys,g_guest,MICRODOS_PICO_CACHE?&g_cache:NULL);
+#if MICRODOS_PICO_CACHE
+    md_dos2_system_init(&g_sys, g_guest, &g_cache);
+#else
+    md_dos2_system_init(&g_sys, g_guest, NULL);
+#endif
     g_sys.boot.console.write=con_write; g_sys.boot.console.peek=con_peek; g_sys.boot.console.read=con_read; g_sys.boot.console.flush=con_flush; g_sys.boot.console.user=&g_con;
     g_sys.boot.disk.read=disk_read; g_sys.boot.disk.write=disk_write; g_sys.boot.disk.user=NULL; g_sys.boot.disk.sector_size=512u; g_sys.boot.disk.sector_count=720u; g_sys.boot.disk.writable=true;
     g_sys.boot.clock_days=1162u; g_sys.boot.clock_hours=12u;

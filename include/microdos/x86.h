@@ -285,6 +285,13 @@ static inline int md_aot_chunks_ok(const MdAotGuard *guard, uint32_t first, uint
 #define MD_X86_PAGE_TRANSLATED 0x01u
 #define MD_X86_PAGE_AOT 0x02u
 
+/* Pure-interpreter targets have nothing translated to invalidate.  Compile
+   store tracking out entirely there: self-modifying code remains naturally
+   coherent because the next interpreter fetch reads guest memory directly. */
+#ifndef MD_X86_TRACK_WRITES
+#define MD_X86_TRACK_WRITES 1
+#endif
+
 static inline unsigned md_x86_page_flags(const MdX86 *cpu, uint32_t address)
 {
     if (cpu->code_page_generation == NULL || cpu->code_page_executable == NULL) return 0u;
@@ -442,6 +449,7 @@ static inline void md_x86_write16_tracked_inline(MdX86 *cpu, uint32_t a0, uint16
     if (f1 != 0u) md_x86_note_aot_write(cpu, a1);
 }
 
+#if MD_X86_TRACK_WRITES
 static inline void md_x86_write8_linear(MdX86 *cpu, uint32_t address, uint8_t value)
 {
     const uint32_t a0 = address & MD_X86_ADDRESS_MASK;
@@ -461,6 +469,20 @@ static inline void md_x86_write16_linear(MdX86 *cpu, uint32_t address, uint16_t 
     }
     md_x86_store16_tracked(cpu, a0, value);
 }
+#else
+static inline void md_x86_write8_linear(MdX86 *cpu, uint32_t address, uint8_t value)
+{
+    cpu->memory[address & MD_X86_ADDRESS_MASK] = value;
+}
+
+static inline void md_x86_write16_linear(MdX86 *cpu, uint32_t address, uint16_t value)
+{
+    const uint32_t a0 = address & MD_X86_ADDRESS_MASK;
+    const uint32_t a1 = (a0 + 1u) & MD_X86_ADDRESS_MASK;
+    cpu->memory[a0] = (uint8_t)value;
+    cpu->memory[a1] = (uint8_t)(value >> 8);
+}
+#endif
 
 static inline uint8_t md_x86_read8(const MdX86 *cpu, uint16_t segment, uint16_t offset)
 {

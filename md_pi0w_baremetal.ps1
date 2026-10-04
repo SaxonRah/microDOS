@@ -66,6 +66,7 @@ function Build-HostPrereqs {
     & $mkfat `
         --command (Join-Path $Root "third_party\msdos\v2.0\bin\COMMAND.COM") `
         --add (Join-Path $Root "tests\dos2\DOS2TEST.COM") DOS2TEST.COM `
+        --add (Join-Path $Root "tests\dos2\MDSTRESS.COM") MDSTRESS.COM `
         --output (Join-Path $Build "msdos2.img")
     if ($LASTEXITCODE -ne 0) { throw "FAT12 image build failed." }
 }

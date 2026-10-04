@@ -3,14 +3,17 @@
 
 #include <string.h>
 
+#if MICRODOS_TRANSLATION_SUPPORT
 static uint32_t md_next_epoch(uint32_t value)
 {
     ++value;
     return value != 0u ? value : 1u;
 }
+#endif
 
 static void md_runtime_bind_tracking(MdRuntime *runtime)
 {
+#if MICRODOS_TRANSLATION_SUPPORT
     runtime->cpu.code_page_generation = runtime->code_page_generation;
     runtime->cpu.code_page_executable = runtime->code_page_executable;
     runtime->cpu.code_write_epoch = &runtime->code_write_epoch;
@@ -20,45 +23,67 @@ static void md_runtime_bind_tracking(MdRuntime *runtime)
     memset(runtime->aot_live_bits, 0, sizeof(runtime->aot_live_bits));
     runtime->aot_live_pool_used = 0u;
     runtime->cpu.aot_live_bits = runtime->aot_live_bits;
-    /* High-water mark of used slots: 0 until something attaches, so writes
-       to executable pages (e.g. the DOS kernel stack) skip the guard walk. */
     runtime->cpu.aot_guard_count = 0u;
+#else
+    runtime->cpu.code_page_generation = NULL;
+    runtime->cpu.code_page_executable = NULL;
+    runtime->cpu.code_write_epoch = NULL;
+    runtime->cpu.aot_guards = NULL;
+    runtime->cpu.aot_guard_count = 0u;
+    runtime->cpu.aot_page_owner = NULL;
+    runtime->cpu.aot_live_bits = NULL;
+#endif
 }
+
 
 void md_runtime_reset(MdRuntime *runtime)
 {
     uint8_t *memory = runtime->cpu.memory;
     MdHooks hooks = runtime->hooks;
+#if MICRODOS_TRANSLATION_SUPPORT
     MdBlockCache *block_cache = runtime->block_cache;
     const uint32_t next_code_epoch = md_next_epoch(runtime->code_epoch);
+#endif
 
     memset(runtime, 0, sizeof(*runtime));
     runtime->cpu.memory = memory;
     md_x86_set_flags(&runtime->cpu, MD_X86_FLAG_ALWAYS1);
     runtime->hooks = hooks;
+#if MICRODOS_TRANSLATION_SUPPORT
     runtime->block_cache = block_cache;
     runtime->code_epoch = next_code_epoch;
     runtime->code_write_epoch = 1u;
+#endif
     md_runtime_bind_tracking(runtime);
 }
+
 
 void md_runtime_init(MdRuntime *runtime, uint8_t *memory, const MdHooks *hooks)
 {
     memset(runtime, 0, sizeof(*runtime));
     runtime->cpu.memory = memory;
     md_x86_set_flags(&runtime->cpu, MD_X86_FLAG_ALWAYS1);
+#if MICRODOS_TRANSLATION_SUPPORT
     runtime->code_epoch = 1u;
     runtime->code_write_epoch = 1u;
+#endif
     if (hooks != NULL) {
         runtime->hooks = *hooks;
     }
     md_runtime_bind_tracking(runtime);
 }
 
+
 void md_runtime_set_block_cache(MdRuntime *runtime, MdBlockCache *cache)
 {
+#if MICRODOS_TRANSLATION_SUPPORT
     runtime->block_cache = cache;
+#else
+    (void)runtime;
+    (void)cache;
+#endif
 }
+
 
 void md_runtime_load_raw(MdRuntime *runtime, const uint8_t *data, size_t size,
                          uint16_t segment, uint16_t offset)
@@ -114,13 +139,19 @@ void md_runtime_load_com(MdRuntime *runtime, const uint8_t *data, size_t size, u
 
 void md_runtime_invalidate_code(MdRuntime *runtime)
 {
+#if MICRODOS_TRANSLATION_SUPPORT
     runtime->code_epoch = md_next_epoch(runtime->code_epoch);
     runtime->code_write_epoch = md_next_epoch(runtime->code_write_epoch);
+#else
+    (void)runtime;
+#endif
 }
+
 
 void md_runtime_mark_code_range(MdRuntime *runtime, uint16_t segment,
                                 uint16_t offset, size_t size)
 {
+#if MICRODOS_TRANSLATION_SUPPORT
     uint32_t address = md_x86_linear(segment, offset);
 
     while (size != 0u) {
@@ -133,24 +164,45 @@ void md_runtime_mark_code_range(MdRuntime *runtime, uint16_t segment,
         address = (address + (uint32_t)chunk) & MD_X86_ADDRESS_MASK;
         size -= chunk;
     }
+#else
+    (void)runtime;
+    (void)segment;
+    (void)offset;
+    (void)size;
+#endif
 }
+
 
 int md_runtime_aot_find(const MdRuntime *runtime, const void *program, uint16_t segment)
 {
+#if MICRODOS_TRANSLATION_SUPPORT
     unsigned i;
     for (i = 0; i < MD_AOT_ATTACH_SLOTS; ++i) {
         const MdAotGuard *g = &runtime->aot_slots[i];
         if (g->in_use && g->program == program && g->segment == segment) return (int)i;
     }
     return -1;
+#else
+    (void)runtime;
+    (void)program;
+    (void)segment;
+    return -1;
+#endif
 }
+
 
 void md_runtime_aot_touch(MdRuntime *runtime, int slot)
 {
+#if MICRODOS_TRANSLATION_SUPPORT
     if (slot >= 0 && (unsigned)slot < MD_AOT_ATTACH_SLOTS) {
         runtime->aot_slots[slot].last_use = ++runtime->aot_use_clock;
     }
+#else
+    (void)runtime;
+    (void)slot;
+#endif
 }
+
 
 void md_x86_note_aot_slow(MdX86 *cpu, uint32_t a)
 {
@@ -170,6 +222,7 @@ static int md_guard_live_code_byte(const MdAotGuard *g, uint32_t a)
     return ((g->chunk_ok[chunk >> 3] >> (chunk & 7u)) & 1u) != 0u;
 }
 
+#if MICRODOS_TRANSLATION_SUPPORT
 static void md_set_live_bit(MdRuntime *rt, uint32_t a)
 {
     const unsigned page = (unsigned)(a >> MD_X86_CODE_PAGE_SHIFT);
@@ -186,7 +239,10 @@ static void md_set_live_bit(MdRuntime *rt, uint32_t a)
     }
     if (bm != g_md_live_all_ones) bm[(a & MD_X86_CODE_PAGE_MASK) >> 3] |= (uint8_t)(1u << (a & 7u));
 }
+#endif
 
+
+#if MICRODOS_TRANSLATION_SUPPORT
 static void md_runtime_aot_rebuild_live_bits(MdRuntime *runtime)
 {
     unsigned i;
@@ -204,6 +260,8 @@ static void md_runtime_aot_rebuild_live_bits(MdRuntime *runtime)
         }
     }
 }
+#endif
+
 
 /* A chunk of `guard` died: clear its live bits, then re-derive any bit that
    another live guard still needs (overlapping attachments stay correct). */
@@ -228,6 +286,7 @@ void md_x86_aot_chunk_died(MdX86 *cpu, const MdAotGuard *guard, uint32_t chunk)
 /* Rebuild the page -> guard owner map from the attachment slots. Called
    whenever an attachment is (re)armed; guards that die later keep their
    entries, which is safe (md_x86_aot_check_guard ignores dead guards). */
+#if MICRODOS_TRANSLATION_SUPPORT
 static void md_runtime_aot_rebuild_owner_map(MdRuntime *runtime)
 {
     unsigned i;
@@ -245,6 +304,8 @@ static void md_runtime_aot_rebuild_owner_map(MdRuntime *runtime)
         }
     }
 }
+#endif
+
 
 /* Out-of-line tracked stores (see x86.h). */
 void md_x86_store8_tracked(MdX86 *cpu, uint32_t a0, uint8_t value)
@@ -268,10 +329,8 @@ void md_x86_write_block(MdX86 *cpu, uint16_t segment, uint16_t offset,
         return;
     }
     memcpy(cpu->memory + lin, data, len);
+#if MICRODOS_TRANSLATION_SUPPORT
     {
-        /* Same observable bookkeeping as per-byte stores: each touched
-           executable page's generation (and the global epoch) changes, and
-           every compiled byte written goes through the exact AOT check. */
         uint32_t a = lin;
         const uint32_t end = lin + len;
         while (a < end) {
@@ -285,11 +344,14 @@ void md_x86_write_block(MdX86 *cpu, uint16_t segment, uint16_t offset,
             a = stop;
         }
     }
+#endif
 }
+
 
 MdAotGuard *md_runtime_aot_attach(MdRuntime *runtime, const void *program, uint16_t segment,
                                   uint32_t base, uint32_t size, const uint8_t *code_bits)
 {
+#if MICRODOS_TRANSLATION_SUPPORT
     int slot = md_runtime_aot_find(runtime, program, segment);
     MdAotGuard *g;
     unsigned i;
@@ -307,7 +369,7 @@ MdAotGuard *md_runtime_aot_attach(MdRuntime *runtime, const void *program, uint1
         ++runtime->aot_evictions;
     }
     g = &runtime->aot_slots[slot];
-    g->valid = 0u;                 /* never half-armed while fields change */
+    g->valid = 0u;
     g->base = base;
     g->size = size;
     g->code_bits = code_bits;
@@ -320,7 +382,7 @@ MdAotGuard *md_runtime_aot_attach(MdRuntime *runtime, const void *program, uint1
     g->live_chunks = 0u;
     if (size <= 0x10000u) {
         uint32_t c;
-        const uint32_t bytes_per_chunk_map = (1u << MD_AOT_CHUNK_SHIFT) / 8u;   /* 8 */
+        const uint32_t bytes_per_chunk_map = (1u << MD_AOT_CHUNK_SHIFT) / 8u;
         for (c = 0; c * (1u << MD_AOT_CHUNK_SHIFT) < size; ++c) {
             uint32_t k, any = 0u;
             for (k = 0; k < bytes_per_chunk_map; ++k) {
@@ -330,14 +392,13 @@ MdAotGuard *md_runtime_aot_attach(MdRuntime *runtime, const void *program, uint1
             if (any != 0u) ++g->live_chunks;
         }
     }
-    g->valid = size <= 0x10000u && g->live_chunks != 0u;   /* chunk map covers <= 64 KiB */
+    g->valid = size <= 0x10000u && g->live_chunks != 0u;
     if ((unsigned)slot + 1u > runtime->cpu.aot_guard_count) {
         runtime->cpu.aot_guard_count = (unsigned)slot + 1u;
     }
     md_runtime_aot_rebuild_owner_map(runtime);
     md_runtime_aot_rebuild_live_bits(runtime);
     if (g->valid) {
-        /* compiled image pages: AOT flag only (see MD_X86_PAGE_AOT) */
         uint32_t page = (base & MD_X86_ADDRESS_MASK) >> MD_X86_CODE_PAGE_SHIFT;
         const uint32_t last = ((base + size - 1u) & MD_X86_ADDRESS_MASK) >> MD_X86_CODE_PAGE_SHIFT;
         for (;; page = (page + 1u) % MD_X86_CODE_PAGE_COUNT) {
@@ -346,7 +407,17 @@ MdAotGuard *md_runtime_aot_attach(MdRuntime *runtime, const void *program, uint1
         }
     }
     return g;
+#else
+    (void)runtime;
+    (void)program;
+    (void)segment;
+    (void)base;
+    (void)size;
+    (void)code_bits;
+    return NULL;
+#endif
 }
+
 
 void md_runtime_request_exit(MdRuntime *runtime, uint8_t exit_code)
 {

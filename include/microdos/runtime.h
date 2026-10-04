@@ -7,6 +7,14 @@
 
 #include "microdos/x86.h"
 
+#ifndef MICRODOS_TRANSLATION_SUPPORT
+#define MICRODOS_TRANSLATION_SUPPORT 1
+#endif
+
+#ifndef MD_INTERP_OPCODE_PROFILE
+#define MD_INTERP_OPCODE_PROFILE 0
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -50,6 +58,7 @@ struct MdRuntime {
     uint8_t fault_opcode;
     uint8_t exit_code;
 
+#if MICRODOS_TRANSLATION_SUPPORT
     /* code_epoch invalidates an entire external cache after image/reset events.
        Page generations handle normal self-modifying-code invalidation. */
     uint32_t code_epoch;
@@ -73,6 +82,8 @@ struct MdRuntime {
     uint8_t aot_live_pool_used;
     uint32_t aot_use_clock;
     uint32_t aot_evictions;
+
+#endif
 };
 
 void md_runtime_init(MdRuntime *runtime, uint8_t *memory, const MdHooks *hooks);
@@ -133,6 +144,13 @@ void md_interp_muldiv(MdRuntime *runtime, uint8_t opcode, unsigned ext, uint16_t
 void md_interp_string_op(MdRuntime *runtime, uint8_t opcode, uint8_t segment_prefix,
                          uint8_t repeat_prefix);
 
+#if MD_INTERP_OPCODE_PROFILE
+const uint32_t *md_interp_opcode_profile_counts(void);
+const uint32_t *md_interp_unpref_modrm_profile_counts(void);
+const uint32_t *md_interp_prefix_profile_counts(void);
+const uint32_t *md_interp_hot_modrm_profile_counts(void);
+void md_interp_opcode_profile_reset(void);
+#endif
 MdStopReason md_interp_step(MdRuntime *runtime);
 MdStopReason md_interp_run(MdRuntime *runtime, uint64_t instruction_budget);
 /* Like md_interp_run(), but also returns (with MD_STOP_NONE) as soon as CS
