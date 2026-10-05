@@ -328,13 +328,14 @@ static inline void md_op_mov_sreg(MdRuntime *runtime, uint8_t opcode, uint16_t i
 {
     MdX86 *cpu = &runtime->cpu;
     const uint8_t modrm = md_fetch8(runtime);
-    const unsigned reg = (modrm >> 3) & 7u;
+    /*
+     * Original 8086 checks only the low two Sreg selector bits.  ModR/M.reg
+     * values 4..7 therefore alias 0..3.  MOV-to-CS remains rejected by
+     * md_set_sreg(), matching the architecturally unusable selector 1 form.
+     */
+    const unsigned reg = (modrm >> 3) & 3u;
     MdOperand rm = md_decode_rm(runtime, modrm, prefix);
 
-    if (reg >= 4u) {
-        md_fault(runtime, opcode, ip_before);
-        return;
-    }
     if (opcode == 0x8Cu) {
         md_operand_write16(runtime, rm, md_get_sreg(cpu, reg));
     } else if (!md_set_sreg(cpu, reg, md_operand_read16(runtime, rm))) {
@@ -659,13 +660,25 @@ static inline void md_op_shift(MdRuntime *runtime, uint8_t opcode,
     }
 }
 
+static inline void md_divide_error(MdRuntime *runtime)
+{
+    /*
+     * 8086 divide-by-zero and quotient overflow are Type-0 interrupts, not
+     * emulator stop conditions.  cpu->ip already points at the next guest
+     * instruction, which is the return IP pushed by original 8086 hardware.
+     */
+    (void)md_runtime_interrupt(runtime, 0u);
+}
+
 /* MUL/IMUL/DIV/IDIV (M18): one implementation shared by the interpreter's
-   group 3 and dosrecomp-generated code (md_interp_muldiv), so results, flags
-   and divide faults are identical in both. `ext` is ModR/M.reg (4..7). */
+   group 3 and dosrecomp-generated code (md_interp_muldiv).  DIV/IDIV
+   exceptions dispatch through real-mode vector 0. `ext` is ModR/M.reg (4..7). */
 static inline void md_muldiv_core(MdRuntime *runtime, uint8_t opcode, unsigned ext,
-                                  uint16_t operand, uint16_t ip_before)
+                                  uint16_t operand, uint16_t ip_before,
+                                  uint8_t repeat_prefix)
 {
     MdX86 *cpu = &runtime->cpu;
+    (void)ip_before;
     if (opcode == 0xF6u) {
         const uint8_t value = (uint8_t)operand;
         switch (ext) {
@@ -687,10 +700,10 @@ static inline void md_muldiv_core(MdRuntime *runtime, uint8_t opcode, unsigned e
                 const uint16_t dividend = cpu->r[MD_X86_AX];
                 uint16_t q;
                 uint16_t r;
-                if (value == 0u) { md_fault(runtime, opcode, ip_before); break; }
+                if (value == 0u) { md_divide_error(runtime); break; }
                 q = (uint16_t)(dividend / value);
                 r = (uint16_t)(dividend % value);
-                if (q > 0xFFu) { md_fault(runtime, opcode, ip_before); break; }
+                if (q > 0xFFu) { md_divide_error(runtime); break; }
                 md_x86_set_reg8(cpu, 0u, (uint8_t)q);
                 md_x86_set_reg8(cpu, 4u, (uint8_t)r);
                 break;
@@ -701,10 +714,11 @@ static inline void md_muldiv_core(MdRuntime *runtime, uint8_t opcode, unsigned e
                 const int32_t divisor = (value & 0x80u) != 0u ? (int32_t)value - 0x100L : (int32_t)value;
                 int32_t q;
                 int32_t r;
-                if (divisor == 0) { md_fault(runtime, opcode, ip_before); break; }
+                if (divisor == 0) { md_divide_error(runtime); break; }
                 q = dividend / divisor;
                 r = dividend % divisor;
-                if (q < -128 || q > 127) { md_fault(runtime, opcode, ip_before); break; }
+                if (q <= -128 || q > 127) { md_divide_error(runtime); break; }
+                if (repeat_prefix != 0u) q = -q; /* original-8086 REP/REPNE IDIV sign latch */
                 md_x86_set_reg8(cpu, 0u, (uint8_t)q);
                 md_x86_set_reg8(cpu, 4u, (uint8_t)r);
                 break;
@@ -733,10 +747,10 @@ static inline void md_muldiv_core(MdRuntime *runtime, uint8_t opcode, unsigned e
                 const uint32_t dividend = ((uint32_t)cpu->r[MD_X86_DX] << 16) | cpu->r[MD_X86_AX];
                 uint32_t q;
                 uint32_t r;
-                if (value == 0u) { md_fault(runtime, opcode, ip_before); break; }
+                if (value == 0u) { md_divide_error(runtime); break; }
                 q = dividend / value;
                 r = dividend % value;
-                if (q > 0xFFFFu) { md_fault(runtime, opcode, ip_before); break; }
+                if (q > 0xFFFFu) { md_divide_error(runtime); break; }
                 cpu->r[MD_X86_AX] = (uint16_t)q;
                 cpu->r[MD_X86_DX] = (uint16_t)r;
                 break;
@@ -748,10 +762,11 @@ static inline void md_muldiv_core(MdRuntime *runtime, uint8_t opcode, unsigned e
                 const int64_t divisor = (int64_t)(int16_t)value;
                 int64_t q;
                 int64_t r;
-                if (divisor == 0) { md_fault(runtime, opcode, ip_before); break; }
+                if (divisor == 0) { md_divide_error(runtime); break; }
                 q = dividend / divisor;
                 r = dividend % divisor;
-                if (q < -32768LL || q > 32767LL) { md_fault(runtime, opcode, ip_before); break; }
+                if (q <= -32768LL || q > 32767LL) { md_divide_error(runtime); break; }
+                if (repeat_prefix != 0u) q = -q; /* original-8086 REP/REPNE IDIV sign latch */
                 cpu->r[MD_X86_AX] = (uint16_t)q;
                 cpu->r[MD_X86_DX] = (uint16_t)r;
                 break;
@@ -772,14 +787,12 @@ static inline void md_op_group3(MdRuntime *runtime, uint8_t opcode,
     if (!width16) {
         const uint8_t value = md_operand_read8(runtime, rm);
         switch (ext) {
-            case 0u: {
+            case 0u:
+            case 1u: { /* /1 is an original-8086 alias of TEST */
                 const uint8_t imm = md_fetch8(runtime);
                 (void)md_x86_logic8(cpu, (uint8_t)(value & imm));
                 break;
             }
-            case 1u:
-                md_fault(runtime, opcode, ip_before);
-                break;
             case 2u:
                 md_operand_write8(runtime, rm, (uint8_t)~value);
                 break;
@@ -787,20 +800,18 @@ static inline void md_op_group3(MdRuntime *runtime, uint8_t opcode,
                 md_operand_write8(runtime, rm, md_x86_sub8(cpu, 0u, value));
                 break;
             default:   /* 4 MUL, 5 IMUL, 6 DIV, 7 IDIV */
-                md_muldiv_core(runtime, opcode, ext, value, ip_before);
+                md_muldiv_core(runtime, opcode, ext, value, ip_before, prefix != NULL ? prefix->repeat : 0u);
                 break;
         }
     } else {
         const uint16_t value = md_operand_read16(runtime, rm);
         switch (ext) {
-            case 0u: {
+            case 0u:
+            case 1u: { /* /1 is an original-8086 alias of TEST */
                 const uint16_t imm = md_fetch16(runtime);
                 (void)md_x86_logic16(cpu, (uint16_t)(value & imm));
                 break;
             }
-            case 1u:
-                md_fault(runtime, opcode, ip_before);
-                break;
             case 2u:
                 md_operand_write16(runtime, rm, (uint16_t)~value);
                 break;
@@ -808,7 +819,7 @@ static inline void md_op_group3(MdRuntime *runtime, uint8_t opcode,
                 md_operand_write16(runtime, rm, md_x86_sub16(cpu, 0u, value));
                 break;
             default:   /* 4 MUL, 5 IMUL, 6 DIV, 7 IDIV */
-                md_muldiv_core(runtime, opcode, ext, value, ip_before);
+                md_muldiv_core(runtime, opcode, ext, value, ip_before, prefix != NULL ? prefix->repeat : 0u);
                 break;
         }
     }
@@ -872,7 +883,13 @@ static inline void md_op_group45(MdRuntime *runtime, uint8_t opcode,
             break;
         }
         case 6u:
-            md_x86_push(cpu, md_operand_read16(runtime, rm));
+        case 7u: /* /7 is an original-8086 alias of PUSH r/m16 */
+            if (rm.is_register) {
+                /* Includes the original-8086 PUSH SP post-decrement value. */
+                md_x86_push_reg(cpu, rm.reg);
+            } else {
+                md_x86_push(cpu, md_operand_read16(runtime, rm));
+            }
             break;
         default:
             md_fault(runtime, opcode, ip_before);
@@ -893,7 +910,22 @@ static inline void md_op_daa(MdX86 *cpu)
         al = (uint8_t)(al + 6u);
         af = 1;
     }
-    if (old_al > 0x99u || old_cf) {
+    /*
+     * Original 8086 DAA/DAS upper-digit correction is not the later-x86
+     * old_AL>99h rule and not a simple >9Fh threshold either.
+     *
+     * Physical 8086 behavior for the invalid-BCD window 9Ah..9Fh depends on
+     * the incoming AF flag:
+     *   AF=0 -> perform the +/-60h upper correction
+     *   AF=1 -> do not perform the upper correction
+     *
+     * A0h..FFh always qualify, and incoming CF still forces correction.
+     * flags_raw still contains the incoming AF here; the local `af` result is
+     * committed only after this decision.
+     */
+    if (old_cf ||
+        old_al > 0x9Fu ||
+        (old_al > 0x99u && (cpu->flags_raw & MD_X86_FLAG_AF) == 0u)) {
         al = (uint8_t)(al + 0x60u);
         cf = 1;
     }
@@ -917,7 +949,22 @@ static inline void md_op_das(MdX86 *cpu)
         al = (uint8_t)(al - 6u);
         af = 1;
     }
-    if (old_al > 0x99u || old_cf) {
+    /*
+     * Original 8086 DAA/DAS upper-digit correction is not the later-x86
+     * old_AL>99h rule and not a simple >9Fh threshold either.
+     *
+     * Physical 8086 behavior for the invalid-BCD window 9Ah..9Fh depends on
+     * the incoming AF flag:
+     *   AF=0 -> perform the +/-60h upper correction
+     *   AF=1 -> do not perform the upper correction
+     *
+     * A0h..FFh always qualify, and incoming CF still forces correction.
+     * flags_raw still contains the incoming AF here; the local `af` result is
+     * committed only after this decision.
+     */
+    if (old_cf ||
+        old_al > 0x9Fu ||
+        (old_al > 0x99u && (cpu->flags_raw & MD_X86_FLAG_AF) == 0u)) {
         al = (uint8_t)(al - 0x60u);
         cf = 1;
     }
@@ -1011,7 +1058,8 @@ static inline int md_execute_opcode(MdRuntime *runtime, uint8_t opcode, uint16_t
         return 1;
     }
 
-    if (opcode >= 0x70u && opcode <= 0x7Fu) {
+    if (opcode >= 0x60u && opcode <= 0x7Fu) {
+        /* On the original 8086, bit 4 of the Jcc opcode is ignored. */
         const int8_t rel = (int8_t)md_fetch8(runtime);
         if (md_x86_condition(cpu, opcode & 0x0Fu)) cpu->ip = (uint16_t)(cpu->ip + rel);
         return 1;
@@ -1152,13 +1200,16 @@ static inline int md_execute_opcode(MdRuntime *runtime, uint8_t opcode, uint16_t
             md_op_string(runtime, opcode, prefix);
             break;
 
+        case 0xC0: /* original-8086 alias of C2 */
         case 0xC2: {
             const uint16_t adjust = md_fetch16(runtime);
             cpu->ip = md_x86_pop(cpu);
             cpu->r[MD_X86_SP] = (uint16_t)(cpu->r[MD_X86_SP] + adjust);
             break;
         }
+        case 0xC1: /* original-8086 alias of C3 */
         case 0xC3: cpu->ip = md_x86_pop(cpu); break;
+        case 0xC8: /* original-8086 alias of CA */
         case 0xCA: {
             const uint16_t adjust = md_fetch16(runtime);
             cpu->ip = md_x86_pop(cpu);
@@ -1166,6 +1217,7 @@ static inline int md_execute_opcode(MdRuntime *runtime, uint8_t opcode, uint16_t
             cpu->r[MD_X86_SP] = (uint16_t)(cpu->r[MD_X86_SP] + adjust);
             break;
         }
+        case 0xC9: /* original-8086 alias of CB */
         case 0xCB:
             cpu->ip = md_x86_pop(cpu);
             cpu->cs = md_x86_pop(cpu);
@@ -1189,7 +1241,7 @@ static inline int md_execute_opcode(MdRuntime *runtime, uint8_t opcode, uint16_t
         case 0xD4: { /* AAM imm8 */
             const uint8_t base = md_fetch8(runtime);
             const uint8_t al = md_x86_get_reg8(cpu, 0u);
-            if (base == 0u) { md_fault(runtime, opcode, ip_before); break; }
+            if (base == 0u) { md_x86_set_szp8(cpu, 0u); md_divide_error(runtime); break; }
             md_x86_set_reg8(cpu, 4u, (uint8_t)(al / base));
             md_x86_set_reg8(cpu, 0u, (uint8_t)(al % base));
             md_x86_set_szp8(cpu, md_x86_get_reg8(cpu, 0u));
@@ -1370,7 +1422,7 @@ static MdStopReason md_interp_run_threaded(MdRuntime *runtime, uint32_t instruct
         for (i = 0x58u; i <= 0x5Fu; ++i) dispatch[i] = &&op_pop_r16;
         dispatch[0x50] = &&op_push_ax;
         dispatch[0x58] = &&op_pop_ax;
-        for (i = 0x70u; i <= 0x7Fu; ++i) dispatch[i] = &&op_jcc8;
+        for (i = 0x60u; i <= 0x7Fu; ++i) dispatch[i] = &&op_jcc8;
         dispatch[0x74] = &&op_jz8;
         dispatch[0x75] = &&op_jnz8;
         /* M16: direct entries for the opcodes that dominate the MS-DOS 2.0
@@ -2000,7 +2052,7 @@ op_group3:
         if (opcode == 0xF6u && hot_modrm == 0xE3u) {
             const uint8_t bl = md_x86_get_reg8(&runtime->cpu, 3u);
             (void)md_fetch8(runtime);
-            md_muldiv_core(runtime, 0xF6u, 4u, bl, ip_before);
+            md_muldiv_core(runtime, 0xF6u, 4u, bl, ip_before, 0u);
             MD_NEXT();
         }
 
@@ -2107,7 +2159,7 @@ MdStopReason md_interp_run_until_cs_change(MdRuntime *runtime, uint64_t instruct
 void md_interp_muldiv(MdRuntime *runtime, uint8_t opcode, unsigned ext, uint16_t operand,
                       uint16_t ip_before)
 {
-    md_muldiv_core(runtime, opcode, ext, operand, ip_before);
+    md_muldiv_core(runtime, opcode, ext, operand, ip_before, 0u);
 }
 
 void md_interp_string_op(MdRuntime *runtime, uint8_t opcode, uint8_t segment_prefix,

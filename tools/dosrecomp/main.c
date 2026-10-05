@@ -525,7 +525,7 @@ static int dr_gen_to(DrProgram *p, uint16_t ip, DrOut *out)
         o(out, "    cpu->r[%u] = md_x86_pop(cpu);\n", op & 7u);
         return DR_GEN_CONTINUE;
     }
-    if (op >= 0x70u && op <= 0x7Fu) {           /* Jcc rel8 */
+    if (op >= 0x60u && op <= 0x7Fu) {           /* Jcc rel8; 60-6F alias on 8086 */
         TICK();
         o(out, "    if (MD_COND(0x%Xu)) {\n", op & 0x0Fu);
         dr_goto(out, p, d->target);
@@ -621,10 +621,11 @@ static int dr_gen_to(DrProgram *p, uint16_t ip, DrOut *out)
 
         case 0x8E:                               /* MOV sreg,r/m16 (not CS) */
             dr_modrm(p, at + 1u, seg_ov, &m);
-            if ((m.reg & 3u) == 1u || m.reg > 3u) return DR_GEN_HOLE;
+            /* Original 8086 ignores ModR/M.reg bit 2 for Sreg selection. */
+            if ((m.reg & 3u) == 1u) return DR_GEN_HOLE;
             TICK(); OPEN(); dr_ea(out, &m);
             dr_rd(a, sizeof(a), &m, 1);
-            o(out, "        %s = %s;\n", kSeg[m.reg], a);
+            o(out, "        %s = %s;\n", kSeg[m.reg & 3u], a);
             CLOSE();
             return DR_GEN_CONTINUE;
 
@@ -731,17 +732,17 @@ static int dr_gen_to(DrProgram *p, uint16_t ip, DrOut *out)
             o(out, "    (void)MD_ALU16(4u, 0xFFFFu, (uint16_t)(cpu->r[0] & 0x%04Xu));\n", dr_u16(p, at + 1u));
             return DR_GEN_CONTINUE;
 
-        case 0xC2: case 0xC3:                    /* RET near */
+        case 0xC0: case 0xC1: case 0xC2: case 0xC3: /* RET near; C0/C1 aliases */
             TICK();
             o(out, "    cpu->ip = md_x86_pop(cpu);\n");
-            if (op == 0xC2u) o(out, "    cpu->r[4] = (uint16_t)(cpu->r[4] + 0x%04Xu);\n", dr_u16(p, at + 1u));
+            if (op == 0xC0u || op == 0xC2u) o(out, "    cpu->r[4] = (uint16_t)(cpu->r[4] + 0x%04Xu);\n", dr_u16(p, at + 1u));
             o(out, "    goto md_dispatch;\n");
             return DR_GEN_TERMINAL;
 
-        case 0xCA: case 0xCB:                    /* RETF */
+        case 0xC8: case 0xC9: case 0xCA: case 0xCB: /* RETF; C8/C9 aliases */
             TICK();
             o(out, "    cpu->ip = md_x86_pop(cpu);\n    cpu->cs = md_x86_pop(cpu);\n");
-            if (op == 0xCAu) o(out, "    cpu->r[4] = (uint16_t)(cpu->r[4] + 0x%04Xu);\n", dr_u16(p, at + 1u));
+            if (op == 0xC8u || op == 0xCAu) o(out, "    cpu->r[4] = (uint16_t)(cpu->r[4] + 0x%04Xu);\n", dr_u16(p, at + 1u));
             o(out, "    goto md_dispatch;\n");
             return DR_GEN_TERMINAL;
 
@@ -857,7 +858,7 @@ static int dr_gen_to(DrProgram *p, uint16_t ip, DrOut *out)
         case 0xF6: case 0xF7: {                  /* group 3: TEST/NOT/NEG only */
             char v[256];
             dr_modrm(p, at + 1u, seg_ov, &m);
-            if (m.reg == 1u) return DR_GEN_HOLE;             /* undefined on 8086 */
+            if (m.reg >= 6u) return DR_GEN_HOLE;             /* DIV/IDIV may redirect through Type-0 */
             if (m.reg >= 4u) {                               /* M18: MUL/IMUL/DIV/IDIV */
                 TICK(); OPEN(); dr_ea(out, &m);
                 dr_rd(a, sizeof(a), &m, w16);
@@ -869,7 +870,7 @@ static int dr_gen_to(DrProgram *p, uint16_t ip, DrOut *out)
             }
             TICK(); OPEN(); dr_ea(out, &m);
             dr_rd(a, sizeof(a), &m, w16);
-            if (m.reg == 0u) {
+            if (m.reg == 0u || m.reg == 1u) { /* /1 aliases TEST on original 8086 */
                 if (w16) o(out, "        (void)MD_ALU16(4u, 0xFFFFu, (uint16_t)(%s & 0x%04Xu));\n", a, dr_u16(p, at + 1u + m.length));
                 else o(out, "        (void)MD_ALU8(4u, 0xFFu, (uint8_t)(%s & 0x%02Xu));\n", a, dr_u8(p, at + 1u + m.length));
             } else {
@@ -917,11 +918,17 @@ static int dr_gen_to(DrProgram *p, uint16_t ip, DrOut *out)
                 o(out, "    goto md_dispatch;\n");
                 return DR_GEN_TERMINAL;
             }
-            if (m.reg == 6u) {                   /* PUSH r/m16 */
-                TICK(); OPEN(); dr_ea(out, &m);
-                dr_rd(a, sizeof(a), &m, 1);
-                o(out, "        MD_PUSH(%s);\n        MD_AOT_WCHK_HERE();\n", a);
-                CLOSE();
+            if (m.reg == 6u || m.reg == 7u) {    /* PUSH r/m16; /7 is 8086 alias */
+                TICK();
+                if (m.is_reg) {
+                    /* MD_PUSHR preserves the original-8086 PUSH SP quirk. */
+                    o(out, "    MD_PUSHR(%uu);\n    MD_AOT_WCHK_HERE();\n", m.rm);
+                } else {
+                    OPEN(); dr_ea(out, &m);
+                    dr_rd(a, sizeof(a), &m, 1);
+                    o(out, "        MD_PUSH(%s);\n        MD_AOT_WCHK_HERE();\n", a);
+                    CLOSE();
+                }
                 return DR_GEN_CONTINUE;
             }
             return DR_GEN_HOLE;

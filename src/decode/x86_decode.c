@@ -142,30 +142,16 @@ bool md_decode_8086(const uint8_t *image,
         goto done;
     }
 
-    /* 80186+ encodings. Decode their length so a suspicious path can still be
-       inspected, but flag them as not valid 8086 instructions. */
+    /*
+     * Original 8086/8088: 60h..6Fh alias 70h..7Fh.  The 80186 later reused
+     * these byte values for PUSHA/POPA/BOUND/IMUL/PUSH/INS/OUTS.
+     */
     if (opcode >= 0x60u && opcode <= 0x6Fu) {
-        out->valid_8086 = 0u;
-        switch (opcode) {
-            case 0x62u:
-            case 0x63u:
-                if (!md_take_modrm(&c, out)) return false;
-                break;
-            case 0x68u:
-                if (!md_take(&c, 2u)) return false;
-                break;
-            case 0x69u:
-                if (!md_take_modrm_imm(&c, out, 2u)) return false;
-                break;
-            case 0x6Au:
-                if (!md_take(&c, 1u)) return false;
-                break;
-            case 0x6Bu:
-                if (!md_take_modrm_imm(&c, out, 1u)) return false;
-                break;
-            default:
-                break;
-        }
+        int8_t rel;
+        if (c.pos >= c.size) return false;
+        rel = (int8_t)c.image[c.pos++];
+        out->flow = MD_DECODE_FLOW_CONDITIONAL;
+        out->target = (uint16_t)((uint16_t)(image_base + (uint16_t)c.pos) + rel);
         goto done;
     }
 
@@ -220,9 +206,13 @@ bool md_decode_8086(const uint8_t *image,
         goto done;
     }
 
-    if (opcode == 0xC0u || opcode == 0xC1u) {
-        out->valid_8086 = 0u;
-        if (!md_take_modrm_imm(&c, out, 1u)) return false;
+    if (opcode == 0xC0u) { /* original-8086 alias of RET imm16 (C2) */
+        if (!md_take(&c, 2u)) return false;
+        out->flow = MD_DECODE_FLOW_RETURN;
+        goto done;
+    }
+    if (opcode == 0xC1u) { /* original-8086 alias of RET (C3) */
+        out->flow = MD_DECODE_FLOW_RETURN;
         goto done;
     }
     if (opcode == 0xC2u || opcode == 0xCAu) {
@@ -246,13 +236,13 @@ bool md_decode_8086(const uint8_t *image,
         if (!md_take_modrm_imm(&c, out, 2u)) return false;
         goto done;
     }
-    if (opcode == 0xC8u) {
-        out->valid_8086 = 0u;
-        if (!md_take(&c, 3u)) return false;
+    if (opcode == 0xC8u) { /* original-8086 alias of RETF imm16 (CA) */
+        if (!md_take(&c, 2u)) return false;
+        out->flow = MD_DECODE_FLOW_RETURN;
         goto done;
     }
-    if (opcode == 0xC9u) {
-        out->valid_8086 = 0u;
+    if (opcode == 0xC9u) { /* original-8086 alias of RETF (CB) */
+        out->flow = MD_DECODE_FLOW_RETURN;
         goto done;
     }
     if (opcode == 0xCCu || opcode == 0xCEu) goto done;
@@ -376,12 +366,12 @@ static int md_base_interp_opcode(uint8_t opcode)
     if (opcode <= 0x3Bu && (opcode & 0x04u) == 0u) return 1;
     if (opcode <= 0x3Du && (opcode & 0x06u) == 0x04u) return 1;
 
-    if (opcode >= 0x70u && opcode <= 0x7Fu) return 1;
+    if (opcode >= 0x60u && opcode <= 0x7Fu) return 1;
     if (opcode >= 0x80u && opcode <= 0x8Fu) return 1;
     if (opcode >= 0x90u && opcode <= 0x9Fu) return 1;
     if (opcode >= 0xA0u && opcode <= 0xA9u) return 1;
     if (opcode >= 0xAAu && opcode <= 0xAFu) return 1;
-    if (opcode >= 0xC2u && opcode <= 0xC7u) return 1;
+    if (opcode >= 0xC0u && opcode <= 0xC9u) return 1;
     if (opcode >= 0xCAu && opcode <= 0xCFu) return 1;
     if (opcode >= 0xD0u && opcode <= 0xD7u) return 1;
     if (opcode >= 0xE0u && opcode <= 0xEFu) return 1;
@@ -406,16 +396,15 @@ bool md_decode_interp_supported(const MdDecodedInstruction *inst)
 
     ext = (inst->modrm >> 3) & 7u;
     mod = inst->modrm >> 6;
-    if ((inst->opcode == 0x8Cu || inst->opcode == 0x8Eu) && ext >= 4u) return false;
-    if (inst->opcode == 0x8Eu && ext == 1u) return false; /* MOV CS,r/m16 */
+
+    if (inst->opcode == 0x8Eu && (ext & 3u) == 1u) return false; /* MOV CS,r/m16 and high aliases */
     if (inst->opcode == 0x8Du && mod == 3u) return false; /* LEA requires memory EA. */
     if (inst->opcode == 0x8Fu && ext != 0u) return false;
     if ((inst->opcode == 0xC4u || inst->opcode == 0xC5u) && mod == 3u) return false;
     if ((inst->opcode == 0xC6u || inst->opcode == 0xC7u) && ext != 0u) return false;
-    if ((inst->opcode == 0xF6u || inst->opcode == 0xF7u) && ext == 1u) return false;
+
     if (inst->opcode == 0xFEu && ext > 1u) return false;
     if (inst->opcode == 0xFFu) {
-        if (ext == 7u) return false;
         if ((ext == 3u || ext == 5u) && mod == 3u) return false;
     }
     return true;

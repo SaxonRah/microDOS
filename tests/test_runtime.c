@@ -834,34 +834,51 @@ static void test_aot_store_completes_instruction(uint8_t *memory)
     CHECK(rt.instructions == 3u);
 }
 
-/* M18: MUL/DIV compiled through the shared interpreter core; the divide
-   fault must stop both engines identically. */
+/* M18 + 8086 silicon conformance: DIV-by-zero is real-mode Type-0.
+   Interpreter and generated/AOT paths must enter the same handler and build
+   the same original-8086 return frame. */
 static void test_aot_muldiv_fault(uint8_t *memory)
 {
     static const uint8_t kProg[] = {
         0xB8,0xD2,0x04, 0xB3,0x0A, 0xF6,0xE3, 0xB9,0x07,0x00, 0x31,0xD2,
         0xF7,0xF1, 0x30,0xDB, 0xF6,0xF3, 0xF4
     };
+    static uint8_t mem_b[MD_X86_ADDRESS_SPACE];
+    const uint16_t handler_segment = 0x4000u;
+    const uint16_t handler_offset = 0x0100u;
     MdRuntime a, b;
     MdHooks hooks = {0};
 
     memset(memory, 0, MD_X86_ADDRESS_SPACE);
     md_runtime_init(&a, memory, &hooks);
     md_runtime_load_com(&a, kProg, sizeof(kProg), 0x1000u);
-    CHECK(md_interp_run(&a, 100u) == MD_STOP_FAULT);
+    md_x86_write16_linear(&a.cpu, 0u, handler_offset);
+    md_x86_write16_linear(&a.cpu, 2u, handler_segment);
+    md_x86_write8(&a.cpu, handler_segment, handler_offset, 0xF4u);
+    CHECK(md_interp_run(&a, 100u) == MD_STOP_HALT);
 
-    {
-        static uint8_t mem_b[MD_X86_ADDRESS_SPACE];
-        md_runtime_init(&b, mem_b, &hooks);
-        CHECK(md_recomp_divfault(&b, 0x1000u, 100u) == MD_STOP_FAULT);
-        CHECK(b.aot_instructions > 0u);
-    }
+    memset(mem_b, 0, sizeof(mem_b));
+    md_runtime_init(&b, mem_b, &hooks);
+    md_x86_write16_linear(&b.cpu, 0u, handler_offset);
+    md_x86_write16_linear(&b.cpu, 2u, handler_segment);
+    md_x86_write8(&b.cpu, handler_segment, handler_offset, 0xF4u);
+    CHECK(md_recomp_divfault(&b, 0x1000u, 100u) == MD_STOP_HALT);
+    CHECK(b.aot_instructions > 0u);
+
     CHECK(a.instructions == b.instructions);
-    CHECK(a.instructions == 8u);
-    CHECK(a.cpu.ip == b.cpu.ip);
-    CHECK(a.fault_linear == b.fault_linear);
-    CHECK(a.fault_opcode == b.fault_opcode);
-    /* MUL BL multiplies AL only: 0xD2 * 10 = 2100; 2100 / 7 = 300 r 0 */
+    CHECK(a.instructions == 9u);
+    CHECK(a.cpu.cs == b.cpu.cs && a.cpu.cs == handler_segment);
+    CHECK(a.cpu.ip == b.cpu.ip && a.cpu.ip == (uint16_t)(handler_offset + 1u));
+    CHECK(a.cpu.ss == b.cpu.ss && a.cpu.ss == 0x1000u);
+    CHECK(a.cpu.r[MD_X86_SP] == b.cpu.r[MD_X86_SP] && a.cpu.r[MD_X86_SP] == 0xFFF8u);
+
+    CHECK(md_x86_read16(&a.cpu, 0x1000u, 0xFFF8u) == 0x0112u);
+    CHECK(md_x86_read16(&b.cpu, 0x1000u, 0xFFF8u) == 0x0112u);
+    CHECK(md_x86_read16(&a.cpu, 0x1000u, 0xFFFAu) == 0x1000u);
+    CHECK(md_x86_read16(&b.cpu, 0x1000u, 0xFFFAu) == 0x1000u);
+    CHECK(md_x86_read16(&a.cpu, 0x1000u, 0xFFFCu) ==
+          md_x86_read16(&b.cpu, 0x1000u, 0xFFFCu));
+
     CHECK(a.cpu.r[MD_X86_AX] == b.cpu.r[MD_X86_AX] && a.cpu.r[MD_X86_AX] == 300u);
     CHECK(a.cpu.r[MD_X86_DX] == b.cpu.r[MD_X86_DX] && a.cpu.r[MD_X86_DX] == 0u);
     CHECK(md_x86_flags(&a.cpu) == md_x86_flags(&b.cpu));

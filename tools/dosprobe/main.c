@@ -268,7 +268,7 @@ static const char *dp_opcode_name(uint8_t op)
     if (op >= 0x28u && op <= 0x2Bu) return "SUB r/m,reg";
     if (op >= 0x30u && op <= 0x33u) return "XOR r/m,reg";
     if (op >= 0x38u && op <= 0x3Bu) return "CMP r/m,reg";
-    if (op >= 0x70u && op <= 0x7Fu) return "Jcc rel8";
+    if (op >= 0x60u && op <= 0x7Fu) return "Jcc rel8";
     if (op == 0x80u || op == 0x81u || op == 0x82u || op == 0x83u) return "ALU r/m,imm";
     if (op >= 0x88u && op <= 0x8Bu) return "MOV r/m,reg";
     if (op == 0x8Cu) return "MOV r/m,Sreg";
@@ -514,7 +514,7 @@ static int dp_selftest(void)
     static const uint8_t grp3_neg[] = {0xF7u, 0xD8u};
     static const uint8_t shift_cl[] = {0xD3u, 0xE8u};
     static const uint8_t les_mem[] = {0xC4u, 0x06u, 0x34u, 0x12u};
-    static const uint8_t push_186[] = {0x68u, 0x34u, 0x12u};
+    static const uint8_t jcc_alias_68[] = {0x68u, 0x34u};
     static uint8_t flow_image[] = {
         0xE9u, 0x03u, 0x00u,       /* jmp 0006 */
         0xDEu, 0xADu, 0xBEu,       /* unreachable data */
@@ -555,8 +555,10 @@ static int dp_selftest(void)
           md_decode_interp_supported(&inst) && !md_decode_aot_supported(&inst);
     ok &= md_decode_8086(les_mem, sizeof(les_mem), 0x0100u, 0x0100u, &inst) &&
           md_decode_interp_supported(&inst) && !md_decode_aot_supported(&inst);
-    ok &= dp_expect_decode(push_186, sizeof(push_186), 0x0100u, 0x0100u, 3u, 0x68u,
-                           MD_DECODE_FLOW_FALLTHROUGH, 0);
+    ok &= dp_expect_decode(jcc_alias_68, sizeof(jcc_alias_68), 0x0100u, 0x0100u, 2u, 0x68u,
+                           MD_DECODE_FLOW_CONDITIONAL, 1);
+    ok &= md_decode_8086(jcc_alias_68, sizeof(jcc_alias_68), 0x0100u, 0x0100u, &inst) &&
+          inst.target == 0x0136u && md_decode_interp_supported(&inst);
 
     {
         DpScan scan;

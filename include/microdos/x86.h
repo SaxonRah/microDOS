@@ -491,7 +491,19 @@ static inline uint8_t md_x86_read8(const MdX86 *cpu, uint16_t segment, uint16_t 
 
 static inline uint16_t md_x86_read16(const MdX86 *cpu, uint16_t segment, uint16_t offset)
 {
-    return md_x86_read16_linear(cpu, md_x86_linear(segment, offset));
+    const uint32_t a0 = md_x86_linear(segment, offset);
+
+    /*
+     * Original 8086 segmented word accesses wrap the 16-bit offset between
+     * the low and high byte.  This differs from incrementing the already
+     * formed 20-bit linear address when offset == FFFFh.
+     */
+    if (offset != 0xFFFFu)
+        return md_x86_read16_linear(cpu, a0);
+
+    return (uint16_t)(
+        (uint16_t)md_x86_read8_linear(cpu, a0) |
+        ((uint16_t)md_x86_read8_linear(cpu, md_x86_linear(segment, 0u)) << 8));
 }
 
 static inline void md_x86_write8(MdX86 *cpu, uint16_t segment, uint16_t offset, uint8_t value)
@@ -501,7 +513,16 @@ static inline void md_x86_write8(MdX86 *cpu, uint16_t segment, uint16_t offset, 
 
 static inline void md_x86_write16(MdX86 *cpu, uint16_t segment, uint16_t offset, uint16_t value)
 {
-    md_x86_write16_linear(cpu, md_x86_linear(segment, offset), value);
+    const uint32_t a0 = md_x86_linear(segment, offset);
+
+    if (offset != 0xFFFFu) {
+        md_x86_write16_linear(cpu, a0, value);
+        return;
+    }
+
+    /* See md_x86_read16(): high byte is segment:0000, not linear a0+1. */
+    md_x86_write8_linear(cpu, a0, (uint8_t)value);
+    md_x86_write8_linear(cpu, md_x86_linear(segment, 0u), (uint8_t)(value >> 8));
 }
 
 static inline uint8_t md_x86_get_reg8(const MdX86 *cpu, unsigned reg)
