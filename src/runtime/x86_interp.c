@@ -2256,8 +2256,12 @@ op_group3:
         }
     }
 
+    // md_op_group3(runtime, opcode, ip_before, NULL);
+    // MD_NEXT();
+    /* DIV/IDIV can raise INT 0, which changes CS: refresh the cached code
+    base (and honour watch_cs) exactly like op_generic does. */
     md_op_group3(runtime, opcode, ip_before, NULL);
-    MD_NEXT();
+    MD_NEXT_CS();
 
 op_generic:
     (void)md_execute_opcode(runtime, opcode, ip_before, NULL);
