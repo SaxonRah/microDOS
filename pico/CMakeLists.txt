@@ -293,16 +293,3 @@ pico_set_program_name(microdos_nativev2_usbsmoke "microDOS NV2 USB smoke")
 
 md_pico_bench(microdos_bench     1 300000)
 md_pico_bench(microdos_bench_150 1 0)
-
-# --- microDOS tracked Native-v2 benchmark target v1 ---
-md_pico_dos(microdos_pico_nativev2_track 1 0 300000 0 0 0 0 0 0)
-target_sources(microdos_pico_nativev2_track PRIVATE
-    "${MD_ROOT}/src/runtime/native_v2.c"
-    "${MD_ROOT}/src/runtime/native_v2_runtime.c"
-    "${MD_ROOT}/src/decode/x86_decode.c")
-target_compile_definitions(microdos_pico_nativev2_track PRIVATE
-    MICRODOS_ENABLE_NATIVE_V2=1
-    MICRODOS_PICO_NATIVE_V2=1)
-pico_set_program_name(microdos_pico_nativev2_track
-    "microDOS Native v2 tracked")
-# --- end microDOS tracked Native-v2 benchmark target v1 ---
