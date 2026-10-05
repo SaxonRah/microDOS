@@ -2068,6 +2068,18 @@ op_mov_rm:
             MD_NEXT();
         }
 
+        /*
+         * M24.5: hot register-only ModR/M templates.
+         *
+         * 88 D8 = MOV AL,BL. This is one of the hottest remaining
+         * unprefixed MOV forms in DOS2TEST and needs no EA decode.
+         */
+        if (opcode == 0x88u && hot_modrm == 0xD8u) {
+            (void)MD_CODE_FETCH8();
+            md_x86_set_reg8(opcode_cpu, 0u, md_x86_get_reg8(opcode_cpu, 3u));
+            MD_NEXT();
+        }
+
         if (opcode == 0x88u &&
             (hot_modrm == 0x1Eu || hot_modrm == 0x0Eu || hot_modrm == 0x2Eu)) {
             uint16_t disp;
@@ -2222,6 +2234,14 @@ op_group3:
             const uint8_t bl = md_x86_get_reg8(&runtime->cpu, 3u);
             (void)MD_CODE_FETCH8();
             md_muldiv_core(runtime, 0xF6u, 4u, bl, ip_before, 0u);
+            MD_NEXT();
+        }
+
+        /* F6 E4 = MUL AH: same proven MUL core, skipping generic decode. */
+        if (opcode == 0xF6u && hot_modrm == 0xE4u) {
+            const uint8_t ah = md_x86_get_reg8(opcode_cpu, 4u);
+            (void)MD_CODE_FETCH8();
+            md_muldiv_core(runtime, 0xF6u, 4u, ah, ip_before, 0u);
             MD_NEXT();
         }
 
