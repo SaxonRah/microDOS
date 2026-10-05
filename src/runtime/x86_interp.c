@@ -1425,6 +1425,7 @@ static MdStopReason md_interp_run_threaded(MdRuntime *runtime, uint32_t instruct
         for (i = 0x60u; i <= 0x7Fu; ++i) dispatch[i] = &&op_jcc8;
         dispatch[0x74] = &&op_jz8;
         dispatch[0x75] = &&op_jnz8;
+        dispatch[0x3C] = &&op_cmp_al_imm8;
         /* M16: direct entries for the opcodes that dominate the MS-DOS 2.0
            kernel/COMMAND.COM mix (profiled on DOS2TEST). They call the same
            md_op_* semantics as md_execute_opcode, skipping its range-test
@@ -1490,36 +1491,125 @@ static MdStopReason md_interp_run_threaded(MdRuntime *runtime, uint32_t instruct
 
     MD_NEXT();
 
+/*
+ * M24.2: threaded stack locality.
+ *
+ * The threaded interpreter already keeps stack_ss_base synchronized with SS.
+ * Use it for the common stack word access instead of reforming SS:SP through
+ * md_x86_push()/md_x86_pop() on every CALL/RET/PUSH/POP.
+ *
+ * Tracked builds retain exactly the existing SMC/AOT rule: direct writes are
+ * used only when every touched page is non-executable; otherwise the shared
+ * tracked-store helper performs generation/AOT invalidation.
+ *
+ * SP=FFFFh remains on the generic segmented-word path because original 8086
+ * word semantics fetch/store the high byte at SS:0000, not linear a0+1.
+ */
 #if defined(MD_X86_TRACK_WRITES) && !MD_X86_TRACK_WRITES
 #define MD_STACK_PUSH16_FAST(value_) do { \
         const uint16_t md_stack_value_ = (uint16_t)(value_); \
         const uint16_t md_stack_sp_ = (uint16_t)(opcode_cpu->r[MD_X86_SP] - 2u); \
         const uint32_t md_stack_a0_ = (stack_ss_base + (uint32_t)md_stack_sp_) & MD_X86_ADDRESS_MASK; \
         opcode_cpu->r[MD_X86_SP] = md_stack_sp_; \
-        opcode_memory[md_stack_a0_] = (uint8_t)md_stack_value_; \
-        opcode_memory[(md_stack_a0_ + 1u) & MD_X86_ADDRESS_MASK] = (uint8_t)(md_stack_value_ >> 8); \
+        if (md_stack_sp_ != 0xFFFFu) { \
+            opcode_memory[md_stack_a0_] = (uint8_t)md_stack_value_; \
+            opcode_memory[(md_stack_a0_ + 1u) & MD_X86_ADDRESS_MASK] = \
+                (uint8_t)(md_stack_value_ >> 8); \
+        } else { \
+            md_x86_write16(opcode_cpu, opcode_cpu->ss, md_stack_sp_, md_stack_value_); \
+        } \
     } while (0)
 #define MD_STACK_POP16_FAST(dst_) do { \
         const uint16_t md_stack_sp_ = opcode_cpu->r[MD_X86_SP]; \
-        const uint32_t md_stack_a0_ = (stack_ss_base + (uint32_t)md_stack_sp_) & MD_X86_ADDRESS_MASK; \
-        (dst_) = (uint16_t)((uint16_t)opcode_memory[md_stack_a0_] | \
-                 ((uint16_t)opcode_memory[(md_stack_a0_ + 1u) & MD_X86_ADDRESS_MASK] << 8)); \
+        if (md_stack_sp_ != 0xFFFFu) { \
+            const uint32_t md_stack_a0_ = \
+                (stack_ss_base + (uint32_t)md_stack_sp_) & MD_X86_ADDRESS_MASK; \
+            (dst_) = (uint16_t)((uint16_t)opcode_memory[md_stack_a0_] | \
+                     ((uint16_t)opcode_memory[(md_stack_a0_ + 1u) & \
+                                              MD_X86_ADDRESS_MASK] << 8)); \
+        } else { \
+            (dst_) = md_x86_read16(opcode_cpu, opcode_cpu->ss, md_stack_sp_); \
+        } \
         opcode_cpu->r[MD_X86_SP] = (uint16_t)(md_stack_sp_ + 2u); \
     } while (0)
 #else
-#define MD_STACK_PUSH16_FAST(value_) \
-    md_x86_push(opcode_cpu, (uint16_t)(value_))
+#define MD_STACK_PUSH16_FAST(value_) do { \
+        const uint16_t md_stack_value_ = (uint16_t)(value_); \
+        const uint16_t md_stack_sp_ = (uint16_t)(opcode_cpu->r[MD_X86_SP] - 2u); \
+        const uint32_t md_stack_a0_ = \
+            (stack_ss_base + (uint32_t)md_stack_sp_) & MD_X86_ADDRESS_MASK; \
+        opcode_cpu->r[MD_X86_SP] = md_stack_sp_; \
+        if (md_stack_sp_ != 0xFFFFu) { \
+            const uint32_t md_stack_a1_ = \
+                (md_stack_a0_ + 1u) & MD_X86_ADDRESS_MASK; \
+            if (!md_x86_page_executable(opcode_cpu, md_stack_a0_) && \
+                ((md_stack_a0_ & MD_X86_CODE_PAGE_MASK) != MD_X86_CODE_PAGE_MASK || \
+                 !md_x86_page_executable(opcode_cpu, md_stack_a1_))) { \
+                opcode_memory[md_stack_a0_] = (uint8_t)md_stack_value_; \
+                opcode_memory[md_stack_a1_] = (uint8_t)(md_stack_value_ >> 8); \
+            } else { \
+                md_x86_store16_tracked(opcode_cpu, md_stack_a0_, md_stack_value_); \
+            } \
+        } else { \
+            md_x86_write16(opcode_cpu, opcode_cpu->ss, md_stack_sp_, md_stack_value_); \
+        } \
+    } while (0)
 #define MD_STACK_POP16_FAST(dst_) do { \
-        (dst_) = md_x86_pop(opcode_cpu); \
+        const uint16_t md_stack_sp_ = opcode_cpu->r[MD_X86_SP]; \
+        if (md_stack_sp_ != 0xFFFFu) { \
+            const uint32_t md_stack_a0_ = \
+                (stack_ss_base + (uint32_t)md_stack_sp_) & MD_X86_ADDRESS_MASK; \
+            (dst_) = (uint16_t)((uint16_t)opcode_memory[md_stack_a0_] | \
+                     ((uint16_t)opcode_memory[(md_stack_a0_ + 1u) & \
+                                              MD_X86_ADDRESS_MASK] << 8)); \
+        } else { \
+            (dst_) = md_x86_read16(opcode_cpu, opcode_cpu->ss, md_stack_sp_); \
+        } \
+        opcode_cpu->r[MD_X86_SP] = (uint16_t)(md_stack_sp_ + 2u); \
     } while (0)
 #endif
 
+/*
+ * M24.1: threaded code-fetch locality.
+ *
+ * MD_NEXT already fetches opcodes through the cached CS linear base.  Hot
+ * handlers used to fall back to md_fetch8/md_fetch16 for every ModR/M,
+ * displacement and immediate byte, which recomputed CS:IP linear addresses.
+ *
+ * These helpers are local to the GCC/Clang threaded interpreter.  FETCH16
+ * deliberately treats IP=FFFFh as a segmented word access: the high byte is
+ * fetched from CS:0000, matching the original 8086 and md_fetch16().
+ */
+#define MD_CODE_PEEK8() \
+    opcode_memory[(opcode_cs_base + (uint32_t)opcode_cpu->ip) & MD_X86_ADDRESS_MASK]
+
+#define MD_CODE_FETCH8() \
+    opcode_memory[(opcode_cs_base + \
+                   (uint32_t)(uint16_t)(opcode_cpu->ip++)) & \
+                  MD_X86_ADDRESS_MASK]
+
+#define MD_CODE_FETCH16() \
+    __extension__ ({ \
+        const uint16_t md_code_ip_ = opcode_cpu->ip; \
+        const uint32_t md_code_a0_ = \
+            (opcode_cs_base + (uint32_t)md_code_ip_) & MD_X86_ADDRESS_MASK; \
+        const uint32_t md_code_a1_ = \
+            md_code_ip_ == 0xFFFFu \
+                ? (opcode_cs_base & MD_X86_ADDRESS_MASK) \
+                : ((md_code_a0_ + 1u) & MD_X86_ADDRESS_MASK); \
+        const uint16_t md_code_value_ = \
+            (uint16_t)((uint16_t)opcode_memory[md_code_a0_] | \
+                       ((uint16_t)opcode_memory[md_code_a1_] << 8)); \
+        opcode_cpu->ip = (uint16_t)(md_code_ip_ + 2u); \
+        md_code_value_; \
+    })
+
 op_mov_r8_imm:
-    md_op_mov_r8_imm(runtime, opcode);
+    md_x86_set_reg8(opcode_cpu, opcode & 7u, MD_CODE_FETCH8());
     MD_NEXT();
 
 op_mov_r16_imm:
-    md_op_mov_r16_imm(runtime, opcode);
+    opcode_cpu->r[opcode & 7u] = MD_CODE_FETCH16();
     MD_NEXT();
 
 op_inc_r16:
@@ -1538,16 +1628,43 @@ op_pop_ax:
     MD_STACK_POP16_FAST(opcode_cpu->r[MD_X86_AX]);
     MD_NEXT();
 
-op_push_r16:
-    md_x86_push_reg(&runtime->cpu, opcode & 7u);
+op_push_r16: {
+    const unsigned reg = opcode & 7u;
+    /*
+     * Original 8086 PUSH SP stores the already-decremented SP. Compute that
+     * value before the macro performs the actual decrement/store.
+     */
+    const uint16_t value =
+        reg == MD_X86_SP
+            ? (uint16_t)(opcode_cpu->r[MD_X86_SP] - 2u)
+            : opcode_cpu->r[reg];
+    MD_STACK_PUSH16_FAST(value);
     MD_NEXT();
+}
 
-op_pop_r16:
-    runtime->cpu.r[opcode & 7u] = md_x86_pop(&runtime->cpu);
+op_pop_r16: {
+    const unsigned reg = opcode & 7u;
+    if (reg == MD_X86_SP) {
+        /*
+         * POP SP's final SP is the popped value, not old-SP+2. Keep the
+         * canonical helper for this one architectural aliasing case.
+         */
+        opcode_cpu->r[MD_X86_SP] = md_x86_pop(opcode_cpu);
+    } else {
+        MD_STACK_POP16_FAST(opcode_cpu->r[reg]);
+    }
     MD_NEXT();
+}
+
+op_cmp_al_imm8: {
+    const uint8_t rhs = MD_CODE_FETCH8();
+    (void)md_x86_alu8(opcode_cpu, 7u,
+                      md_x86_get_reg8(opcode_cpu, 0u), rhs);
+    MD_NEXT();
+}
 
 op_jz8: {
-    const int8_t rel = (int8_t)md_fetch8(runtime);
+    const int8_t rel = (int8_t)MD_CODE_FETCH8();
     if (md_x86_zf(&runtime->cpu)) {
         const uint16_t target = (uint16_t)(runtime->cpu.ip + rel);
         runtime->cpu.ip = target;
@@ -1558,7 +1675,7 @@ op_jz8: {
 }
 
 op_jnz8: {
-    const int8_t rel = (int8_t)md_fetch8(runtime);
+    const int8_t rel = (int8_t)MD_CODE_FETCH8();
     if (!md_x86_zf(&runtime->cpu)) {
         const uint16_t target = (uint16_t)(runtime->cpu.ip + rel);
         runtime->cpu.ip = target;
@@ -1582,7 +1699,7 @@ op_jnz8: {
 }
 
 op_jcc8: {
-    const int8_t rel = (int8_t)md_fetch8(runtime);
+    const int8_t rel = (int8_t)MD_CODE_FETCH8();
     if (md_x86_condition(&runtime->cpu, opcode & 0x0Fu)) {
         const uint16_t target = (uint16_t)(runtime->cpu.ip + rel);
         runtime->cpu.ip = target;
@@ -1597,12 +1714,10 @@ op_prefix: {
        general prefix parser for that hot case, but leave repeated/mixed
        prefixes, REP and LOCK on the fully general path below. */
     if (opcode == 0x26u || opcode == 0x2Eu || opcode == 0x36u || opcode == 0x3Eu) {
-        const uint8_t next_opcode = md_x86_read8(&runtime->cpu,
-                                                  runtime->cpu.cs,
-                                                  runtime->cpu.ip);
+        const uint8_t next_opcode = MD_CODE_PEEK8();
         if (!md_is_prefix_byte(next_opcode)) {
             MdPrefixState prefix = { opcode, 0u, 0u };
-            (void)md_fetch8(runtime);  /* consume the already-peeked opcode */
+            (void)MD_CODE_FETCH8();  /* consume the already-peeked opcode */
 #if MD_INTERP_OPCODE_PROFILE
             MD_PREFIX_PROFILE_HIT(opcode, next_opcode);
 #endif
@@ -1611,9 +1726,7 @@ op_prefix: {
             {
                 const unsigned hot_row = md_hot_modrm_profile_row(opcode, next_opcode);
                 if (hot_row < 10u) {
-                    const uint8_t modrm = md_x86_read8(&runtime->cpu,
-                                                       runtime->cpu.cs,
-                                                       runtime->cpu.ip);
+                    const uint8_t modrm = MD_CODE_PEEK8();
                     MD_HOT_MODRM_PROFILE_HIT(opcode, next_opcode, modrm);
                 }
             }
@@ -1626,15 +1739,13 @@ op_prefix: {
                COMMAND/DOS stream. Peek first so every non-match falls back
                without consuming anything. */
             {
-                const uint8_t hot_modrm = md_x86_read8(&runtime->cpu,
-                                                       runtime->cpu.cs,
-                                                       runtime->cpu.ip);
+                const uint8_t hot_modrm = MD_CODE_PEEK8();
 
                 if (opcode == 0x2Eu && next_opcode == 0xFFu && hot_modrm == 0x36u) {
                     uint16_t disp;
                     uint16_t value;
-                    (void)md_fetch8(runtime);
-                    disp = md_fetch16(runtime);
+                    (void)MD_CODE_FETCH8();
+                    disp = MD_CODE_FETCH16();
                     value = md_x86_read16(&runtime->cpu, runtime->cpu.cs, disp);
                     md_x86_push(&runtime->cpu, value);
                     MD_NEXT();
@@ -1643,8 +1754,8 @@ op_prefix: {
                 if (opcode == 0x2Eu && next_opcode == 0x8Fu && hot_modrm == 0x06u) {
                     uint16_t disp;
                     uint16_t value;
-                    (void)md_fetch8(runtime);
-                    disp = md_fetch16(runtime);
+                    (void)MD_CODE_FETCH8();
+                    disp = MD_CODE_FETCH16();
                     value = md_x86_pop(&runtime->cpu);
                     md_x86_write16(&runtime->cpu, runtime->cpu.cs, disp, value);
                     MD_NEXT();
@@ -1655,8 +1766,8 @@ op_prefix: {
                     uint16_t target_ip;
                     uint16_t target_cs;
                     uint16_t return_ip;
-                    (void)md_fetch8(runtime);
-                    disp = md_fetch16(runtime);
+                    (void)MD_CODE_FETCH8();
+                    disp = MD_CODE_FETCH16();
                     target_ip = md_x86_read16(&runtime->cpu, runtime->cpu.ss, disp);
                     target_cs = md_x86_read16(&runtime->cpu, runtime->cpu.ss,
                                               (uint16_t)(disp + 2u));
@@ -1671,9 +1782,9 @@ op_prefix: {
                 if (opcode == 0x36u && next_opcode == 0xC7u && hot_modrm == 0x06u) {
                     uint16_t disp;
                     uint16_t imm;
-                    (void)md_fetch8(runtime);
-                    disp = md_fetch16(runtime);
-                    imm = md_fetch16(runtime);
+                    (void)MD_CODE_FETCH8();
+                    disp = MD_CODE_FETCH16();
+                    imm = MD_CODE_FETCH16();
                     md_x86_write16(&runtime->cpu, runtime->cpu.ss, disp, imm);
                     MD_NEXT();
                 }
@@ -1682,10 +1793,10 @@ op_prefix: {
                     uint16_t disp;
                     uint8_t lhs;
                     uint8_t rhs;
-                    (void)md_fetch8(runtime);
-                    disp = md_fetch16(runtime);
+                    (void)MD_CODE_FETCH8();
+                    disp = MD_CODE_FETCH16();
                     lhs = md_x86_read8(&runtime->cpu, runtime->cpu.ss, disp);
-                    rhs = md_fetch8(runtime);
+                    rhs = MD_CODE_FETCH8();
                     (void)md_alu8(&runtime->cpu, 7u, lhs, rhs);
                     MD_NEXT();
                 }
@@ -1694,8 +1805,8 @@ op_prefix: {
                     (hot_modrm == 0x1Eu || hot_modrm == 0x16u)) {
                     uint16_t disp;
                     uint16_t value;
-                    (void)md_fetch8(runtime);
-                    disp = md_fetch16(runtime);
+                    (void)MD_CODE_FETCH8();
+                    disp = MD_CODE_FETCH16();
                     value = hot_modrm == 0x1Eu ? runtime->cpu.ds : runtime->cpu.ss;
                     md_x86_write16(&runtime->cpu, runtime->cpu.ss, disp, value);
                     MD_NEXT();
@@ -1703,15 +1814,15 @@ op_prefix: {
 
                 if (opcode == 0x36u && next_opcode == 0x8Bu && hot_modrm == 0x3Eu) {
                     uint16_t disp;
-                    (void)md_fetch8(runtime);
-                    disp = md_fetch16(runtime);
+                    (void)MD_CODE_FETCH8();
+                    disp = MD_CODE_FETCH16();
                     runtime->cpu.r[MD_X86_DI] =
                         md_x86_read16(&runtime->cpu, runtime->cpu.ss, disp);
                     MD_NEXT();
                 }
 
                 if (opcode == 0x26u && next_opcode == 0x8Au && hot_modrm == 0x05u) {
-                    (void)md_fetch8(runtime);
+                    (void)MD_CODE_FETCH8();
                     md_x86_set_reg8(&runtime->cpu, 0u,
                                     md_x86_read8(&runtime->cpu, runtime->cpu.es,
                                                  runtime->cpu.r[MD_X86_DI]));
@@ -1724,8 +1835,8 @@ op_prefix: {
                     int8_t disp;
                     uint16_t rhs;
                     unsigned alu_op;
-                    (void)md_fetch8(runtime);
-                    disp = (int8_t)md_fetch8(runtime);
+                    (void)MD_CODE_FETCH8();
+                    disp = (int8_t)MD_CODE_FETCH8();
                     rhs = md_x86_read16(&runtime->cpu, runtime->cpu.es,
                                         (uint16_t)(runtime->cpu.r[MD_X86_DI] + disp));
                     alu_op = next_opcode == 0x03u ? 0u : 5u;
@@ -1739,7 +1850,7 @@ op_prefix: {
             if (opcode == 0x36u) { /* SS: */
                 switch (next_opcode) {
                     case 0xA3u: {
-                        const uint16_t off = md_fetch16(runtime);
+                        const uint16_t off = MD_CODE_FETCH16();
                         md_x86_write16(&runtime->cpu, runtime->cpu.ss, off,
                                        runtime->cpu.r[MD_X86_AX]);
                         MD_NEXT_CS();
@@ -1760,7 +1871,7 @@ op_prefix: {
                         md_op_mov_rm_r(runtime, next_opcode, &prefix);
                         MD_NEXT_CS();
                     case 0xA1u: {
-                        const uint16_t off = md_fetch16(runtime);
+                        const uint16_t off = MD_CODE_FETCH16();
                         runtime->cpu.r[MD_X86_AX] =
                             md_x86_read16(&runtime->cpu, runtime->cpu.ss, off);
                         MD_NEXT_CS();
@@ -1801,13 +1912,13 @@ op_alu_rm:
     if (md_unpref_modrm_profile_row(opcode) < 6u) {
         MD_UNPREF_MODRM_PROFILE_HIT(
             opcode,
-            md_x86_read8(&runtime->cpu, runtime->cpu.cs, runtime->cpu.ip));
+            MD_CODE_PEEK8());
     }
 #endif
     /* Profile-guided exact unprefixed ALU template. */
     if (opcode == 0x33u &&
-        md_x86_read8(&runtime->cpu, runtime->cpu.cs, runtime->cpu.ip) == 0xDBu) {
-        (void)md_fetch8(runtime);
+        MD_CODE_PEEK8() == 0xDBu) {
+        (void)MD_CODE_FETCH8();
         runtime->cpu.r[MD_X86_BX] =
             md_alu16(&runtime->cpu, 6u,
                      runtime->cpu.r[MD_X86_BX],
@@ -1827,22 +1938,22 @@ op_group1:
     if (md_unpref_modrm_profile_row(opcode) < 6u) {
         MD_UNPREF_MODRM_PROFILE_HIT(
             opcode,
-            md_x86_read8(&runtime->cpu, runtime->cpu.cs, runtime->cpu.ip));
+            MD_CODE_PEEK8());
     }
 #endif
     /* Profile-guided exact unprefixed 83h templates. */
     if (opcode == 0x83u) {
         const uint8_t hot_modrm =
-            md_x86_read8(&runtime->cpu, runtime->cpu.cs, runtime->cpu.ip);
+            MD_CODE_PEEK8();
 
         if (hot_modrm == 0xFFu || hot_modrm == 0xFBu) {
             uint16_t lhs;
             uint16_t rhs;
-            (void)md_fetch8(runtime);
+            (void)MD_CODE_FETCH8();
             lhs = hot_modrm == 0xFFu
                 ? runtime->cpu.r[MD_X86_DI]
                 : runtime->cpu.r[MD_X86_BX];
-            rhs = (uint16_t)(int16_t)(int8_t)md_fetch8(runtime);
+            rhs = (uint16_t)(int16_t)(int8_t)MD_CODE_FETCH8();
             (void)md_alu16(&runtime->cpu, 7u, lhs, rhs);
             MD_NEXT();
         }
@@ -1850,8 +1961,8 @@ op_group1:
         if (hot_modrm == 0xC7u || hot_modrm == 0xC6u) {
             uint16_t rhs;
             uint16_t *dst;
-            (void)md_fetch8(runtime);
-            rhs = (uint16_t)(int16_t)(int8_t)md_fetch8(runtime);
+            (void)MD_CODE_FETCH8();
+            rhs = (uint16_t)(int16_t)(int8_t)MD_CODE_FETCH8();
             dst = hot_modrm == 0xC7u
                 ? &runtime->cpu.r[MD_X86_DI]
                 : &runtime->cpu.r[MD_X86_SI];
@@ -1868,18 +1979,18 @@ op_mov_rm:
     if (md_unpref_modrm_profile_row(opcode) < 6u) {
         MD_UNPREF_MODRM_PROFILE_HIT(
             opcode,
-            md_x86_read8(&runtime->cpu, runtime->cpu.cs, runtime->cpu.ip));
+            MD_CODE_PEEK8());
     }
 #endif
     /* Profile-guided exact unprefixed MOV templates. */
     {
         const uint8_t hot_modrm =
-            md_x86_read8(&runtime->cpu, runtime->cpu.cs, runtime->cpu.ip);
+            MD_CODE_PEEK8();
 
         if (opcode == 0x8Bu && hot_modrm == 0x44u) {
             int8_t disp;
-            (void)md_fetch8(runtime);
-            disp = (int8_t)md_fetch8(runtime);
+            (void)MD_CODE_FETCH8();
+            disp = (int8_t)MD_CODE_FETCH8();
             runtime->cpu.r[MD_X86_AX] =
                 md_x86_read16(&runtime->cpu, runtime->cpu.ds,
                               (uint16_t)(runtime->cpu.r[MD_X86_SI] + disp));
@@ -1887,13 +1998,13 @@ op_mov_rm:
         }
 
         if (opcode == 0x8Bu && hot_modrm == 0xFBu) {
-            (void)md_fetch8(runtime);
+            (void)MD_CODE_FETCH8();
             runtime->cpu.r[MD_X86_DI] = runtime->cpu.r[MD_X86_BX];
             MD_NEXT();
         }
 
         if (opcode == 0x8Bu && hot_modrm == 0xF7u) {
-            (void)md_fetch8(runtime);
+            (void)MD_CODE_FETCH8();
             runtime->cpu.r[MD_X86_SI] = runtime->cpu.r[MD_X86_DI];
             MD_NEXT();
         }
@@ -1902,8 +2013,8 @@ op_mov_rm:
             (hot_modrm == 0x1Eu || hot_modrm == 0x0Eu || hot_modrm == 0x2Eu)) {
             uint16_t disp;
             unsigned reg8;
-            (void)md_fetch8(runtime);
-            disp = md_fetch16(runtime);
+            (void)MD_CODE_FETCH8();
+            disp = MD_CODE_FETCH16();
             reg8 = hot_modrm == 0x1Eu ? 3u : (hot_modrm == 0x0Eu ? 1u : 5u);
             md_x86_write8(&runtime->cpu, runtime->cpu.ds, disp,
                           md_x86_get_reg8(&runtime->cpu, reg8));
@@ -1916,8 +2027,7 @@ op_mov_rm:
 
 op_loop: {
 #ifdef MICRODOS_ENABLE_NATIVE_V2
-    const int8_t rel = (int8_t)md_x86_read8(
-        &runtime->cpu, runtime->cpu.cs, runtime->cpu.ip);
+    const int8_t rel = (int8_t)MD_CODE_PEEK8();
     const uint16_t fallthrough = (uint16_t)(runtime->cpu.ip + 1u);
     const uint16_t target = (uint16_t)(fallthrough + rel);
 #endif
@@ -1977,14 +2087,14 @@ op_ret:
     MD_NEXT();
 
 op_call16: {
-    const int16_t rel = (int16_t)md_fetch16(runtime);
+    const int16_t rel = (int16_t)MD_CODE_FETCH16();
     MD_STACK_PUSH16_FAST(opcode_cpu->ip);
     opcode_cpu->ip = (uint16_t)(opcode_cpu->ip + rel);
     MD_NEXT();
 }
 
 op_jmp16: {
-    const int16_t rel = (int16_t)md_fetch16(runtime);
+    const int16_t rel = (int16_t)MD_CODE_FETCH16();
     const uint16_t target = (uint16_t)(runtime->cpu.ip + rel);
     runtime->cpu.ip = target;
     if (rel < 0)
@@ -1996,7 +2106,7 @@ op_nop:
     MD_NEXT();
 
 op_int: {
-    const uint8_t vector = md_fetch8(runtime);
+    const uint8_t vector = MD_CODE_FETCH8();
     runtime->instructions += done;     /* hooks may observe the count */
     done = 0u;
     (void)md_runtime_interrupt(runtime, vector);
@@ -2004,7 +2114,7 @@ op_int: {
 }
 
 op_jmp8: {
-    const int8_t rel = (int8_t)md_fetch8(runtime);
+    const int8_t rel = (int8_t)MD_CODE_FETCH8();
     const uint16_t target = (uint16_t)(runtime->cpu.ip + rel);
     runtime->cpu.ip = target;
     if (rel < 0)
@@ -2021,45 +2131,45 @@ op_group3:
     if (md_unpref_modrm_profile_row(opcode) < 6u) {
         MD_UNPREF_MODRM_PROFILE_HIT(
             opcode,
-            md_x86_read8(&runtime->cpu, runtime->cpu.cs, runtime->cpu.ip));
+            MD_CODE_PEEK8());
     }
 #endif
     /* Profile-guided exact unprefixed Group-3 templates. */
     {
         const uint8_t hot_modrm =
-            md_x86_read8(&runtime->cpu, runtime->cpu.cs, runtime->cpu.ip);
+            MD_CODE_PEEK8();
 
         if (opcode == 0xF6u && hot_modrm == 0x44u) {
             int8_t disp;
             uint8_t lhs;
             uint8_t rhs;
-            (void)md_fetch8(runtime);
-            disp = (int8_t)md_fetch8(runtime);
+            (void)MD_CODE_FETCH8();
+            disp = (int8_t)MD_CODE_FETCH8();
             lhs = md_x86_read8(&runtime->cpu, runtime->cpu.ds,
                                (uint16_t)(runtime->cpu.r[MD_X86_SI] + disp));
-            rhs = md_fetch8(runtime);
+            rhs = MD_CODE_FETCH8();
             (void)md_x86_logic8(&runtime->cpu, (uint8_t)(lhs & rhs));
             MD_NEXT();
         }
 
         if (opcode == 0xF6u && hot_modrm == 0xD4u) {
             const uint8_t ah = md_x86_get_reg8(&runtime->cpu, 4u);
-            (void)md_fetch8(runtime);
+            (void)MD_CODE_FETCH8();
             md_x86_set_reg8(&runtime->cpu, 4u, (uint8_t)~ah);
             MD_NEXT();
         }
 
         if (opcode == 0xF6u && hot_modrm == 0xE3u) {
             const uint8_t bl = md_x86_get_reg8(&runtime->cpu, 3u);
-            (void)md_fetch8(runtime);
+            (void)MD_CODE_FETCH8();
             md_muldiv_core(runtime, 0xF6u, 4u, bl, ip_before, 0u);
             MD_NEXT();
         }
 
         if (opcode == 0xF7u && hot_modrm == 0xC7u) {
             uint16_t imm;
-            (void)md_fetch8(runtime);
-            imm = md_fetch16(runtime);
+            (void)MD_CODE_FETCH8();
+            imm = MD_CODE_FETCH16();
             (void)md_x86_logic16(&runtime->cpu,
                                  (uint16_t)(runtime->cpu.r[MD_X86_DI] & imm));
             MD_NEXT();
@@ -2077,6 +2187,9 @@ md_exit:
     runtime->instructions += done;
     return runtime->stop_reason;
 
+#undef MD_CODE_PEEK8
+#undef MD_CODE_FETCH8
+#undef MD_CODE_FETCH16
 #undef MD_STACK_PUSH16_FAST
 #undef MD_STACK_POP16_FAST
 #undef MD_NEXT
