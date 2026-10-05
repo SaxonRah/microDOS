@@ -1570,6 +1570,58 @@ static MdStopReason md_interp_run_threaded(MdRuntime *runtime, uint32_t instruct
 #endif
 
 /*
+ * M24.3: cached segment hot-prefix locality.
+ *
+ * M24.2 proved that keeping SS<<4 in a threaded-loop local materially helps
+ * DOS stack traffic.  The exact hot prefix templates below still rebuild
+ * SS:/CS: segmented addresses through md_x86_read/write helpers.
+ *
+ * Reuse stack_ss_base and opcode_cs_base for those known-hot templates.
+ * The linear write helpers retain the normal translation/AOT invalidation
+ * checks.  Offset FFFFh deliberately falls back to the segmented helpers so
+ * the high byte wraps to segment:0000 as on the original 8086.
+ */
+#define MD_CACHED_SEG_READ8(base_, off_) \
+    md_x86_read8_linear(opcode_cpu, \
+        ((uint32_t)(base_) + (uint32_t)(uint16_t)(off_)) & MD_X86_ADDRESS_MASK)
+
+#define MD_CACHED_SEG_READ16(base_, seg_, off_) \
+    __extension__ ({ \
+        const uint16_t md_seg_off_ = (uint16_t)(off_); \
+        const uint16_t md_seg_value_ = \
+            md_seg_off_ != 0xFFFFu \
+                ? md_x86_read16_linear( \
+                      opcode_cpu, \
+                      ((uint32_t)(base_) + (uint32_t)md_seg_off_) & \
+                          MD_X86_ADDRESS_MASK) \
+                : md_x86_read16(opcode_cpu, (uint16_t)(seg_), md_seg_off_); \
+        md_seg_value_; \
+    })
+
+#define MD_CACHED_SEG_WRITE8(base_, off_, value_) do { \
+        md_x86_write8_linear( \
+            opcode_cpu, \
+            ((uint32_t)(base_) + (uint32_t)(uint16_t)(off_)) & \
+                MD_X86_ADDRESS_MASK, \
+            (uint8_t)(value_)); \
+    } while (0)
+
+#define MD_CACHED_SEG_WRITE16(base_, seg_, off_, value_) do { \
+        const uint16_t md_seg_off_ = (uint16_t)(off_); \
+        const uint16_t md_seg_value_ = (uint16_t)(value_); \
+        if (md_seg_off_ != 0xFFFFu) { \
+            md_x86_write16_linear( \
+                opcode_cpu, \
+                ((uint32_t)(base_) + (uint32_t)md_seg_off_) & \
+                    MD_X86_ADDRESS_MASK, \
+                md_seg_value_); \
+        } else { \
+            md_x86_write16( \
+                opcode_cpu, (uint16_t)(seg_), md_seg_off_, md_seg_value_); \
+        } \
+    } while (0)
+
+/*
  * M24.1: threaded code-fetch locality.
  *
  * MD_NEXT already fetches opcodes through the cached CS linear base.  Hot
@@ -1746,8 +1798,9 @@ op_prefix: {
                     uint16_t value;
                     (void)MD_CODE_FETCH8();
                     disp = MD_CODE_FETCH16();
-                    value = md_x86_read16(&runtime->cpu, runtime->cpu.cs, disp);
-                    md_x86_push(&runtime->cpu, value);
+                    value = MD_CACHED_SEG_READ16(
+                        opcode_cs_base, opcode_cpu->cs, disp);
+                    MD_STACK_PUSH16_FAST(value);
                     MD_NEXT();
                 }
 
@@ -1756,8 +1809,9 @@ op_prefix: {
                     uint16_t value;
                     (void)MD_CODE_FETCH8();
                     disp = MD_CODE_FETCH16();
-                    value = md_x86_pop(&runtime->cpu);
-                    md_x86_write16(&runtime->cpu, runtime->cpu.cs, disp, value);
+                    MD_STACK_POP16_FAST(value);
+                    MD_CACHED_SEG_WRITE16(
+                        opcode_cs_base, opcode_cpu->cs, disp, value);
                     MD_NEXT();
                 }
 
@@ -1768,14 +1822,16 @@ op_prefix: {
                     uint16_t return_ip;
                     (void)MD_CODE_FETCH8();
                     disp = MD_CODE_FETCH16();
-                    target_ip = md_x86_read16(&runtime->cpu, runtime->cpu.ss, disp);
-                    target_cs = md_x86_read16(&runtime->cpu, runtime->cpu.ss,
-                                              (uint16_t)(disp + 2u));
-                    return_ip = runtime->cpu.ip;
-                    md_x86_push(&runtime->cpu, runtime->cpu.cs);
-                    md_x86_push(&runtime->cpu, return_ip);
-                    runtime->cpu.cs = target_cs;
-                    runtime->cpu.ip = target_ip;
+                    target_ip = MD_CACHED_SEG_READ16(
+                        stack_ss_base, opcode_cpu->ss, disp);
+                    target_cs = MD_CACHED_SEG_READ16(
+                        stack_ss_base, opcode_cpu->ss,
+                        (uint16_t)(disp + 2u));
+                    return_ip = opcode_cpu->ip;
+                    MD_STACK_PUSH16_FAST(opcode_cpu->cs);
+                    MD_STACK_PUSH16_FAST(return_ip);
+                    opcode_cpu->cs = target_cs;
+                    opcode_cpu->ip = target_ip;
                     MD_NEXT_CS();
                 }
 
@@ -1785,7 +1841,8 @@ op_prefix: {
                     (void)MD_CODE_FETCH8();
                     disp = MD_CODE_FETCH16();
                     imm = MD_CODE_FETCH16();
-                    md_x86_write16(&runtime->cpu, runtime->cpu.ss, disp, imm);
+                    MD_CACHED_SEG_WRITE16(
+                        stack_ss_base, opcode_cpu->ss, disp, imm);
                     MD_NEXT();
                 }
 
@@ -1795,9 +1852,9 @@ op_prefix: {
                     uint8_t rhs;
                     (void)MD_CODE_FETCH8();
                     disp = MD_CODE_FETCH16();
-                    lhs = md_x86_read8(&runtime->cpu, runtime->cpu.ss, disp);
+                    lhs = MD_CACHED_SEG_READ8(stack_ss_base, disp);
                     rhs = MD_CODE_FETCH8();
-                    (void)md_alu8(&runtime->cpu, 7u, lhs, rhs);
+                    (void)md_alu8(opcode_cpu, 7u, lhs, rhs);
                     MD_NEXT();
                 }
 
@@ -1807,8 +1864,9 @@ op_prefix: {
                     uint16_t value;
                     (void)MD_CODE_FETCH8();
                     disp = MD_CODE_FETCH16();
-                    value = hot_modrm == 0x1Eu ? runtime->cpu.ds : runtime->cpu.ss;
-                    md_x86_write16(&runtime->cpu, runtime->cpu.ss, disp, value);
+                    value = hot_modrm == 0x1Eu ? opcode_cpu->ds : opcode_cpu->ss;
+                    MD_CACHED_SEG_WRITE16(
+                        stack_ss_base, opcode_cpu->ss, disp, value);
                     MD_NEXT();
                 }
 
@@ -1816,8 +1874,8 @@ op_prefix: {
                     uint16_t disp;
                     (void)MD_CODE_FETCH8();
                     disp = MD_CODE_FETCH16();
-                    runtime->cpu.r[MD_X86_DI] =
-                        md_x86_read16(&runtime->cpu, runtime->cpu.ss, disp);
+                    opcode_cpu->r[MD_X86_DI] = MD_CACHED_SEG_READ16(
+                        stack_ss_base, opcode_cpu->ss, disp);
                     MD_NEXT();
                 }
 
@@ -1851,9 +1909,10 @@ op_prefix: {
                 switch (next_opcode) {
                     case 0xA3u: {
                         const uint16_t off = MD_CODE_FETCH16();
-                        md_x86_write16(&runtime->cpu, runtime->cpu.ss, off,
-                                       runtime->cpu.r[MD_X86_AX]);
-                        MD_NEXT_CS();
+                        MD_CACHED_SEG_WRITE16(
+                            stack_ss_base, opcode_cpu->ss, off,
+                            opcode_cpu->r[MD_X86_AX]);
+                        MD_NEXT();
                     }
                     case 0x8Cu:
                         md_op_mov_sreg(runtime, next_opcode, ip_before, &prefix);
@@ -1872,9 +1931,9 @@ op_prefix: {
                         MD_NEXT_CS();
                     case 0xA1u: {
                         const uint16_t off = MD_CODE_FETCH16();
-                        runtime->cpu.r[MD_X86_AX] =
-                            md_x86_read16(&runtime->cpu, runtime->cpu.ss, off);
-                        MD_NEXT_CS();
+                        opcode_cpu->r[MD_X86_AX] = MD_CACHED_SEG_READ16(
+                            stack_ss_base, opcode_cpu->ss, off);
+                        MD_NEXT();
                     }
                     default:
                         break;
@@ -2187,6 +2246,10 @@ md_exit:
     runtime->instructions += done;
     return runtime->stop_reason;
 
+#undef MD_CACHED_SEG_READ8
+#undef MD_CACHED_SEG_READ16
+#undef MD_CACHED_SEG_WRITE8
+#undef MD_CACHED_SEG_WRITE16
 #undef MD_CODE_PEEK8
 #undef MD_CODE_FETCH8
 #undef MD_CODE_FETCH16
