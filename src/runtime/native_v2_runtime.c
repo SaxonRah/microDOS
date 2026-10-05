@@ -159,6 +159,45 @@ static int md_nv2_rt_range_overlaps_code(const MdNativeV2RuntimeSlot *slot,
     return 0;
 }
 
+/*
+ * Native-v2 direct stores bypass md_x86_write*_linear(), so when the normal
+ * translation/AOT tracker is installed we may execute them only if the exact
+ * destination range lies entirely on untracked guest pages.
+ *
+ * The Phase-3 runtime already proves every admitted store class has an exact,
+ * non-wrapping range.  This helper adds the missing integration proof that
+ * those ranges cannot modify any translated/AOT page.  Once proven, the
+ * legacy blanket "tracker exists => reject every store" gate may be bypassed
+ * for this one native call without losing SMC/AOT coherency.
+ */
+static int md_nv2_rt_range_hits_tracked_pages(const MdX86 *cpu,
+                                               uint32_t data_start,
+                                               uint32_t data_end)
+{
+    uint32_t address;
+
+    if (cpu->code_page_executable == NULL)
+        return 0;
+
+    if (data_start > data_end || data_end >= MD_X86_ADDRESS_SPACE)
+        return 1;
+
+    address = data_start;
+    for (;;) {
+        const unsigned page = md_x86_code_page(address);
+
+        if (cpu->code_page_executable[page] != 0u)
+            return 1;
+
+        if ((address | MD_X86_CODE_PAGE_MASK) >= data_end)
+            break;
+
+        address = (address | MD_X86_CODE_PAGE_MASK) + 1u;
+    }
+
+    return 0;
+}
+
 static void md_nv2_rt_reject(MdNativeV2RuntimeSlot *slot,
                              uint16_t cs,
                              uint16_t ip,
@@ -450,6 +489,11 @@ execute:
             ++runtime->store_guard_rejects;
             return false;
         }
+
+        if (md_nv2_rt_range_hits_tracked_pages(cpu, data_start, data_end)) {
+            ++runtime->store_guard_rejects;
+            return false;
+        }
     }
 
     /*
@@ -495,6 +539,12 @@ execute:
             ++runtime->store_guard_rejects;
             return false;
         }
+
+        if (md_nv2_rt_range_hits_tracked_pages(cpu, src_start, src_end) ||
+            md_nv2_rt_range_hits_tracked_pages(cpu, dst_start, dst_end)) {
+            ++runtime->store_guard_rejects;
+            return false;
+        }
     }
 
     /*
@@ -514,6 +564,11 @@ execute:
 
         if (cpu->ss > 0xEFFFu ||
             !(data_end < code_start || data_start > code_end)) {
+            ++runtime->stack_guard_rejects;
+            return false;
+        }
+
+        if (md_nv2_rt_range_hits_tracked_pages(cpu, data_start, data_end)) {
             ++runtime->stack_guard_rejects;
             return false;
         }
@@ -547,6 +602,11 @@ execute:
             ++runtime->stack_guard_rejects;
             return false;
         }
+
+        if (md_nv2_rt_range_hits_tracked_pages(cpu, data_start, data_end)) {
+            ++runtime->stack_guard_rejects;
+            return false;
+        }
     }
 
     if (slot->code.requires_safe_muldiv) {
@@ -573,7 +633,27 @@ execute:
             run_iterations == 65536u ? 0u : (uint16_t)run_iterations;
     }
 
-    native_rc = md_native_v2_execute(cpu, &slot->code);
+    /*
+     * md_native_v2_execute() intentionally retains its conservative public
+     * API rule that any store falls back when a tracker pointer is installed.
+     * The runtime wrapper has now proven the exact store destination ranges
+     * do not touch any tracked page, so suppress only that legacy pointer gate
+     * for this call.  Restore the tracker before interpreting the result.
+     */
+    {
+        uint8_t *saved_code_page_executable = NULL;
+
+        if (slot->code.has_store && cpu->code_page_executable != NULL) {
+            saved_code_page_executable = cpu->code_page_executable;
+            cpu->code_page_executable = NULL;
+        }
+
+        native_rc = md_native_v2_execute(cpu, &slot->code);
+
+        if (saved_code_page_executable != NULL)
+            cpu->code_page_executable = saved_code_page_executable;
+    }
+
     if (native_rc == MD_NATIVE_V2_EXEC_FALLBACK) {
         if (chunked || zero_counter)
             cpu->r[slot->counter_reg & 7u] = saved_counter;
