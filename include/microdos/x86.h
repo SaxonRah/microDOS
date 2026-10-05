@@ -174,10 +174,21 @@ static inline int md_x86_cf(const MdX86 *cpu)
     }
 }
 
+/*
+ * M24.4: lazy ZF fast path.
+ *
+ * Every lazy 8-bit ALU producer stores a uint8_t result through md_x86_lazy(),
+ * which zero-extends it into lazy_res. 16-bit producers already store the full
+ * uint16_t result. Therefore a pending lazy result needs no width-dependent
+ * mask for ZF: zero is zero at either width.
+ *
+ * This removes md_lazy_mask()/width testing from hot JZ/JNZ, LOOPZ/NZ and
+ * REP compare termination while preserving the raw-FLAGS path exactly.
+ */
 static inline int md_x86_zf(const MdX86 *cpu)
 {
     if (cpu->lazy_op == MD_LAZY_NONE) return (cpu->flags_raw & 0x0040u) != 0u;
-    return (cpu->lazy_res & md_lazy_mask(cpu->lazy_op)) == 0u;
+    return cpu->lazy_res == 0u;
 }
 
 static inline int md_x86_sf(const MdX86 *cpu)
