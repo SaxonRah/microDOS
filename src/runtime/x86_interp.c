@@ -139,13 +139,9 @@ typedef struct MdPrefixState {
 
 static inline int md_is_prefix_byte(uint8_t opcode)
 {
-    switch (opcode) {
-        case 0x26u: case 0x2Eu: case 0x36u: case 0x3Eu:
-        case 0xF0u: case 0xF2u: case 0xF3u:
-            return 1;
-        default:
-            return 0;
-    }
+    /* 26/2E/36/3E share the pattern 001xx110; F0/F2/F3 are 111100xx minus F1. */
+    return (opcode & 0xE7u) == 0x26u ||
+           ((opcode & 0xFCu) == 0xF0u && opcode != 0xF1u);
 }
 
 static inline void md_apply_prefix(MdPrefixState *prefix, uint8_t opcode)
@@ -165,17 +161,23 @@ static inline void md_apply_prefix(MdPrefixState *prefix, uint8_t opcode)
     }
 }
 
+static inline uint16_t md_get_sreg(const MdX86 *cpu, unsigned reg)
+{
+    switch (reg & 3u) {
+        case 0u: return cpu->es;
+        case 1u: return cpu->cs;
+        case 2u: return cpu->ss;
+        default: return cpu->ds;
+    }
+}
+
 static inline uint16_t md_prefixed_segment(const MdX86 *cpu,
                                             const MdPrefixState *prefix,
                                             uint16_t fallback)
 {
     if (prefix == NULL || prefix->segment_override == 0u) return fallback;
-    switch (prefix->segment_override) {
-        case 0x26u: return cpu->es;
-        case 0x2Eu: return cpu->cs;
-        case 0x36u: return cpu->ss;
-        default: return cpu->ds;
-    }
+    /* Override bytes 26/2E/36/3E carry the Sreg number in bits 4:3. */
+    return md_get_sreg(cpu, (prefix->segment_override >> 3) & 3u);
 }
 
 static inline MdOperand md_decode_rm(MdRuntime *runtime, uint8_t modrm, const MdPrefixState *prefix)
@@ -205,15 +207,17 @@ static inline MdOperand md_decode_rm(MdRuntime *runtime, uint8_t modrm, const Md
         return op;
     }
 
-    switch (rm) {
-        case 0: base = (uint16_t)(cpu->r[MD_X86_BX] + cpu->r[MD_X86_SI]); break;
-        case 1: base = (uint16_t)(cpu->r[MD_X86_BX] + cpu->r[MD_X86_DI]); break;
-        case 2: base = (uint16_t)(cpu->r[MD_X86_BP] + cpu->r[MD_X86_SI]); uses_bp = 1; break;
-        case 3: base = (uint16_t)(cpu->r[MD_X86_BP] + cpu->r[MD_X86_DI]); uses_bp = 1; break;
-        case 4: base = cpu->r[MD_X86_SI]; break;
-        case 5: base = cpu->r[MD_X86_DI]; break;
-        case 6: base = cpu->r[MD_X86_BP]; uses_bp = 1; break;
-        default: base = cpu->r[MD_X86_BX]; break;
+    /* Table-driven 8086 EA: base register, optional index register (masked
+       to zero for rm 4..7), and the BP-relative set {2,3,6} as the bitmask
+       0x4C. Replaces an 8-way switch with two loads and an AND. */
+    {
+        static const uint8_t ea_base[8]  = { MD_X86_BX, MD_X86_BX, MD_X86_BP, MD_X86_BP,
+                                             MD_X86_SI, MD_X86_DI, MD_X86_BP, MD_X86_BX };
+        static const uint8_t ea_index[8] = { MD_X86_SI, MD_X86_DI, MD_X86_SI, MD_X86_DI,
+                                             0u, 0u, 0u, 0u };
+        const uint16_t index_mask = (uint16_t)(0u - (unsigned)((rm >> 2) ^ 1u));
+        base = (uint16_t)(cpu->r[ea_base[rm]] + (cpu->r[ea_index[rm]] & index_mask));
+        uses_bp = (int)((0x4Cu >> rm) & 1u);
     }
 
     if (mod == 1u) displacement = (int8_t)md_fetch8(runtime);
@@ -247,16 +251,6 @@ static inline void md_operand_write16(MdRuntime *runtime, MdOperand op, uint16_t
 {
     if (op.is_register) runtime->cpu.r[op.reg] = value;
     else md_x86_write16(&runtime->cpu, op.segment, op.offset, value);
-}
-
-static inline uint16_t md_get_sreg(const MdX86 *cpu, unsigned reg)
-{
-    switch (reg & 3u) {
-        case 0u: return cpu->es;
-        case 1u: return cpu->cs;
-        case 2u: return cpu->ss;
-        default: return cpu->ds;
-    }
 }
 
 static inline int md_set_sreg(MdX86 *cpu, unsigned reg, uint16_t value)
@@ -756,16 +750,23 @@ static inline void md_muldiv_core(MdRuntime *runtime, uint8_t opcode, unsigned e
                 break;
             }
             default: {
+                /* DX:AX is exactly an int32_t, so a 32-bit SDIV suffices.
+                   Cortex-M33 has no 64-bit divide: the old int64_t form
+                   called __aeabi_ldivmod for every IDIV r/m16. The only
+                   32-bit overflow case (INT32_MIN / -1) has a quotient far
+                   outside the 16-bit range, so it is a #DE anyway. */
                 const uint32_t bits = ((uint32_t)cpu->r[MD_X86_DX] << 16) | cpu->r[MD_X86_AX];
-                const int64_t dividend = (bits & 0x80000000u) != 0u
-                    ? (int64_t)bits - 0x100000000LL : (int64_t)bits;
-                const int64_t divisor = (int64_t)(int16_t)value;
-                int64_t q;
-                int64_t r;
-                if (divisor == 0) { md_divide_error(runtime); break; }
+                const int32_t dividend = (int32_t)bits;
+                const int32_t divisor = (int32_t)(int16_t)value;
+                int32_t q;
+                int32_t r;
+                if (divisor == 0 || (divisor == -1 && bits == 0x80000000u)) {
+                    md_divide_error(runtime);
+                    break;
+                }
                 q = dividend / divisor;
                 r = dividend % divisor;
-                if (q <= -32768LL || q > 32767LL) { md_divide_error(runtime); break; }
+                if (q <= -32768L || q > 32767L) { md_divide_error(runtime); break; }
                 if (repeat_prefix != 0u) q = -q; /* original-8086 REP/REPNE IDIV sign latch */
                 cpu->r[MD_X86_AX] = (uint16_t)q;
                 cpu->r[MD_X86_DX] = (uint16_t)r;

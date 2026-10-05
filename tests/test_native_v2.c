@@ -136,6 +136,76 @@ static const uint8_t kLoopReadsCx[] = {
     0xE2,0xF9         /* loop 0100 */
 };
 
+/*
+ * M24.6 class tests deliberately use several register combinations. These
+ * must compile through the same reusable byte IR; none is an exact matcher.
+ */
+static const uint8_t kByteRegLoop[] = {
+    0xB7,0x03,             /* mov bh,3 */
+    0xB2,0x11,             /* mov dl,11h */
+    0x88,0xD7,             /* mov bh,dl */
+    0x80,0xC7,0x01,        /* add bh,1 */
+    0x43,                  /* inc bx */
+    0xE2,0xF4              /* loop 0100 */
+};
+
+static const uint8_t kByteMulLoop[] = {
+    0xB4,0x07,             /* mov ah,7 */
+    0xF6,0xE4,             /* mul ah */
+    0x43,                  /* inc bx */
+    0xE2,0xF9              /* loop 0100 */
+};
+
+static const uint8_t kByteStosLoop[] = {
+    0x88,0xD8,             /* mov al,bl */
+    0xB4,0x07,             /* mov ah,7 */
+    0xF6,0xE4,             /* mul ah */
+    0x04,0x03,             /* add al,3 */
+    0xAA,                  /* stosb */
+    0x43,                  /* inc bx */
+    0xE2,0xF4              /* loop 0100 */
+};
+
+static const uint8_t kByteLodsLoop[] = {
+    0xAC,                  /* lodsb */
+    0x43,                  /* inc bx */
+    0xE2,0xFC              /* loop 0100 */
+};
+
+static const uint8_t kByteCmpMemLoop[] = {
+    0x3A,0x04,             /* cmp al,[si] */
+    0x43,                  /* inc bx */
+    0xE2,0xFB              /* loop 0100 */
+};
+
+
+static const uint8_t kByteSideExitMem[] = {
+    0x88,0xD8,             /* mov al,bl */
+    0xB4,0x07,             /* mov ah,7 */
+    0xF6,0xE4,             /* mul ah */
+    0x04,0x03,             /* add al,3 */
+    0x3A,0x04,             /* cmp al,[si] */
+    0x75,0x06,             /* jnz external side exit */
+    0x46,                  /* inc si */
+    0x43,                  /* inc bx */
+    0xE2,0xF0              /* loop 0100 */
+};
+
+static const uint8_t kByteSideExitImm[] = {
+    0x3C,0x20,             /* cmp al,20h */
+    0x75,0x03,             /* jnz end */
+    0x43,                  /* inc bx */
+    0xE2,0xF9              /* loop 0100 */
+};
+
+static const uint8_t kByteSideExitReg[] = {
+    0x3A,0xC3,             /* cmp al,bl */
+    0x74,0x03,             /* jz end */
+    0x43,                  /* inc bx */
+    0xE2,0xF9              /* loop 0100 */
+};
+
+
 static const uint8_t kFlagsStackPhase7[] = {
     0x93,                   /* xchg ax,bx */
     0x9C,                   /* pushf */
@@ -659,6 +729,158 @@ int main(void)
                     (unsigned)code.loop_terminal,
                     (unsigned)code.chunkable_loop);
             return 1;
+        }
+    }
+
+
+    {
+        struct ByteCase {
+            const char *name;
+            const uint8_t *bytes;
+            size_t size;
+            unsigned ops;
+            int memory;
+            int store;
+            int entry_cf;
+            int df_clear;
+            int safe_stosb;
+        };
+        static const struct ByteCase cases[] = {
+            { "byte-reg", kByteRegLoop, sizeof(kByteRegLoop),
+              6u, 0, 0, 0, 0, 0 },
+            { "byte-mul", kByteMulLoop, sizeof(kByteMulLoop),
+              4u, 0, 0, 0, 0, 0 },
+            { "byte-stos", kByteStosLoop, sizeof(kByteStosLoop),
+              7u, 1, 1, 0, 1, 1 },
+            { "byte-lods", kByteLodsLoop, sizeof(kByteLodsLoop),
+              3u, 1, 0, 1, 1, 0 },
+            { "byte-cmp-mem", kByteCmpMemLoop, sizeof(kByteCmpMemLoop),
+              3u, 1, 0, 0, 0, 0 }
+        };
+        unsigned ci;
+
+        for (ci = 0u; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
+            MdNativeV2Code code;
+            MdNativeV2Status st;
+            size_t guest_size = 0u;
+            uint8_t counter = 0xFFu;
+            const struct ByteCase *bc = &cases[ci];
+
+            memset(&code, 0, sizeof(code));
+            st = md_native_v2_compile_counted_loop(
+                bc->bytes, bc->size, 0x0100u,
+                &code, &guest_size, &counter);
+
+            if (st != MD_NATIVE_V2_OK ||
+                guest_size != bc->size ||
+                counter != MD_X86_CX ||
+                code.op_count != bc->ops ||
+                code.end_ip != (uint16_t)(0x0100u + bc->size) ||
+                code.loop_terminal != 0xE2u ||
+                code.chunkable_loop != 1u ||
+                !!code.needs_memory != bc->memory ||
+                !!code.has_store != bc->store ||
+                !!code.needs_entry_cf != bc->entry_cf ||
+                !!code.requires_df_clear != bc->df_clear ||
+                !!code.safe_stosb_loop != bc->safe_stosb ||
+                code.size == 0u || code.size > MD_NATIVE_V2_CODE_BYTES) {
+                fprintf(stderr,
+                        "m24.6 class8 %s failed st=%s bytes=%u ops=%u "
+                        "counter=%u mem=%u store=%u cf=%u df=%u safe=%u "
+                        "chunk=%u size=%u\n",
+                        bc->name, md_native_v2_status_name(st),
+                        (unsigned)guest_size, (unsigned)code.op_count,
+                        (unsigned)counter,
+                        (unsigned)code.needs_memory,
+                        (unsigned)code.has_store,
+                        (unsigned)code.needs_entry_cf,
+                        (unsigned)code.requires_df_clear,
+                        (unsigned)code.safe_stosb_loop,
+                        (unsigned)code.chunkable_loop,
+                        (unsigned)code.size);
+                return 1;
+            }
+        }
+    }
+
+
+    {
+        struct SideCase {
+            const char *name;
+            const uint8_t *bytes;
+            size_t size;
+            unsigned ops;
+            uint16_t target;
+            unsigned exit_ops;
+            unsigned flags;
+            unsigned dst;
+            unsigned src;
+            unsigned imm;
+            int memory;
+        };
+        static const struct SideCase cases[] = {
+            { "side-mem", kByteSideExitMem, sizeof(kByteSideExitMem),
+              9u, 0x0112u, 6u, 3u, 0u, 4u, 0u, 1 },
+            { "side-imm", kByteSideExitImm, sizeof(kByteSideExitImm),
+              4u, 0x0107u, 2u, 2u, 0u, 0u, 0x20u, 0 },
+            { "side-reg", kByteSideExitReg, sizeof(kByteSideExitReg),
+              4u, 0x0107u, 2u, 1u, 0u, 3u, 0u, 0 }
+        };
+        unsigned ci;
+
+        for (ci = 0u; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
+            MdNativeV2Code code;
+            MdNativeV2Status st;
+            size_t guest_size = 0u;
+            uint8_t counter = 0xFFu;
+            const struct SideCase *sc = &cases[ci];
+
+            uint8_t probe_window[64];
+
+            /*
+             * Production probing passes a larger candidate window than the
+             * final loop span. Keep the side-exit target inside that window
+             * so tests exercise the same classification path as the runtime.
+             */
+            memset(probe_window, 0x90, sizeof(probe_window));
+            memcpy(probe_window, sc->bytes, sc->size);
+            memset(&code, 0, sizeof(code));
+            st = md_native_v2_compile_counted_loop(
+                probe_window, sizeof(probe_window), 0x0100u,
+                &code, &guest_size, &counter);
+
+            if (st != MD_NATIVE_V2_OK ||
+                guest_size != sc->size ||
+                counter != MD_X86_CX ||
+                code.phase != 15u ||
+                code.op_count != sc->ops ||
+                code.loop_terminal != 0xE2u ||
+                code.chunkable_loop != 1u ||
+                code.side_exit_target != sc->target ||
+                code.side_exit_ops != sc->exit_ops ||
+                code.side_exit_flags != sc->flags ||
+                code.side_exit_dst != sc->dst ||
+                code.side_exit_src != sc->src ||
+                code.side_exit_imm != sc->imm ||
+                !!code.needs_memory != sc->memory ||
+                code.size == 0u || code.size > MD_NATIVE_V2_CODE_BYTES) {
+                fprintf(stderr,
+                        "m24.6b %s failed st=%s bytes=%u ops=%u phase=%u "
+                        "target=%04x exitops=%u flags=%u dst=%u src=%u "
+                        "imm=%u mem=%u chunk=%u size=%u\n",
+                        sc->name, md_native_v2_status_name(st),
+                        (unsigned)guest_size, (unsigned)code.op_count,
+                        (unsigned)code.phase, code.side_exit_target,
+                        (unsigned)code.side_exit_ops,
+                        (unsigned)code.side_exit_flags,
+                        (unsigned)code.side_exit_dst,
+                        (unsigned)code.side_exit_src,
+                        (unsigned)code.side_exit_imm,
+                        (unsigned)code.needs_memory,
+                        (unsigned)code.chunkable_loop,
+                        (unsigned)code.size);
+                return 1;
+            }
         }
     }
 

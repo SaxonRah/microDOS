@@ -8,6 +8,13 @@
 typedef enum MdNv2Kind {
     MD_NV2_MOV_R16_IMM = 0,
     MD_NV2_MOV_RR16,
+    MD_NV2_MOV_RR8,
+    MD_NV2_MOV_R8_IMM,
+    MD_NV2_MOV_R8_MEM8,
+    MD_NV2_ALU_RR8,
+    MD_NV2_ALU_R8_IMM,
+    MD_NV2_ALU_R8_MEM8,
+    MD_NV2_MUL_R8,
     MD_NV2_INC_R16,
     MD_NV2_DEC_R16,
     MD_NV2_ALU_RR16,
@@ -23,6 +30,8 @@ typedef enum MdNv2Kind {
     MD_NV2_MOV_R16_MEM16,
     MD_NV2_MOV_MEM16_R16,
     MD_NV2_LEA_INDEX_DISP8,
+    MD_NV2_LODSB,
+    MD_NV2_STOSB,
     MD_NV2_LODSW,
     MD_NV2_JZ,
     MD_NV2_JNZ,
@@ -32,6 +41,7 @@ typedef enum MdNv2Kind {
     MD_NV2_NOP
 } MdNv2Kind;
 
+/* M24.6b generic counted-loop side exits + bitfield byte lowering. */
 typedef struct MdNv2Op {
     uint16_t ip;
     uint16_t next_ip;
@@ -44,6 +54,7 @@ typedef struct MdNv2Op {
     uint8_t need_cf;
     uint8_t need_z;
     uint8_t retire_dynamic;
+    uint8_t side_exit;
 } MdNv2Op;
 
 typedef struct MdThumbBuf {
@@ -57,7 +68,15 @@ typedef struct MdBranchPatch {
     size_t at;
     uint16_t target_ip;
     uint8_t cond;
+    uint8_t side_exit;
 } MdBranchPatch;
+
+enum {
+    MD_NV2_SIDE_FLAGS_NONE = 0,
+    MD_NV2_SIDE_FLAGS_CMP_RR8 = 1,
+    MD_NV2_SIDE_FLAGS_CMP_RI8 = 2,
+    MD_NV2_SIDE_FLAGS_CMP_RM8 = 3
+};
 
 /*
  * Pico-first register convention:
@@ -257,6 +276,65 @@ static void th_strh_w_reg(MdThumbBuf *b, unsigned rt, unsigned rn, unsigned rm)
          (uint16_t)(((rt & 15u) << 12) | (rm & 15u)));
 }
 
+static void th_ldrb_w_reg(MdThumbBuf *b, unsigned rt, unsigned rn, unsigned rm)
+{
+    th32(b,
+         (uint16_t)(0xF810u | (rn & 15u)),
+         (uint16_t)(((rt & 15u) << 12) | (rm & 15u)));
+}
+
+static void th_strb_w_reg(MdThumbBuf *b, unsigned rt, unsigned rn, unsigned rm)
+{
+    th32(b,
+         (uint16_t)(0xF800u | (rn & 15u)),
+         (uint16_t)(((rt & 15u) << 12) | (rm & 15u)));
+}
+
+/* UBFX Rd,Rn,#lsb,#width. */
+static void th_ubfx(MdThumbBuf *b, unsigned rd, unsigned rn,
+                    unsigned lsb, unsigned width)
+{
+    const unsigned imm3 = (lsb >> 2) & 7u;
+    const unsigned imm2 = lsb & 3u;
+
+    if (lsb > 31u || width == 0u || width > 32u ||
+        lsb + width > 32u) {
+        b->failed = 1;
+        return;
+    }
+
+    th32(b,
+         (uint16_t)(0xF3C0u | (rn & 15u)),
+         (uint16_t)((imm3 << 12) |
+                    ((rd & 15u) << 8) |
+                    (imm2 << 6) |
+                    ((width - 1u) & 31u)));
+}
+
+/*
+ * BFI is ideal for 8086 AH/AL-style subregister updates: replace one byte
+ * without a clear-mask/shift/OR sequence.
+ */
+static void th_bfi(MdThumbBuf *b, unsigned rd, unsigned rn,
+                   unsigned lsb, unsigned width)
+{
+    const unsigned imm3 = (lsb >> 2) & 7u;
+    const unsigned imm2 = lsb & 3u;
+    const unsigned msb = lsb + width - 1u;
+
+    if (lsb > 31u || width == 0u || width > 32u || msb > 31u) {
+        b->failed = 1;
+        return;
+    }
+
+    th32(b,
+         (uint16_t)(0xF360u | (rn & 15u)),
+         (uint16_t)((imm3 << 12) |
+                    ((rd & 15u) << 8) |
+                    (imm2 << 6) |
+                    (msb & 31u)));
+}
+
 static void th_add_w_reg(MdThumbBuf *b, unsigned rd, unsigned rn, unsigned rm)
 {
     th32(b,
@@ -447,6 +525,11 @@ static void th_cf_from_bit16(MdThumbBuf *b, unsigned rn)
          0x4B00u); /* Rd=r11, lsb=16, width=1 */
 }
 
+static void th_cf_from_bit8(MdThumbBuf *b, unsigned rn)
+{
+    th_ubfx(b, 11u, rn, 8u, 1u);
+}
+
 /* UBFX r12,r12,#0,#20: physical 8086 20-bit address wrap. */
 static void th_wrap20_r12(MdThumbBuf *b)
 {
@@ -535,10 +618,29 @@ static int md_nv2_mem_index_from_rm(unsigned rm)
     return -1;
 }
 
+static unsigned md_nv2_r8_parent(unsigned r8)
+{
+    return r8 & 3u;
+}
+
+static int md_nv2_alu8_supported(unsigned alu)
+{
+    /*
+     * ADD/OR/AND/SUB/XOR/CMP need no incoming carry. ADC/SBB stay in
+     * fallback until the byte class has a measured reason to pay for them.
+     */
+    return alu == 0u || alu == 1u || alu == 4u ||
+           alu == 5u || alu == 6u || alu == 7u;
+}
+
 
 static int md_nv2_op_defines_cf(const MdNv2Op *op)
 {
-    return op->kind == MD_NV2_ALU_RR16 ||
+    return op->kind == MD_NV2_ALU_RR8 ||
+           op->kind == MD_NV2_ALU_R8_IMM ||
+           op->kind == MD_NV2_ALU_R8_MEM8 ||
+           op->kind == MD_NV2_MUL_R8 ||
+           op->kind == MD_NV2_ALU_RR16 ||
            op->kind == MD_NV2_GRP1_R16_IMM8 ||
            op->kind == MD_NV2_ALU_ACC_IMM16 ||
            op->kind == MD_NV2_TEST_R16_IMM16 ||
@@ -558,6 +660,9 @@ static int md_nv2_op_defines_z(const MdNv2Op *op)
 {
     return op->kind == MD_NV2_INC_R16 ||
            op->kind == MD_NV2_DEC_R16 ||
+           op->kind == MD_NV2_ALU_RR8 ||
+           op->kind == MD_NV2_ALU_R8_IMM ||
+           op->kind == MD_NV2_ALU_R8_MEM8 ||
            op->kind == MD_NV2_ALU_RR16 ||
            op->kind == MD_NV2_GRP1_R16_IMM8 ||
            op->kind == MD_NV2_ALU_ACC_IMM16 ||
@@ -593,6 +698,25 @@ static int md_nv2_op_writes_reg(const MdNv2Op *op, unsigned reg)
         case MD_NV2_MOV_R16_MEM16:
         case MD_NV2_LEA_INDEX_DISP8:
             return op->dst == reg;
+
+        case MD_NV2_MOV_RR8:
+        case MD_NV2_MOV_R8_IMM:
+        case MD_NV2_MOV_R8_MEM8:
+            return md_nv2_r8_parent(op->dst) == reg;
+
+        case MD_NV2_ALU_RR8:
+        case MD_NV2_ALU_R8_IMM:
+        case MD_NV2_ALU_R8_MEM8:
+            return op->aux != 7u && md_nv2_r8_parent(op->dst) == reg;
+
+        case MD_NV2_MUL_R8:
+            return reg == MD_X86_AX;
+
+        case MD_NV2_LODSB:
+            return reg == MD_X86_AX || reg == MD_X86_SI;
+
+        case MD_NV2_STOSB:
+            return reg == MD_X86_DI;
 
         case MD_NV2_ALU_RR16:
             return op->aux != 7u && op->dst == reg;
@@ -652,6 +776,36 @@ static int md_nv2_op_reads_reg(const MdNv2Op *op, unsigned reg)
 
         case MD_NV2_MOV_RR16:
             return op->src == reg;
+
+        case MD_NV2_MOV_RR8:
+            return md_nv2_r8_parent(op->src) == reg;
+
+        case MD_NV2_MOV_R8_IMM:
+            return 0;
+
+        case MD_NV2_MOV_R8_MEM8:
+            return md_nv2_mem_rm_reads_reg(op->aux, reg);
+
+        case MD_NV2_ALU_RR8:
+            return md_nv2_r8_parent(op->dst) == reg ||
+                   md_nv2_r8_parent(op->src) == reg;
+
+        case MD_NV2_ALU_R8_IMM:
+            return md_nv2_r8_parent(op->dst) == reg;
+
+        case MD_NV2_ALU_R8_MEM8:
+            return md_nv2_r8_parent(op->dst) == reg ||
+                   md_nv2_mem_rm_reads_reg(op->aux, reg);
+
+        case MD_NV2_MUL_R8:
+            return reg == MD_X86_AX ||
+                   md_nv2_r8_parent(op->src) == reg;
+
+        case MD_NV2_LODSB:
+            return reg == MD_X86_SI;
+
+        case MD_NV2_STOSB:
+            return reg == MD_X86_AX || reg == MD_X86_DI;
 
         case MD_NV2_INC_R16:
         case MD_NV2_DEC_R16:
@@ -780,6 +934,43 @@ static uint8_t md_nv2_safe_store_bx_si_loop(const MdNv2Op *ops,
     return (uint8_t)(stores == 1u && si_steps == 1u);
 }
 
+static uint8_t md_nv2_safe_stosb_loop(const MdNv2Op *ops,
+                                        unsigned count,
+                                        uint8_t loop_terminal)
+{
+    unsigned stosb = 0u;
+    unsigned i;
+
+    if (loop_terminal != 0xE2u || count < 2u)
+        return 0u;
+
+    for (i = 0u; i < count; ++i) {
+        const MdNv2Op *op = &ops[i];
+
+        if (op->kind == MD_NV2_LOOP_CX)
+            continue;
+
+        if (op->kind == MD_NV2_STOSB) {
+            ++stosb;
+            continue;
+        }
+
+        /* Keep the proof linear: no conditionally skipped byte stores. */
+        if (op->kind == MD_NV2_JZ || op->kind == MD_NV2_JNZ ||
+            op->kind == MD_NV2_JB || op->kind == MD_NV2_JMP)
+            return 0u;
+
+        if (op->kind == MD_NV2_MOV_MEM16_R16)
+            return 0u;
+
+        if (md_nv2_op_writes_reg(op, MD_X86_DI) ||
+            md_nv2_op_writes_reg(op, MD_X86_CX))
+            return 0u;
+    }
+
+    return (uint8_t)(stosb == 1u);
+}
+
 static int md_nv2_prove_muldiv_pair(const MdNv2Op *ops,
                                     unsigned count,
                                     uint8_t *mul_reg_out,
@@ -906,7 +1097,12 @@ static int md_nv2_mark_dynamic_retire(MdNv2Op *ops,
              ops[i].kind == MD_NV2_JB ||
              ops[i].kind == MD_NV2_JMP) &&
             ops[i].target != ops[0].ip) {
-            int ti = md_nv2_find_op_ip(ops, count, ops[i].target);
+            int ti;
+
+            if (ops[i].side_exit)
+                continue;
+
+            ti = md_nv2_find_op_ip(ops, count, ops[i].target);
             if (ti < 0)
                 return -1;
             branch_index = i;
@@ -1021,6 +1217,7 @@ static MdNativeV2Status md_nv2_lower(const uint8_t *image,
     uint16_t ip = entry_ip;
     unsigned count = 0u;
     unsigned conditional_count = 0u;
+    unsigned side_exit_count = 0u;
     int last_flag_kind = -1;
     uint8_t last_flag_reg = 0u;
     uint8_t has_loop = 0u;
@@ -1075,7 +1272,14 @@ static MdNativeV2Status md_nv2_lower(const uint8_t *image,
         op->next_ip = inst.next_ip;
         op->target = inst.target;
 
-        if ((opcode & 0xF8u) == 0xB8u) {
+        if ((opcode & 0xF8u) == 0xB0u) {
+            if (inst.length != 2u || off + 1u >= image_size)
+                return MD_NATIVE_V2_DECODE_ERROR;
+
+            op->kind = MD_NV2_MOV_R8_IMM;
+            op->dst = (uint8_t)(opcode & 7u);
+            op->imm = q[1];
+        } else if ((opcode & 0xF8u) == 0xB8u) {
             if (inst.length != 3u || off + 2u >= image_size)
                 return MD_NATIVE_V2_DECODE_ERROR;
 
@@ -1083,6 +1287,30 @@ static MdNativeV2Status md_nv2_lower(const uint8_t *image,
             op->dst = (uint8_t)(opcode & 7u);
             op->imm = (uint16_t)((uint16_t)q[1] |
                                  ((uint16_t)q[2] << 8));
+        } else if ((opcode == 0x88u || opcode == 0x8Au) &&
+                   inst.has_modrm) {
+            const unsigned mod = inst.modrm >> 6;
+            const unsigned mreg = (inst.modrm >> 3) & 7u;
+            const unsigned mrm = inst.modrm & 7u;
+
+            if (mod == 3u) {
+                op->kind = MD_NV2_MOV_RR8;
+                if (opcode == 0x8Au) {
+                    op->dst = (uint8_t)mreg;
+                    op->src = (uint8_t)mrm;
+                } else {
+                    op->dst = (uint8_t)mrm;
+                    op->src = (uint8_t)mreg;
+                }
+            } else if (opcode == 0x8Au &&
+                       mod == 0u && md_nv2_ds_mod0_rm_supported(mrm)) {
+                needs_memory = 1u;
+                op->kind = MD_NV2_MOV_R8_MEM8;
+                op->dst = (uint8_t)mreg;
+                op->aux = (uint8_t)mrm;
+            } else {
+                return MD_NATIVE_V2_UNSUPPORTED;
+            }
         } else if ((opcode == 0x89u || opcode == 0x8Bu) &&
                    inst.has_modrm) {
             const unsigned mod = inst.modrm >> 6;
@@ -1138,6 +1366,43 @@ static MdNativeV2Status md_nv2_lower(const uint8_t *image,
             last_flag_reg = op->dst;
             last_flag_index = (int)count;
         } else if (opcode <= 0x3Bu &&
+                   (opcode & 1u) == 0u &&
+                   ((opcode & 7u) == 0u || (opcode & 7u) == 2u) &&
+                   inst.has_modrm) {
+            const unsigned alu = (opcode >> 3) & 7u;
+            const unsigned mod = inst.modrm >> 6;
+            const unsigned mreg = (inst.modrm >> 3) & 7u;
+            const unsigned mrm = inst.modrm & 7u;
+
+            if (!md_nv2_alu8_supported(alu))
+                return MD_NATIVE_V2_UNSUPPORTED;
+
+            op->aux = (uint8_t)alu;
+
+            if (mod == 3u) {
+                op->kind = MD_NV2_ALU_RR8;
+                if (opcode & 2u) {
+                    op->dst = (uint8_t)mreg;
+                    op->src = (uint8_t)mrm;
+                } else {
+                    op->dst = (uint8_t)mrm;
+                    op->src = (uint8_t)mreg;
+                }
+            } else if ((opcode & 2u) != 0u &&
+                       mod == 0u && md_nv2_ds_mod0_rm_supported(mrm)) {
+                needs_memory = 1u;
+                op->kind = MD_NV2_ALU_R8_MEM8;
+                op->dst = (uint8_t)mreg;
+                op->src = (uint8_t)alu;
+                op->aux = (uint8_t)mrm;
+            } else {
+                return MD_NATIVE_V2_UNSUPPORTED;
+            }
+
+            last_flag_kind = op->kind;
+            last_flag_reg = (uint8_t)md_nv2_r8_parent(op->dst);
+            last_flag_index = (int)count;
+        } else if (opcode <= 0x3Bu &&
                    (opcode & 1u) != 0u &&
                    ((opcode & 7u) == 1u || (opcode & 7u) == 3u) &&
                    inst.has_modrm &&
@@ -1163,6 +1428,20 @@ static MdNativeV2Status md_nv2_lower(const uint8_t *image,
             last_flag_kind = MD_NV2_ALU_RR16;
             last_flag_reg = op->dst;
             last_flag_index = (int)count;
+        } else if (opcode == 0x04u || opcode == 0x0Cu ||
+                   opcode == 0x24u || opcode == 0x2Cu ||
+                   opcode == 0x34u || opcode == 0x3Cu) {
+            if (inst.length != 2u || off + 1u >= image_size)
+                return MD_NATIVE_V2_DECODE_ERROR;
+
+            op->kind = MD_NV2_ALU_R8_IMM;
+            op->aux = (uint8_t)((opcode >> 3) & 7u);
+            op->dst = 0u; /* AL */
+            op->imm = q[1];
+
+            last_flag_kind = MD_NV2_ALU_R8_IMM;
+            last_flag_reg = MD_X86_AX;
+            last_flag_index = (int)count;
         } else if (opcode == 0x05u || opcode == 0x35u ||
                    opcode == 0x3Du) {
             if (inst.length != 3u || off + 2u >= image_size)
@@ -1177,6 +1456,22 @@ static MdNativeV2Status md_nv2_lower(const uint8_t *image,
 
             last_flag_kind = MD_NV2_ALU_ACC_IMM16;
             last_flag_reg = MD_X86_AX;
+            last_flag_index = (int)count;
+        } else if (opcode == 0x80u &&
+                   inst.has_modrm &&
+                   (inst.modrm >> 6) == 3u) {
+            const unsigned alu = (inst.modrm >> 3) & 7u;
+
+            if (!md_nv2_alu8_supported(alu))
+                return MD_NATIVE_V2_UNSUPPORTED;
+
+            op->kind = MD_NV2_ALU_R8_IMM;
+            op->aux = (uint8_t)alu;
+            op->dst = (uint8_t)(inst.modrm & 7u);
+            op->imm = q[2];
+
+            last_flag_kind = MD_NV2_ALU_R8_IMM;
+            last_flag_reg = (uint8_t)md_nv2_r8_parent(op->dst);
             last_flag_index = (int)count;
         } else if (opcode == 0x83u &&
                    inst.has_modrm &&
@@ -1210,6 +1505,19 @@ static MdNativeV2Status md_nv2_lower(const uint8_t *image,
             op->imm = (uint16_t)((uint16_t)q[1] |
                                  ((uint16_t)q[2] << 8));
             last_flag_kind = MD_NV2_TEST_R16_IMM16;
+            last_flag_reg = MD_X86_AX;
+            last_flag_index = (int)count;
+        } else if (opcode == 0xF6u &&
+                   inst.has_modrm &&
+                   (inst.modrm >> 6) == 3u) {
+            const unsigned ext = (inst.modrm >> 3) & 7u;
+
+            if (ext != 4u)
+                return MD_NATIVE_V2_UNSUPPORTED;
+
+            op->kind = MD_NV2_MUL_R8;
+            op->src = (uint8_t)(inst.modrm & 7u);
+            last_flag_kind = MD_NV2_MUL_R8;
             last_flag_reg = MD_X86_AX;
             last_flag_index = (int)count;
         } else if (opcode == 0xF7u &&
@@ -1274,6 +1582,15 @@ static MdNativeV2Status md_nv2_lower(const uint8_t *image,
             last_flag_kind = op->kind;
             last_flag_reg = op->dst;
             last_flag_index = (int)count;
+        } else if (opcode == 0xACu) {
+            needs_memory = 1u;
+            requires_df_clear = 1u;
+            op->kind = MD_NV2_LODSB;
+        } else if (opcode == 0xAAu) {
+            needs_memory = 1u;
+            has_store = 1u;
+            requires_df_clear = 1u;
+            op->kind = MD_NV2_STOSB;
         } else if (opcode == 0xADu) {
             needs_memory = 1u;
             requires_df_clear = 1u;
@@ -1297,15 +1614,19 @@ static MdNativeV2Status md_nv2_lower(const uint8_t *image,
 
             if (conditional_count > 8u ||
                 inst.flow != MD_DECODE_FLOW_CONDITIONAL ||
-                inst.target < entry_ip ||
-                (uint32_t)inst.target >= image_end32) {
+                inst.target < entry_ip) {
                 return MD_NATIVE_V2_UNSUPPORTED;
             }
 
             op->kind = opcode == 0x72u ? MD_NV2_JB :
                        opcode == 0x74u ? MD_NV2_JZ : MD_NV2_JNZ;
 
-            if (opcode == 0x75u && inst.target < inst.next_ip) {
+            if ((uint32_t)inst.target >= image_end32) {
+                if (inst.target <= inst.next_ip || side_exit_count != 0u)
+                    return MD_NATIVE_V2_UNSUPPORTED;
+                op->side_exit = 1u;
+                ++side_exit_count;
+            } else if (opcode == 0x75u && inst.target < inst.next_ip) {
                 if (loop_terminal != 0u)
                     return MD_NATIVE_V2_UNSUPPORTED;
                 has_loop = 1u;
@@ -1331,8 +1652,12 @@ static MdNativeV2Status md_nv2_lower(const uint8_t *image,
         ip = inst.next_ip;
     }
 
+    if (side_exit_count != 0u && loop_terminal != 0xE2u)
+        return MD_NATIVE_V2_UNSUPPORTED;
+
     if (loop_terminal == 0xE2u) {
         const MdNv2Op *f;
+        unsigned exit_cf_live = 0u;
 
         if (count < 2u || last_flag_index != (int)count - 2)
             return MD_NATIVE_V2_UNSUPPORTED;
@@ -1362,6 +1687,14 @@ static MdNativeV2Status md_nv2_lower(const uint8_t *image,
             exit_flag_dst = MD_X86_AX;
             exit_flag_src = 0xFFu;
             exit_flag_imm = f->imm;
+        } else if (f->kind == MD_NV2_INC_R16 ||
+                   f->kind == MD_NV2_DEC_R16) {
+            exit_lazy_op = f->kind == MD_NV2_INC_R16
+                ? MD_LAZY_INC16 : MD_LAZY_DEC16;
+            exit_flag_dst = f->dst;
+            exit_flag_src = 0xFFu;
+            exit_flag_imm = 1u;
+            exit_cf_live = 1u;
         } else {
             uint16_t special_imm = 0u;
             uint8_t special_ror = 0u;
@@ -1379,7 +1712,7 @@ static MdNativeV2Status md_nv2_lower(const uint8_t *image,
         }
 
         *needs_entry_cf_out =
-            md_nv2_mark_flag_liveness(ops, count, 0u,
+            md_nv2_mark_flag_liveness(ops, count, exit_cf_live,
                                        cf_sites_out, z_sites_out);
     } else {
         if (last_flag_kind != MD_NV2_DEC_R16 || last_flag_reg == MD_X86_AX)
@@ -1458,12 +1791,69 @@ static void md_nv2_emit_ds_mod0_addr(MdThumbBuf *b, unsigned rm)
     th_wrap20_r12(b);
 }
 
-static void md_nv2_emit_exit_regs_only(MdThumbBuf *b)
+static void md_nv2_emit_r8_to(MdThumbBuf *b, unsigned rd, unsigned r8)
+{
+    const unsigned parent = md_nv2_arm_reg[md_nv2_r8_parent(r8)];
+    th_ubfx(b, rd, parent, (r8 & 4u) != 0u ? 8u : 0u, 8u);
+}
+
+static void md_nv2_emit_r8_from(MdThumbBuf *b, unsigned r8,
+                                unsigned value_reg)
+{
+    const unsigned parent = md_nv2_arm_reg[md_nv2_r8_parent(r8)];
+    const unsigned lsb = (r8 & 4u) != 0u ? 8u : 0u;
+
+    /*
+     * Resident GPRs are maintained zero-extended to 16 bits. BFI therefore
+     * replaces the selected guest byte and preserves the other guest byte in
+     * one Thumb-2 instruction.
+     */
+    th_bfi(b, parent, value_reg, lsb, 8u);
+}
+
+static void md_nv2_emit_mov_r8(MdThumbBuf *b,
+                               unsigned dst8, unsigned src8)
+{
+    const unsigned dst_parent = md_nv2_arm_reg[md_nv2_r8_parent(dst8)];
+    const unsigned src_parent = md_nv2_arm_reg[md_nv2_r8_parent(src8)];
+    const unsigned dst_lsb = (dst8 & 4u) != 0u ? 8u : 0u;
+
+    if ((dst8 & 7u) == (src8 & 7u))
+        return;
+
+    if ((src8 & 4u) == 0u) {
+        th_bfi(b, dst_parent, src_parent, dst_lsb, 8u);
+    } else {
+        md_nv2_emit_r8_to(b, 12u, src8);
+        th_bfi(b, dst_parent, 12u, dst_lsb, 8u);
+    }
+}
+
+static void md_nv2_emit_byte_result(MdThumbBuf *b, const MdNv2Op *op,
+                                    unsigned alu, int write_back)
+{
+    if (alu == 0u || alu == 5u || alu == 7u) {
+        if (op->need_cf)
+            th_cf_from_bit8(b, 12u);
+    } else if (op->need_cf) {
+        th_cf_zero(b);
+    }
+
+    th_ubfx(b, 12u, 12u, 0u, 8u);
+    if (op->need_z)
+        th_cmp_w_imm(b, 12u, 0u);
+    if (write_back)
+        md_nv2_emit_r8_from(b, op->dst, 12u);
+}
+
+static void md_nv2_emit_exit_regs_only(MdThumbBuf *b, int save_cf)
 {
     const unsigned roff = (unsigned)offsetof(MdX86, r);
+    const unsigned coff = (unsigned)offsetof(MdX86, lazy_carry);
     unsigned i;
 
-    if (!th_offset_ok_h(roff)) {
+    if (!th_offset_ok_h(roff) ||
+        (save_cf && !th_offset_ok_b(coff))) {
         b->failed = 1;
         return;
     }
@@ -1472,6 +1862,10 @@ static void md_nv2_emit_exit_regs_only(MdThumbBuf *b)
     th16(b, th_mov_hi(0u, 8u));
     for (i = 1u; i < 8u; ++i)
         th16(b, th_strh(md_nv2_arm_reg[i], 0u, roff + i * 2u));
+    if (save_cf) {
+        th16(b, th_mov_hi(2u, 11u));
+        th16(b, th_strb(2u, 0u, coff));
+    }
     th16(b, 0xBC02u);
     th16(b, th_strh(1u, 0u, roff));
 }
@@ -1803,7 +2197,7 @@ static MdNativeV2Status md_nv2_compile_phase4_call_loop(
         return MD_NATIVE_V2_BRANCH_RANGE;
     }
 
-    md_nv2_emit_exit_regs_only(&b);
+    md_nv2_emit_exit_regs_only(&b, 0);
     th16(&b, th_mov_hi(0u, 8u));
     th_load_imm16(&b, 1u, (uint16_t)(entry_ip + 5u));
     th16(&b, th_strh(1u, 0u, ipoff));
@@ -2540,6 +2934,74 @@ static MdNativeV2Status md_nv2_compile_phase7_flags_loop(
     return MD_NATIVE_V2_OK;
 }
 
+static int md_nv2_describe_side_exit(const MdNv2Op *ops,
+                                      unsigned count,
+                                      uint16_t *target_out,
+                                      uint8_t *ops_out,
+                                      uint8_t *flags_out,
+                                      uint8_t *dst_out,
+                                      uint8_t *src_out,
+                                      uint8_t *imm_out)
+{
+    unsigned found = 0u;
+    unsigned i;
+
+    if (target_out == NULL || ops_out == NULL || flags_out == NULL ||
+        dst_out == NULL || src_out == NULL || imm_out == NULL) {
+        return -1;
+    }
+
+    *target_out = 0u;
+    *ops_out = 0u;
+    *flags_out = MD_NV2_SIDE_FLAGS_NONE;
+    *dst_out = 0u;
+    *src_out = 0u;
+    *imm_out = 0u;
+
+    for (i = 0u; i < count; ++i) {
+        const MdNv2Op *branch;
+        const MdNv2Op *flags;
+
+        if (!ops[i].side_exit)
+            continue;
+
+        if (++found != 1u || i == 0u)
+            return -1;
+
+        branch = &ops[i];
+        flags = &ops[i - 1u];
+
+        if (branch->kind != MD_NV2_JZ &&
+            branch->kind != MD_NV2_JNZ &&
+            branch->kind != MD_NV2_JB) {
+            return -1;
+        }
+
+        if (flags->kind == MD_NV2_ALU_RR8 && flags->aux == 7u) {
+            *flags_out = MD_NV2_SIDE_FLAGS_CMP_RR8;
+            *dst_out = flags->dst;
+            *src_out = flags->src;
+        } else if (flags->kind == MD_NV2_ALU_R8_IMM &&
+                   flags->aux == 7u) {
+            *flags_out = MD_NV2_SIDE_FLAGS_CMP_RI8;
+            *dst_out = flags->dst;
+            *imm_out = (uint8_t)flags->imm;
+        } else if (flags->kind == MD_NV2_ALU_R8_MEM8 &&
+                   flags->src == 7u) {
+            *flags_out = MD_NV2_SIDE_FLAGS_CMP_RM8;
+            *dst_out = flags->dst;
+            *src_out = flags->aux;
+        } else {
+            return -1;
+        }
+
+        *target_out = branch->target;
+        *ops_out = (uint8_t)(i + 1u);
+    }
+
+    return found != 0u ? 1 : 0;
+}
+
 static MdNativeV2Status md_nv2_emit(const MdNv2Op *ops,
                                     unsigned count,
                                     uint16_t start_ip,
@@ -2567,7 +3029,10 @@ static MdNativeV2Status md_nv2_emit(const MdNv2Op *ops,
     unsigned patch_count = 0u;
     unsigned i;
     int z_valid = 0;
+    size_t side_exit_native = (size_t)-1;
+    uint16_t side_exit_target = 0u;
     const unsigned roff = (unsigned)offsetof(MdX86, r);
+    const unsigned esoff = (unsigned)offsetof(MdX86, es);
     const unsigned dsoff = (unsigned)offsetof(MdX86, ds);
     const unsigned foff = (unsigned)offsetof(MdX86, flags_raw);
     const unsigned moff = (unsigned)offsetof(MdX86, memory);
@@ -2584,7 +3049,7 @@ static MdNativeV2Status md_nv2_emit(const MdNv2Op *ops,
     b.failed = 0;
 
     if (!th_offset_ok_h(ipoff) || moff > 0x0FFFu ||
-        dsoff > 0x0FFFu || foff > 0x0FFFu) {
+        esoff > 0x0FFFu || dsoff > 0x0FFFu || foff > 0x0FFFu) {
         return MD_NATIVE_V2_UNSUPPORTED;
     }
 
@@ -2638,6 +3103,118 @@ static MdNativeV2Status md_nv2_emit(const MdNv2Op *ops,
 
             case MD_NV2_MOV_RR16:
                 th16(&b, th_mov_hi(dst, src));
+                break;
+
+            case MD_NV2_MOV_RR8:
+                md_nv2_emit_mov_r8(&b, op->dst, op->src);
+                break;
+
+            case MD_NV2_MOV_R8_IMM:
+                th_movw(&b, 12u, (uint16_t)(op->imm & 0xFFu));
+                md_nv2_emit_r8_from(&b, op->dst, 12u);
+                break;
+
+            case MD_NV2_MOV_R8_MEM8:
+                md_nv2_emit_ds_mod0_addr(&b, op->aux & 7u);
+                th_ldrb_w_reg(&b, 12u, 9u, 12u);
+                md_nv2_emit_r8_from(&b, op->dst, 12u);
+                break;
+
+            case MD_NV2_ALU_RR8: {
+                const unsigned alu = op->aux & 7u;
+                const int write_back = alu != 7u;
+
+                md_nv2_emit_r8_to(&b, 12u, op->dst);
+                md_nv2_emit_r8_to(&b, 11u, op->src);
+
+                switch (alu) {
+                    case 0u: th_add_w_reg(&b, 12u, 12u, 11u); break;
+                    case 1u: th_orr_w_reg(&b, 12u, 12u, 11u); break;
+                    case 4u: th_and_w_reg(&b, 12u, 12u, 11u); break;
+                    case 5u:
+                    case 7u: th_sub_w_reg(&b, 12u, 12u, 11u); break;
+                    case 6u: th_eor_w_reg(&b, 12u, 12u, 11u); break;
+                    default: return MD_NATIVE_V2_UNSUPPORTED;
+                }
+
+                md_nv2_emit_byte_result(&b, op, alu, write_back);
+                z_valid = op->need_z != 0u;
+                break;
+            }
+
+            case MD_NV2_ALU_R8_IMM: {
+                const unsigned alu = op->aux & 7u;
+                const int write_back = alu != 7u;
+
+                md_nv2_emit_r8_to(&b, 12u, op->dst);
+
+                switch (alu) {
+                    case 0u:
+                        th_add_w_imm(&b, 12u, 12u, op->imm & 0xFFu);
+                        break;
+                    case 5u:
+                    case 7u:
+                        th_sub_w_imm(&b, 12u, 12u, op->imm & 0xFFu);
+                        break;
+                    case 1u:
+                    case 4u:
+                    case 6u:
+                        th_movw(&b, 11u, (uint16_t)(op->imm & 0xFFu));
+                        if (alu == 1u)
+                            th_orr_w_reg(&b, 12u, 12u, 11u);
+                        else if (alu == 4u)
+                            th_and_w_reg(&b, 12u, 12u, 11u);
+                        else
+                            th_eor_w_reg(&b, 12u, 12u, 11u);
+                        break;
+                    default:
+                        return MD_NATIVE_V2_UNSUPPORTED;
+                }
+
+                md_nv2_emit_byte_result(&b, op, alu, write_back);
+                z_valid = op->need_z != 0u;
+                break;
+            }
+
+            case MD_NV2_ALU_R8_MEM8: {
+                const unsigned alu = op->src & 7u;
+                const int write_back = alu != 7u;
+
+                md_nv2_emit_ds_mod0_addr(&b, op->aux & 7u);
+                th_ldrb_w_reg(&b, 11u, 9u, 12u);
+                md_nv2_emit_r8_to(&b, 12u, op->dst);
+
+                switch (alu) {
+                    case 0u: th_add_w_reg(&b, 12u, 12u, 11u); break;
+                    case 1u: th_orr_w_reg(&b, 12u, 12u, 11u); break;
+                    case 4u: th_and_w_reg(&b, 12u, 12u, 11u); break;
+                    case 5u:
+                    case 7u: th_sub_w_reg(&b, 12u, 12u, 11u); break;
+                    case 6u: th_eor_w_reg(&b, 12u, 12u, 11u); break;
+                    default: return MD_NATIVE_V2_UNSUPPORTED;
+                }
+
+                md_nv2_emit_byte_result(&b, op, alu, write_back);
+                z_valid = op->need_z != 0u;
+                break;
+            }
+
+            case MD_NV2_MUL_R8:
+                /*
+                 * Extract the source before truncating AX because AH may be
+                 * the multiplier. Result is the exact 8x8 -> AX product.
+                 */
+                md_nv2_emit_r8_to(&b, 12u, op->src);
+                md_nv2_emit_r8_to(&b, 0u, 0u); /* AL */
+                th_mul_w(&b, 0u, 0u, 12u);
+                th16(&b, th_uxth(0u, 0u));
+                if (op->need_cf) {
+                    th_shift_w_imm(&b, 1u, 12u, 0u, 8u);
+                    th_rsb_w_zero(&b, 11u, 12u);
+                    th_orr_w_reg(&b, 12u, 12u, 11u);
+                    th_shift_w_imm(&b, 1u, 11u, 12u, 31u);
+                }
+                z_valid = 0;
                 break;
 
             case MD_NV2_INC_R16:
@@ -2899,6 +3476,29 @@ static MdNativeV2Status md_nv2_emit(const MdNv2Op *ops,
                 break;
             }
 
+            case MD_NV2_LODSB:
+                md_nv2_emit_ds_index_addr(&b, md_nv2_arm_reg[MD_X86_SI]);
+                th_ldrb_w_reg(&b, 12u, 9u, 12u);
+                md_nv2_emit_r8_from(&b, 0u, 12u); /* AL */
+                th_add_w_imm(&b, md_nv2_arm_reg[MD_X86_SI],
+                             md_nv2_arm_reg[MD_X86_SI], 1u);
+                th16(&b, th_uxth(md_nv2_arm_reg[MD_X86_SI],
+                                 md_nv2_arm_reg[MD_X86_SI]));
+                break;
+
+            case MD_NV2_STOSB:
+                /* ES base is not resident; calculate it only at the store. */
+                th_ldrh_w_imm(&b, 12u, 8u, esoff);
+                th_shift_w_imm(&b, 0u, 12u, 12u, 4u);
+                th16(&b, th_add_hi(12u, md_nv2_arm_reg[MD_X86_DI]));
+                th_wrap20_r12(&b);
+                th_strb_w_reg(&b, md_nv2_arm_reg[MD_X86_AX], 9u, 12u);
+                th_add_w_imm(&b, md_nv2_arm_reg[MD_X86_DI],
+                             md_nv2_arm_reg[MD_X86_DI], 1u);
+                th16(&b, th_uxth(md_nv2_arm_reg[MD_X86_DI],
+                                 md_nv2_arm_reg[MD_X86_DI]));
+                break;
+
             case MD_NV2_LODSW:
                 md_nv2_emit_ds_index_addr(&b, md_nv2_arm_reg[MD_X86_SI]);
                 th_ldrh_w_reg(&b, md_nv2_arm_reg[MD_X86_AX], 9u, 12u);
@@ -2919,6 +3519,9 @@ static MdNativeV2Status md_nv2_emit(const MdNv2Op *ops,
                 patches[patch_count].target_ip = op->target;
                 patches[patch_count].cond =
                     (uint8_t)(op->kind == MD_NV2_JZ ? 0u : 1u);
+                patches[patch_count].side_exit = op->side_exit;
+                if (op->side_exit)
+                    side_exit_target = op->target;
                 ++patch_count;
                 break;
 
@@ -2930,6 +3533,9 @@ static MdNativeV2Status md_nv2_emit(const MdNv2Op *ops,
                     th_emit_bcond_placeholder(&b, 1u); /* CF != 0 */
                 patches[patch_count].target_ip = op->target;
                 patches[patch_count].cond = 1u;
+                patches[patch_count].side_exit = op->side_exit;
+                if (op->side_exit)
+                    side_exit_target = op->target;
                 ++patch_count;
                 z_valid = 0;
                 break;
@@ -2940,6 +3546,7 @@ static MdNativeV2Status md_nv2_emit(const MdNv2Op *ops,
                 patches[patch_count].at = th_emit_b_placeholder(&b);
                 patches[patch_count].target_ip = op->target;
                 patches[patch_count].cond = 0xFFu;
+                patches[patch_count].side_exit = 0u;
                 ++patch_count;
                 break;
 
@@ -2954,6 +3561,7 @@ static MdNativeV2Status md_nv2_emit(const MdNv2Op *ops,
                 patches[patch_count].at = th_emit_bcond_placeholder(&b, 1u);
                 patches[patch_count].target_ip = op->target;
                 patches[patch_count].cond = 1u;
+                patches[patch_count].side_exit = 0u;
                 ++patch_count;
                 z_valid = 0;
                 break;
@@ -2973,7 +3581,9 @@ static MdNativeV2Status md_nv2_emit(const MdNv2Op *ops,
         return MD_NATIVE_V2_TOO_LARGE;
 
     if (loop_terminal == 0xE2u)
-        md_nv2_emit_exit_regs_only(&b);
+        md_nv2_emit_exit_regs_only(
+            &b, exit_lazy_op == MD_LAZY_INC16 ||
+                exit_lazy_op == MD_LAZY_DEC16);
     else
         md_nv2_emit_exit_dec_flags(&b, exit_flags_reg);
 
@@ -2985,13 +3595,34 @@ static MdNativeV2Status md_nv2_emit(const MdNv2Op *ops,
         th16(&b, th_movs(0u, 0u));
     th16(&b, 0x4770u); /* bx lr */
 
+    if (side_exit_target != 0u) {
+        side_exit_native = b.at;
+        md_nv2_emit_exit_regs_only(&b, 0);
+        th_load_imm16(&b, 1u, side_exit_target);
+        th16(&b, th_strh(1u, 0u, ipoff));
+        th16(&b, th_movs(0u, 1u));
+        th_mvn_w_reg(&b, 0u, 0u); /* r0 = 0xFFFFFFFE */
+        th16(&b, 0x4770u);
+    }
+
     if (b.failed)
         return MD_NATIVE_V2_TOO_LARGE;
 
     for (i = 0u; i < patch_count; ++i) {
-        const int target_index =
-            md_nv2_find_op_ip(ops, count, patches[i].target_ip);
+        int target_index;
 
+        if (patches[i].side_exit) {
+            if (side_exit_native == (size_t)-1 ||
+                !th_patch_bcond(&b, patches[i].at,
+                                patches[i].cond,
+                                side_exit_native)) {
+                return MD_NATIVE_V2_BRANCH_RANGE;
+            }
+            continue;
+        }
+
+        target_index = md_nv2_find_op_ip(
+            ops, count, patches[i].target_ip);
         if (target_index < 0)
             return MD_NATIVE_V2_BRANCH_RANGE;
 
@@ -3064,6 +3695,13 @@ MdNativeV2Status md_native_v2_compile_8086(const uint8_t *image,
     uint8_t muldiv_div_reg = 0u;
     uint8_t exit_flags_mode = 0u;
     uint8_t exit_rot_reg = 0u;
+    uint16_t side_exit_target = 0u;
+    uint8_t side_exit_ops = 0u;
+    uint8_t side_exit_flags = MD_NV2_SIDE_FLAGS_NONE;
+    uint8_t side_exit_dst = 0u;
+    uint8_t side_exit_src = 0u;
+    uint8_t side_exit_imm = 0u;
+    int side_exit_desc = 0;
     MdNativeV2Status status;
 
     if (out == NULL)
@@ -3080,6 +3718,15 @@ MdNativeV2Status md_native_v2_compile_8086(const uint8_t *image,
     if (status != MD_NATIVE_V2_OK) {
         memset(out, 0, sizeof(*out));
         return status;
+    }
+
+    side_exit_desc = md_nv2_describe_side_exit(
+        ops, count,
+        &side_exit_target, &side_exit_ops, &side_exit_flags,
+        &side_exit_dst, &side_exit_src, &side_exit_imm);
+    if (side_exit_desc < 0) {
+        memset(out, 0, sizeof(*out));
+        return MD_NATIVE_V2_UNSUPPORTED;
     }
 
     {
@@ -3124,9 +3771,13 @@ MdNativeV2Status md_native_v2_compile_8086(const uint8_t *image,
 
         out->safe_store_bx_si_loop =
             md_nv2_safe_store_bx_si_loop(ops, count, loop_terminal);
+        out->safe_stosb_loop =
+            md_nv2_safe_stosb_loop(ops, count, loop_terminal);
 
         if (out->safe_store_bx_si_loop)
             out->phase = 7u;
+        else if (out->safe_stosb_loop)
+            out->phase = 14u;
 
         if (muldiv_proof > 0) {
             out->requires_safe_muldiv = 1u;
@@ -3139,6 +3790,16 @@ MdNativeV2Status md_native_v2_compile_8086(const uint8_t *image,
         out->exit_rot_reg = exit_rot_reg;
         out->chunkable_loop =
             md_nv2_chunk_mode(ops, count, loop_terminal);
+
+        if (side_exit_desc > 0) {
+            out->side_exit_target = side_exit_target;
+            out->side_exit_ops = side_exit_ops;
+            out->side_exit_flags = side_exit_flags;
+            out->side_exit_dst = side_exit_dst;
+            out->side_exit_src = side_exit_src;
+            out->side_exit_imm = side_exit_imm;
+            out->phase = 15u;
+        }
     }
 
     return status;
@@ -3156,8 +3817,28 @@ static uint8_t md_nv2_probe_write_mask(const MdDecodedInstruction *inst)
     if (inst->prefix_count != 0u)
         return 0xFFu;
 
+    if ((opcode & 0xF8u) == 0xB0u)
+        return (uint8_t)(1u << md_nv2_r8_parent(opcode & 7u));
+
     if ((opcode & 0xF8u) == 0xB8u)
         return (uint8_t)(1u << (opcode & 7u));
+
+    if (opcode == 0x88u || opcode == 0x8Au) {
+        const unsigned mod = inst->modrm >> 6;
+        const unsigned reg = (inst->modrm >> 3) & 7u;
+        const unsigned rm = inst->modrm & 7u;
+
+        if (!inst->has_modrm)
+            return 0xFFu;
+
+        if (opcode == 0x8Au)
+            return (uint8_t)(1u << md_nv2_r8_parent(reg));
+
+        if (mod == 3u)
+            return (uint8_t)(1u << md_nv2_r8_parent(rm));
+
+        return 0u;
+    }
 
     if (opcode == 0x89u || opcode == 0x8Bu) {
         const unsigned mod = inst->modrm >> 6;
@@ -3186,6 +3867,24 @@ static uint8_t md_nv2_probe_write_mask(const MdDecodedInstruction *inst)
         return (uint8_t)(1u << (opcode & 7u));
 
     if (opcode <= 0x3Bu &&
+        (opcode & 1u) == 0u &&
+        ((opcode & 7u) == 0u || (opcode & 7u) == 2u) &&
+        inst->has_modrm) {
+        const unsigned alu = (opcode >> 3) & 7u;
+        const unsigned mod = inst->modrm >> 6;
+        const unsigned reg = (inst->modrm >> 3) & 7u;
+        const unsigned rm = inst->modrm & 7u;
+
+        if (alu == 7u) return 0u;
+        if (mod == 3u)
+            return (uint8_t)(1u << md_nv2_r8_parent(
+                (opcode & 2u) ? reg : rm));
+        if ((opcode & 2u) != 0u)
+            return (uint8_t)(1u << md_nv2_r8_parent(reg));
+        return 0u;
+    }
+
+    if (opcode <= 0x3Bu &&
         (opcode & 1u) != 0u &&
         ((opcode & 7u) == 1u || (opcode & 7u) == 3u) &&
         inst->has_modrm &&
@@ -3198,11 +3897,26 @@ static uint8_t md_nv2_probe_write_mask(const MdDecodedInstruction *inst)
         return (uint8_t)(1u << ((opcode & 2u) ? reg : rm));
     }
 
+    if (opcode == 0x04u || opcode == 0x0Cu ||
+        opcode == 0x24u || opcode == 0x2Cu || opcode == 0x34u)
+        return (uint8_t)(1u << MD_X86_AX);
+
+    if (opcode == 0x3Cu)
+        return 0u;
+
     if (opcode == 0x05u || opcode == 0x35u)
         return (uint8_t)(1u << MD_X86_AX);
 
     if (opcode == 0x3Du || opcode == 0xA9u)
         return 0u;
+
+    if (opcode == 0x80u &&
+        inst->has_modrm &&
+        (inst->modrm >> 6) == 3u) {
+        const unsigned alu = (inst->modrm >> 3) & 7u;
+        if (alu == 7u) return 0u;
+        return (uint8_t)(1u << md_nv2_r8_parent(inst->modrm & 7u));
+    }
 
     if (opcode == 0x83u &&
         inst->has_modrm &&
@@ -3216,6 +3930,15 @@ static uint8_t md_nv2_probe_write_mask(const MdDecodedInstruction *inst)
         inst->has_modrm &&
         (inst->modrm >> 6) == 3u)
         return (uint8_t)(1u << (inst->modrm & 7u));
+
+    if (opcode == 0xF6u &&
+        inst->has_modrm &&
+        (inst->modrm >> 6) == 3u) {
+        const unsigned ext = (inst->modrm >> 3) & 7u;
+        if (ext == 4u)
+            return (uint8_t)(1u << MD_X86_AX);
+        return 0xFFu;
+    }
 
     if (opcode == 0xF7u &&
         inst->has_modrm &&
@@ -3231,6 +3954,12 @@ static uint8_t md_nv2_probe_write_mask(const MdDecodedInstruction *inst)
 
     if ((opcode & 0xF0u) == 0x70u || opcode == 0xEBu)
         return 0u; /* short Jcc/JMP */
+
+    if (opcode == 0xACu)
+        return (uint8_t)((1u << MD_X86_AX) | (1u << MD_X86_SI));
+
+    if (opcode == 0xAAu)
+        return (uint8_t)(1u << MD_X86_DI);
 
     if (opcode == 0xADu)
         return (uint8_t)((1u << MD_X86_AX) | (1u << MD_X86_SI));
@@ -3298,9 +4027,16 @@ MdNativeV2Status md_native_v2_compile_counted_loop(const uint8_t *image,
              * Keep scanning the linear body until the terminal backward edge.
              */
             if (inst.target != entry_ip) {
-                if ((inst.opcode != 0x74u && inst.opcode != 0x72u) ||
-                    inst.target <= inst.next_ip ||
-                    (size_t)(uint16_t)(inst.target - entry_ip) >= max_size) {
+                /*
+                 * M24.6b v5: max_size is only the caller's probe window.
+                 * It can be much larger than the eventual counted-loop
+                 * region. Defer internal-vs-external classification until
+                 * the terminal edge establishes the final loop span.
+                 */
+                if ((inst.opcode != 0x72u &&
+                     inst.opcode != 0x74u &&
+                     inst.opcode != 0x75u) ||
+                    inst.target <= inst.next_ip) {
                     return MD_NATIVE_V2_UNSUPPORTED;
                 }
 
@@ -3346,6 +4082,42 @@ MdNativeV2Status md_native_v2_compile_counted_loop(const uint8_t *image,
                 span = (size_t)(uint16_t)(inst.next_ip - entry_ip);
                 if (span == 0u || span > max_size)
                     return MD_NATIVE_V2_UNSUPPORTED;
+
+                {
+                    unsigned external_side_exits = 0u;
+
+                    for (i = 0u; i < count; ++i) {
+                        const MdDecodedInstruction *fwd = &decoded[i];
+                        size_t target_off;
+
+                        if (fwd->flow != MD_DECODE_FLOW_CONDITIONAL ||
+                            fwd->target == entry_ip) {
+                            continue;
+                        }
+
+                        target_off =
+                            (size_t)(uint16_t)(fwd->target - entry_ip);
+
+                        if (target_off >= span) {
+                            if ((fwd->opcode != 0x72u &&
+                                 fwd->opcode != 0x74u &&
+                                 fwd->opcode != 0x75u) ||
+                                ++external_side_exits > 1u) {
+                                return MD_NATIVE_V2_UNSUPPORTED;
+                            }
+                        } else {
+                            /*
+                             * Preserve existing internal small-CFG support:
+                             * JZ/JB only. Forward JNZ is currently reserved
+                             * for an external side exit.
+                             */
+                            if (fwd->opcode != 0x72u &&
+                                fwd->opcode != 0x74u) {
+                                return MD_NATIVE_V2_UNSUPPORTED;
+                            }
+                        }
+                    }
+                }
 
                 status = md_native_v2_compile_8086(
                     image, span, entry_ip, entry_ip, out);
@@ -3445,11 +4217,63 @@ static void md_nv2_finish_loop_flags(MdX86 *cpu, const MdNativeV2Code *code)
             md_x86_lazy(cpu, MD_LAZY_LOGIC16, 0u, 0u, r);
             cpu->lazy_carry = 0u;
             break;
+        case MD_LAZY_INC16:
+        case MD_LAZY_DEC16: {
+            const uint8_t saved_cf = cpu->lazy_carry;
+            a = code->exit_lazy_op == MD_LAZY_INC16
+                ? (uint16_t)(r - 1u) : (uint16_t)(r + 1u);
+            md_x86_lazy(cpu, code->exit_lazy_op, a, 1u, r);
+            cpu->lazy_carry = saved_cf;
+            break;
+        }
         default:
             break;
     }
 }
 
+
+static uint16_t md_nv2_side_rm_offset(const MdX86 *cpu, unsigned rm)
+{
+    switch (rm & 7u) {
+        case 0u: return (uint16_t)(cpu->r[MD_X86_BX] +
+                                   cpu->r[MD_X86_SI]);
+        case 1u: return (uint16_t)(cpu->r[MD_X86_BX] +
+                                   cpu->r[MD_X86_DI]);
+        case 4u: return cpu->r[MD_X86_SI];
+        case 5u: return cpu->r[MD_X86_DI];
+        case 7u: return cpu->r[MD_X86_BX];
+        default: return 0u;
+    }
+}
+
+static void md_nv2_finish_side_exit_flags(MdX86 *cpu,
+                                           const MdNativeV2Code *code)
+{
+    const uint8_t a = md_x86_get_reg8(cpu, code->side_exit_dst & 7u);
+    uint8_t b = 0u;
+
+    switch (code->side_exit_flags) {
+        case MD_NV2_SIDE_FLAGS_CMP_RR8:
+            b = md_x86_get_reg8(cpu, code->side_exit_src & 7u);
+            break;
+
+        case MD_NV2_SIDE_FLAGS_CMP_RI8:
+            b = code->side_exit_imm;
+            break;
+
+        case MD_NV2_SIDE_FLAGS_CMP_RM8:
+            b = md_x86_read8(
+                cpu, cpu->ds,
+                md_nv2_side_rm_offset(cpu, code->side_exit_src));
+            break;
+
+        default:
+            return;
+    }
+
+    md_x86_lazy(cpu, MD_LAZY_SUB8, a, b, (uint8_t)(a - b));
+    cpu->lazy_carry = 0u;
+}
 
 bool md_native_v2_available(void)
 {
@@ -3549,9 +4373,12 @@ uint32_t md_native_v2_execute(MdX86 *cpu, const MdNativeV2Code *code)
     entry = ((uintptr_t)&code->bytes[0]) | (uintptr_t)1u;
     {
         const uint32_t rc = md_nv2_call_thumb(cpu, entry);
-        if (rc != MD_NATIVE_V2_EXEC_FALLBACK &&
-            code->loop_terminal == 0xE2u &&
-            !code->needs_entry_flags) {
+
+        if (rc == MD_NATIVE_V2_EXEC_SIDE_EXIT) {
+            md_nv2_finish_side_exit_flags(cpu, code);
+        } else if (rc != MD_NATIVE_V2_EXEC_FALLBACK &&
+                   code->loop_terminal == 0xE2u &&
+                   !code->needs_entry_flags) {
             md_nv2_finish_loop_flags(cpu, code);
         }
         return rc;

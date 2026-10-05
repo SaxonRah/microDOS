@@ -248,6 +248,8 @@ bool md_native_v2_runtime_try_execute(MdNativeV2Runtime *runtime,
     uint64_t max_retired;
     uint64_t prefix_retired = 0u;
     int chunked = 0;
+    int side_exited = 0;
+    uint64_t side_completed = 0u;
     uint32_t native_rc;
     size_t window;
     unsigned index;
@@ -379,6 +381,7 @@ bool md_native_v2_runtime_try_execute(MdNativeV2Runtime *runtime,
 
         if (code.has_store &&
             !code.safe_store_bx_si_loop &&
+            !code.safe_stosb_loop &&
             !code.safe_stack_pushpop &&
             !code.local_call_graph &&
             !code.safe_rep_string_loop) {
@@ -483,6 +486,42 @@ execute:
         }
 
         data_start = md_x86_linear(cpu->ds, (uint16_t)start_off);
+        data_end = data_start + (uint32_t)byte_count - 1u;
+
+        if (!(data_end < code_start || data_start > code_end)) {
+            ++runtime->store_guard_rejects;
+            return false;
+        }
+
+        if (md_nv2_rt_range_hits_tracked_pages(cpu, data_start, data_end)) {
+            ++runtime->store_guard_rejects;
+            return false;
+        }
+    }
+
+    /*
+     * M24.6 reusable STOSB class. The IR proof guarantees one unconditional
+     * forward STOSB per E2 iteration and no other store in the loop.
+     */
+    if (slot->code.safe_stosb_loop) {
+        const uint32_t start_off = cpu->r[MD_X86_DI];
+        const uint64_t byte_count = run_iterations;
+        const uint64_t end_off_exclusive =
+            (uint64_t)start_off + byte_count;
+        const uint32_t code_start = md_x86_linear(cpu->cs, slot->ip);
+        const uint32_t code_end =
+            code_start + (uint32_t)slot->guest_size - 1u;
+        uint32_t data_start;
+        uint32_t data_end;
+
+        if (cpu->es > 0xEFFFu ||
+            byte_count == 0u ||
+            end_off_exclusive > 0x10000u) {
+            ++runtime->store_guard_rejects;
+            return false;
+        }
+
+        data_start = md_x86_linear(cpu->es, (uint16_t)start_off);
         data_end = data_start + (uint32_t)byte_count - 1u;
 
         if (!(data_end < code_start || data_start > code_end)) {
@@ -662,7 +701,31 @@ execute:
         return false;
     }
 
-    if (slot->code.dynamic_retire) {
+    if (native_rc == MD_NATIVE_V2_EXEC_SIDE_EXIT) {
+        const uint16_t native_start =
+            run_iterations == 65536u ? 0u : (uint16_t)run_iterations;
+        const uint16_t native_left =
+            cpu->r[slot->counter_reg & 7u];
+
+        /*
+         * LOOP decrements CX only after a complete body iteration.
+         * 16-bit modular subtraction therefore gives the exact number of
+         * complete iterations before the partial side-exit iteration.
+         */
+        side_completed =
+            (uint64_t)(uint16_t)(native_start - native_left);
+        retired = prefix_retired +
+            side_completed * (uint64_t)slot->code.op_count +
+            (uint64_t)slot->code.side_exit_ops;
+        side_exited = 1;
+
+        if (chunked) {
+            const uint64_t real_remaining = iterations - side_completed;
+            cpu->r[slot->counter_reg & 7u] =
+                real_remaining == 65536u
+                    ? 0u : (uint16_t)real_remaining;
+        }
+    } else if (slot->code.dynamic_retire) {
         const uint64_t optional_max =
             run_iterations *
             (uint64_t)(slot->code.op_count - slot->code.retire_base_ops);
@@ -679,7 +742,7 @@ execute:
         retired = max_retired;
     }
 
-    if (chunked) {
+    if (chunked && !side_exited) {
         const uint64_t remaining = iterations - run_iterations;
         const uint16_t remaining16 =
             remaining == 65536u ? 0u : (uint16_t)remaining;
@@ -718,7 +781,8 @@ execute:
 
     if (result != NULL) {
         result->retired = retired;
-        result->iterations = (uint32_t)run_iterations;
+        result->iterations = (uint32_t)(
+            side_exited ? side_completed : run_iterations);
         result->cs = slot->cs;
         result->ip = slot->ip;
         result->entered = 1u;

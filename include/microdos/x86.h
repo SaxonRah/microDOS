@@ -152,7 +152,8 @@ static inline int md_lazy_wide(unsigned op)
 
 static inline unsigned md_lazy_sign(unsigned op)
 {
-    return md_lazy_wide(op) ? 0x8000u : 0x80u;
+    /* even op (16-bit) -> 0x8000, odd op (8-bit) -> 0x80, without a branch */
+    return 0x80u << ((~op & 1u) << 3);
 }
 
 static inline unsigned md_lazy_mask(unsigned op)
@@ -220,20 +221,20 @@ static inline int md_x86_of(const MdX86 *cpu)
 static inline void md_x86_flags_materialize(MdX86 *cpu)
 {
     const unsigned op = cpu->lazy_op;
+    const unsigned r = cpu->lazy_res;
     unsigned f;
-    uint8_t p;
+    unsigned p;
     if (op == MD_LAZY_NONE) return;
     f = cpu->flags_raw & (0xFFFFu ^ MD_X86_FLAGS_OSZAPC);   /* no truncating cast (MSVC C4310) */
-    if (md_x86_cf(cpu)) f |= 0x0001u;
-    p = (uint8_t)cpu->lazy_res;
-    p ^= (uint8_t)(p >> 4);
-    p &= 0x0Fu;
-    if ((0x9669u >> p) & 1u) f |= 0x0004u;
-    if (op != MD_LAZY_LOGIC8 && op != MD_LAZY_LOGIC16 &&
-        ((cpu->lazy_a ^ cpu->lazy_b ^ cpu->lazy_res) & 0x10u) != 0u) f |= 0x0010u;
-    if (md_x86_zf(cpu)) f |= 0x0040u;
-    if (md_x86_sf(cpu)) f |= 0x0080u;
-    if (md_x86_of(cpu)) f |= 0x0800u;
+    /* Every flag lands in its bit position with shifts/ORs, no branches. */
+    f |= (unsigned)md_x86_cf(cpu);                               /* CF bit 0 */
+    p = (r ^ (r >> 4)) & 0x0Fu;
+    f |= ((0x9669u >> p) & 1u) << 2;                             /* PF bit 2 */
+    if (op != MD_LAZY_LOGIC8 && op != MD_LAZY_LOGIC16)
+        f |= (cpu->lazy_a ^ cpu->lazy_b ^ r) & 0x10u;            /* AF bit 4 */
+    f |= (unsigned)(r == 0u) << 6;                               /* ZF bit 6 */
+    f |= (unsigned)((r & md_lazy_sign(op)) != 0u) << 7;          /* SF bit 7 */
+    f |= (unsigned)md_x86_of(cpu) << 11;                         /* OF bit 11 */
     cpu->flags_raw = (uint16_t)f;
     cpu->lazy_op = MD_LAZY_NONE;
 }

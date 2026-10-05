@@ -14,6 +14,7 @@ extern "C" {
 #define MD_NATIVE_V2_CODE_BYTES 1024u
 #define MD_NATIVE_V2_MAX_OPS 128u
 #define MD_NATIVE_V2_EXEC_FALLBACK 0xFFFFFFFFu
+#define MD_NATIVE_V2_EXEC_SIDE_EXIT 0xFFFFFFFEu
 
 typedef enum MdNativeV2Status {
     MD_NATIVE_V2_OK = 0,
@@ -55,6 +56,35 @@ typedef struct MdNativeV2Code {
      * SI advances by +2 exactly once, CX is the LOOP counter.
      */
     uint8_t safe_store_bx_si_loop;
+
+    /*
+     * M24.6 reusable byte-string store proof.
+     * A generic STOSB instruction in a linear E2 counted loop may execute
+     * natively only after runtime proves its exact ES:DI byte span is
+     * forward, non-wrapping, disjoint from executing code, and untracked.
+     */
+    uint8_t safe_stosb_loop;
+
+    /*
+     * M24.6b generic counted-loop side exit.
+     *
+     * One forward JZ/JNZ/JB may leave an E2 counted loop before LOOP.
+     * Full iterations still retire op_count operations; side_exit_ops is
+     * the number of guest instructions executed in the partial exit
+     * iteration, including the taken conditional branch.
+     *
+     * side_exit_flags:
+     *   0 = none
+     *   1 = CMP r8,r8
+     *   2 = CMP r8,imm8
+     *   3 = CMP r8,[DS mod=00]
+     */
+    uint16_t side_exit_target;
+    uint8_t side_exit_ops;
+    uint8_t side_exit_flags;
+    uint8_t side_exit_dst;
+    uint8_t side_exit_src;
+    uint8_t side_exit_imm;
 
     /*
      * CFG retirement modes:
