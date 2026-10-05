@@ -15,6 +15,7 @@ add_library(microdos_runtime STATIC
     src/runtime/x86_block_cache.c
     src/runtime/region.c
     src/runtime/exec_router.c
+    src/runtime/translate.c
 )
 add_library(microdos::runtime ALIAS microdos_runtime)
 target_include_directories(microdos_runtime PUBLIC "${CMAKE_CURRENT_LIST_DIR}/include" PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/runtime")

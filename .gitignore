@@ -48,3 +48,5 @@
 # Python
 __pycache__/
 *.pyc
+# M25 differential harness single-case dump
+/translate_diff_case.bin

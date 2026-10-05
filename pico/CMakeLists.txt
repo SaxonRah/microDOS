@@ -291,5 +291,22 @@ target_compile_definitions(microdos_nativev2_usbsmoke PRIVATE
     MICRODOS_PICO_SYS_KHZ=0)
 pico_set_program_name(microdos_nativev2_usbsmoke "microDOS NV2 USB smoke")
 
+# M25 translator on-device check: differential test (interpreter vs
+# translated Thumb-2, guest RAM in PSRAM) plus interpreter-vs-translator
+# loop benchmarks. Run with scripts/md_translate_diff_pico.ps1.
+add_executable(microdos_pico_translate_diff
+    "${CMAKE_CURRENT_LIST_DIR}/microdos_translate_diff.c"
+    "${MD_ROOT}/src/runtime/runtime.c"
+    "${MD_ROOT}/src/runtime/x86_interp.c"
+    "${MD_ROOT}/src/runtime/x86_block_cache.c"
+    "${MD_ROOT}/src/runtime/region.c"
+    "${MD_ROOT}/src/runtime/translate.c"
+    "${MD_ROOT}/src/decode/x86_decode.c")
+md_pico_common(microdos_pico_translate_diff 1)
+target_include_directories(microdos_pico_translate_diff PRIVATE "${MD_ROOT}/tests")
+target_compile_definitions(microdos_pico_translate_diff PRIVATE
+    MICRODOS_PICO_SYS_KHZ=300000)
+pico_set_program_name(microdos_pico_translate_diff "microDOS M25 translate diff")
+
 md_pico_bench(microdos_bench     1 300000)
 md_pico_bench(microdos_bench_150 1 0)
