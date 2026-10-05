@@ -4,7 +4,7 @@ param(
     [ValidateSet(16,24,32,48)]
     [int]$HotBlocks = 48,
     [ValidateRange(0,4)]
-    [int]$ClosureDepth = 2
+    [int]$ClosureDepth = 3
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,7 +17,7 @@ $GeneratedAot = Join-Path $Repo "build-host\generated\msdos2_recomp.c"
 $Bench = Join-Path $Repo "md_nativev2_phase3p_completion_splitbench.ps1"
 $Picotool = "$HOME\.pico-sdk\picotool\2.3.0\picotool\picotool.exe"
 $Uf2 = Join-Path $Repo "build-pico\out\microdos_pico_nativev2.uf2"
-$TempDir = Join-Path $Repo "build-pico\phase4h"
+$TempDir = Join-Path $Repo "build-pico\phase4i"
 $FlashAot = Join-Path $TempDir "msdos2_recomp_flash.c"
 
 $RecoveryDir = Join-Path $TempDir "recovery"
@@ -97,7 +97,7 @@ if ($AotFlash.IndexOf($injectMarker, [StringComparison]::Ordinal) -lt 0) {
 $placementMacros = @'
 
 /*
- * Phase 4H diagnostic placement.
+ * Phase 4I diagnostic placement.
  * .flashdata.* remains XIP-flash resident in Pico COPY_TO_RAM binaries.
  */
 #define MD_AOT_XIP_TEXT   __attribute__((section(".flashdata.md_aot_text"), noinline))
@@ -170,7 +170,7 @@ $AotFlash = [regex]::Replace(
 )
 
 # -------------------------------------------------------------------------
-# Phase 4H: profile-guided hot block split.
+# Phase 4I: profile-guided hot block split.
 #
 # The Phase 4F exact profiler found the same top 48 kernel blocks in all
 # three DOS2TEST runs.  Together they retire about 70% of kernel AOT guest
@@ -241,13 +241,15 @@ $HotIps = @(
     Sort-Object { [Convert]::ToInt32($_, 16) }
 )
 $ColdTargets = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$HotColdEdgeKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$HotColdEdges = New-Object System.Collections.Generic.List[object]
 $HotBlockCopies = New-Object System.Collections.Generic.List[string]
 
 foreach ($ip in $HotIps) {
     $block = Get-AotBlockText $AotForHotExtraction $ip
+    $sourceIp = $ip
 
-    # Any direct edge from a hot block to a non-hot block gets a local redirect
-    # label.  This preserves single-statement conditional-goto semantics.
+    # Instrument exact hot->cold edges. Hot->hot edges remain direct.
     $block = [regex]::Replace(
         $block,
         'goto md_block_([0-9A-Fa-f]{4});',
@@ -257,8 +259,17 @@ foreach ($ip in $HotIps) {
             if ($HotSet.Contains($target)) {
                 return "goto md_block_$target;"
             }
+
             [void]$ColdTargets.Add($target)
-            return "goto md_hot_to_cold_$target;"
+            $edgeKey = "${sourceIp}_${target}"
+            if ($HotColdEdgeKeys.Add($edgeKey)) {
+                $HotColdEdges.Add([pscustomobject]@{
+                    Source = $sourceIp
+                    Target = $target
+                    Key    = $edgeKey
+                })
+            }
+            return "goto md_hot_to_cold_${sourceIp}_${target};"
         }
     )
 
@@ -274,17 +285,47 @@ $HotGotoCases = ($HotIps | ForEach-Object {
 }) -join "`n"
 
 $ColdTargetList = @($ColdTargets | Sort-Object)
-$HotColdRedirects = ($ColdTargetList | ForEach-Object {
-@"
-md_hot_to_cold_$($_):
-    cpu->ip = 0x$($_)u;
+
+$HotColdEdgeList = @(
+    $HotColdEdges |
+    Sort-Object `
+        @{ Expression = { [Convert]::ToInt32($_.Source, 16) } }, `
+        @{ Expression = { [Convert]::ToInt32($_.Target, 16) } }
+)
+
+$EdgeCount = $HotColdEdgeList.Count
+if ($EdgeCount -le 0) {
+    throw "Phase 4I edge profiler found no hot->cold edges at closure depth $ClosureDepth."
+}
+
+$EdgeSrcInit = ($HotColdEdgeList | ForEach-Object { "0x$($_.Source)u" }) -join ", "
+$EdgeDstInit = ($HotColdEdgeList | ForEach-Object { "0x$($_.Target)u" }) -join ", "
+
+$HotColdRedirectsList = New-Object System.Collections.Generic.List[string]
+for ($edgeIndex = 0; $edgeIndex -lt $HotColdEdgeList.Count; ++$edgeIndex) {
+    $edge = $HotColdEdgeList[$edgeIndex]
+    $HotColdRedirectsList.Add(@"
+md_hot_to_cold_$($edge.Source)_$($edge.Target):
+    ++md_hot_edge_hits[$edgeIndex];
+    cpu->ip = 0x$($edge.Target)u;
     goto md_dispatch;
-"@
-}) -join "`n"
+"@)
+}
+$HotColdRedirects = $HotColdRedirectsList -join "`n"
 
 $HotBlocksText = $HotBlockCopies -join "`n`n"
 
-$HotPrototypes = @'
+$HotPrototypes = @"
+static uint32_t md_hot_edge_hits[$EdgeCount];
+static const uint16_t md_hot_edge_src[$EdgeCount] = { $EdgeSrcInit };
+static const uint16_t md_hot_edge_dst[$EdgeCount] = { $EdgeDstInit };
+
+unsigned md_aot_hot_edge_count(void);
+uint16_t md_aot_hot_edge_source(unsigned index);
+uint16_t md_aot_hot_edge_target(unsigned index);
+uint32_t md_aot_hot_edge_hits(unsigned index);
+void md_aot_hot_edge_reset(void);
+
 static int md_hot_is_entry(uint16_t ip);
 static MdStopReason md_hot_body(MdRuntime *runtime,
                                 uint16_t segment,
@@ -294,7 +335,7 @@ static MdStopReason md_hot_body(MdRuntime *runtime,
                                 uint32_t *wep_io,
                                 int *fallback_out);
 
-'@
+"@
 
 $annotatedBodyMarker = "static MD_AOT_XIP_TEXT MdStopReason md_body("
 $AotFlash = Replace-ExactlyOnce `
@@ -407,6 +448,33 @@ md_fallback:
     return MD_STOP_NONE;
 }
 
+unsigned md_aot_hot_edge_count(void)
+{
+    return ${EdgeCount}u;
+}
+
+uint16_t md_aot_hot_edge_source(unsigned index)
+{
+    return index < ${EdgeCount}u ? md_hot_edge_src[index] : 0u;
+}
+
+uint16_t md_aot_hot_edge_target(unsigned index)
+{
+    return index < ${EdgeCount}u ? md_hot_edge_dst[index] : 0u;
+}
+
+uint32_t md_aot_hot_edge_hits(unsigned index)
+{
+    return index < ${EdgeCount}u ? md_hot_edge_hits[index] : 0u;
+}
+
+void md_aot_hot_edge_reset(void)
+{
+    unsigned i;
+    for (i = 0u; i < ${EdgeCount}u; ++i)
+        md_hot_edge_hits[i] = 0u;
+}
+
 "@
 
 # dosrecomp emits the macro undefs immediately BEFORE md_body()'s closing
@@ -442,6 +510,7 @@ Write-Host "  CFG closure depth: $ClosureDepth"
 Write-Host "  CFG additions by depth: $($ClosureAddedPerDepth -join ', ')"
 Write-Host "  final SRAM hot blocks: $($HotIps.Count)"
 Write-Host "  remaining hot->cold redirect targets: $($ColdTargetList.Count)"
+Write-Host "  instrumented hot->cold edges: $EdgeCount"
 
 $FlashAotCmake = $FlashAot.Replace('\', '/')
 
@@ -460,9 +529,57 @@ if ($PicoHybrid -eq $PicoText) {
     throw "Could not locate MD_SLICE in pico\microdos_pico.c."
 }
 
+$PicoStatsMarker = 'static void md_stats(uint64_t start_us)'
+$PicoEdgeDecl = @'
+unsigned md_aot_hot_edge_count(void);
+uint16_t md_aot_hot_edge_source(unsigned index);
+uint16_t md_aot_hot_edge_target(unsigned index);
+uint32_t md_aot_hot_edge_hits(unsigned index);
+void md_aot_hot_edge_reset(void);
+
+static void md_aot_hot_edge_report(void)
+{
+    unsigned i;
+    unsigned count = md_aot_hot_edge_count();
+    uint64_t total = 0u;
+
+    for (i = 0u; i < count; ++i)
+        total += (uint64_t)md_aot_hot_edge_hits(i);
+
+    md_say("[aot-edge] total-crossings=%llu edges=%u\n",
+           (unsigned long long)total, count);
+
+    for (i = 0u; i < count; ++i) {
+        uint32_t hits = md_aot_hot_edge_hits(i);
+        if (hits == 0u)
+            continue;
+        md_say("[aot-edge] %04X -> %04X hits=%lu\n",
+               md_aot_hot_edge_source(i),
+               md_aot_hot_edge_target(i),
+               (unsigned long)hits);
+    }
+
+    md_aot_hot_edge_reset();
+}
+
+'@
+
+$PicoHybrid = Replace-ExactlyOnce `
+    $PicoHybrid `
+    $PicoStatsMarker `
+    ($PicoEdgeDecl + $PicoStatsMarker) `
+    "Pico hot-edge profiler declarations"
+
+$PerfMarkMarker = '    g_perf_mark=now;'
+$PicoHybrid = Replace-ExactlyOnce `
+    $PicoHybrid `
+    $PerfMarkMarker `
+    ("    md_aot_hot_edge_report();`r`n" + $PerfMarkMarker) `
+    "Pico hot-edge report hook"
+
 $HybridBlock = @"
 
-# ---- TEMPORARY Phase 4H: profile-guided hot-SRAM kernel AOT -----------------
+# ---- TEMPORARY Phase 4I: hot-to-cold edge-frequency profiler ----------------
 if(TARGET microdos_pico_nativev2)
     get_target_property(_md_nv2_defs microdos_pico_nativev2 COMPILE_DEFINITIONS)
     if(NOT _md_nv2_defs)
@@ -497,7 +614,7 @@ if(TARGET microdos_pico_nativev2)
         "`$`{MD_ROOT}/src/runtime/x86_block_cache.c"
         "$FlashAotCmake")
 endif()
-# ---- END TEMPORARY Phase 4H ----------------------------------------------
+# ---- END TEMPORARY Phase 4I ------------------------------------------------
 "@
 
 $CMakeHybrid = $CMakeText + $HybridBlock
@@ -647,6 +764,9 @@ $PreflightChecks = @(
 
     # Hot dispatcher must jump to the SRAM-local duplicated block.
     @{ Name = "dispatcher case 0694";       Pattern = 'case 0x0694u:\s*goto md_block_0694;'; Expected = 1 },
+    @{ Name = "edge count accessor";          Pattern = 'unsigned md_aot_hot_edge_count\(void\)\s*\{'; Expected = 1 },
+    @{ Name = "edge reset accessor";          Pattern = 'void md_aot_hot_edge_reset\(void\)\s*\{'; Expected = 1 },
+    @{ Name = "edge hit counters";            Pattern = 'static uint32_t md_hot_edge_hits\['; Expected = 1 },
 
     @{ Name = "macro undef tail"; Pattern = '#undef MD_AOT_FLUSH\s*#undef MD_AOT_BLOCK\s*#undef MD_AOT_WCHK\s*#undef MD_AOT_WCHK_T\s*#undef MD_AOT_HOLE\s*#undef MD_AOT_STOPCHK'; Expected = 1 }
 )
@@ -659,18 +779,25 @@ foreach ($check in $PreflightChecks) {
     ).Count
 
     if ($count -ne $check.Expected) {
-        throw "Phase 4H preflight '$($check.Name)' found $count occurrences; expected $($check.Expected)."
+        throw "Phase 4I preflight '$($check.Name)' found $count occurrences; expected $($check.Expected)."
+    }
+}
+
+foreach ($edge in $HotColdEdgeList) {
+    $edgeLabel = "md_hot_to_cold_$($edge.Source)_$($edge.Target):"
+    if ([regex]::Matches($AotFlash, [regex]::Escape($edgeLabel)).Count -ne 1) {
+        throw "Phase 4I preflight missing/duplicated edge redirect $($edge.Source)->$($edge.Target)."
     }
 }
 
 foreach ($ip in $HotIps) {
     $labelCount = [regex]::Matches($AotFlash, "md_block_${ip}:").Count
     if ($labelCount -ne 2) {
-        throw "Phase 4H preflight hot block $ip has $labelCount labels; expected XIP+SRAM copies."
+        throw "Phase 4I preflight hot block $ip has $labelCount labels; expected XIP+SRAM copies."
     }
     $casePattern = "case 0x${ip}u:\s*return 1;"
     if ([regex]::Matches($AotFlash, $casePattern).Count -ne 1) {
-        throw "Phase 4H preflight hot-entry case missing/duplicated for $ip."
+        throw "Phase 4I preflight hot-entry case missing/duplicated for $ip."
     }
 }
 
@@ -682,10 +809,10 @@ $hotDef = [regex]::Match(
 $undefPos = $AotFlash.IndexOf("#undef MD_AOT_FLUSH", [StringComparison]::Ordinal)
 
 if (-not $hotDef.Success -or $undefPos -lt 0 -or $hotDef.Index -gt $undefPos) {
-    throw "Phase 4H preflight ordering failed: hot helper definition must precede macro undef tail."
+    throw "Phase 4I preflight ordering failed: hot helper definition must precede macro undef tail."
 }
 
-Write-Host "Phase 4H generated-source preflight: PASS"
+Write-Host "Phase 4I generated-source preflight: PASS"
 
 $HybridBuilt = $false
 $BenchExit = 0
@@ -696,13 +823,15 @@ try {
     [IO.File]::WriteAllText($Nv2Runtime, $Nv2Hybrid, $Utf8NoBom)
 
     Write-Host ""
-    Write-Host "=== Phase 4H v3 profile-guided hot-CFG SRAM kernel AOT A/B ==="
+    Write-Host "=== Phase 4I v1 hot-to-cold edge-frequency profiler A/B ==="
     Write-Host "Temporary scheduler slice: $SliceInstructions"
     Write-Host "Kernel AOT mode: FAST / non-compact"
     Write-Host "Kernel AOT cold body/tables: XIP flash"
     Write-Host "Kernel AOT hot body seed: top $HotBlocks profiled blocks"
     Write-Host "Kernel AOT hot CFG closure depth: $ClosureDepth"
     Write-Host "Kernel AOT final SRAM block count: $($HotIps.Count)"
+    Write-Host "Instrumented hot->cold edges: $EdgeCount"
+    Write-Host "Profiler note: MIPS includes edge-counter overhead; placement decisions should use [aot-edge] hit counts."
     Write-Host "Interpreter + Native-v2: production copy_to_ram SRAM"
     Write-Host "AOT metadata: 1 attachment slot, 5 live-page bitmaps"
     Write-Host "Phase 4C store coexistence: retained"
@@ -715,11 +844,11 @@ try {
 
     & cmake --build .\build-pico\out --target microdos_pico_nativev2
     if ($LASTEXITCODE -ne 0) {
-        throw "Phase 4H hybrid firmware build failed with exit code $LASTEXITCODE."
+        throw "Phase 4I edge-profiler firmware build failed with exit code $LASTEXITCODE."
     }
 
     if (-not (Test-Path $Uf2)) {
-        throw "Phase 4H build completed but UF2 was not found: $Uf2"
+        throw "Phase 4I build completed but UF2 was not found: $Uf2"
     }
 
     $HybridBuilt = $true
@@ -731,7 +860,7 @@ finally {
     Write-Host "Restored CMakeLists.txt, microdos_pico.c, and native_v2_runtime.c byte-for-byte from persistent recovery copies."
 
     if (-not $HybridBuilt) {
-        Write-Host "Phase 4H did not build; restoring production build state..."
+        Write-Host "Phase 4I did not build; restoring production build state..."
         & cmake -S .\pico -B .\build-pico\out
         if ($LASTEXITCODE -eq 0) {
             & cmake --build .\build-pico\out --target microdos_pico_nativev2
@@ -742,7 +871,7 @@ finally {
 if (-not $HybridBuilt) { exit 1 }
 
 Write-Host ""
-Write-Host "Running completion-boundary workload on Phase 4H firmware..."
+Write-Host "Running completion-boundary workload on Phase 4I edge-profiler firmware..."
 & $Bench -CaptureSeconds $CaptureSeconds
 $BenchExit = $LASTEXITCODE
 
@@ -766,10 +895,10 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host ""
-Write-Host "=== Phase 4H v3 v2 complete ==="
+Write-Host "=== Phase 4I v1 v2 complete ==="
 Write-Host "Production sources restored byte-for-byte."
 Write-Host "Production Phase 3P rebuilt and reflashed."
-Write-Host "Temporary CFG-split AOT source remains only under build-pico\phase4h."
+Write-Host "Temporary CFG-split AOT source remains only under build-pico\phase4i."
 Write-Host "Send back the full console/log output."
 Write-Host ""
 
