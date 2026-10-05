@@ -155,6 +155,26 @@ static inline uint8_t md_x86_shift8(MdX86 *cpu, unsigned operation,
     count &= 0xFFu; /* 8086 uses the full CL count; it does not mask to 5 bits. */
     if (count == 0u) return value;
 
+    /*
+     * Original-8086 undocumented Group-2 /6 is SETMO/SETMOC, not SHL:
+     *
+     *   D0 /6  SETMO  r/m8,1   -> FFh
+     *   D2 /6  SETMOC r/m8,CL  -> unchanged if CL==0, otherwise FFh
+     *
+     * The physical-silicon corpus classifies the arithmetic flags for /6 as
+     * undefined, but observed/documented behavior is logic-like for the -1
+     * result. Keep a deterministic 8086-compatible state: CF/AF/OF clear,
+     * PF/SF set, ZF clear.
+     */
+    if ((operation & 7u) == 6u) {
+        result = 0xFFu;
+        cpu->flags_raw &= (uint16_t)~(MD_X86_FLAG_CF |
+                                      MD_X86_FLAG_AF |
+                                      MD_X86_FLAG_OF);
+        md_x86_set_szp8(cpu, result);
+        return result;
+    }
+
     for (i = 0u; i < count; ++i) {
         const unsigned old_cf = (cpu->flags_raw & MD_X86_FLAG_CF) != 0u;
         unsigned new_cf = 0u;
@@ -176,7 +196,6 @@ static inline uint8_t md_x86_shift8(MdX86 *cpu, unsigned operation,
                 result = (uint8_t)((result >> 1) | (uint8_t)(old_cf << 7));
                 break;
             case 4u: /* SHL/SAL */
-            case 6u: /* undocumented 8086 alias */
                 new_cf = (result >> 7) & 1u;
                 result = (uint8_t)(result << 1);
                 break;
@@ -198,7 +217,7 @@ static inline uint8_t md_x86_shift8(MdX86 *cpu, unsigned operation,
     if (count == 1u) {
         cpu->flags_raw &= (uint16_t)~MD_X86_FLAG_OF;
         switch (operation & 7u) {
-            case 0u: case 2u: case 4u: case 6u:
+            case 0u: case 2u: case 4u:
                 if ((((result >> 7) & 1u) ^ ((cpu->flags_raw & MD_X86_FLAG_CF) != 0u)) != 0u)
                     cpu->flags_raw |= MD_X86_FLAG_OF;
                 break;
@@ -227,6 +246,23 @@ static inline uint16_t md_x86_shift16(MdX86 *cpu, unsigned operation,
     count &= 0xFFu;
     if (count == 0u) return value;
 
+    /*
+     * Original-8086 undocumented Group-2 /6 is SETMO/SETMOC, not SHL:
+     *
+     *   D1 /6  SETMO  r/m16,1   -> FFFFh
+     *   D3 /6  SETMOC r/m16,CL  -> unchanged if CL==0, otherwise FFFFh
+     *
+     * See the byte helper above for the flag policy.
+     */
+    if ((operation & 7u) == 6u) {
+        result = 0xFFFFu;
+        cpu->flags_raw &= (uint16_t)~(MD_X86_FLAG_CF |
+                                      MD_X86_FLAG_AF |
+                                      MD_X86_FLAG_OF);
+        md_x86_set_szp16(cpu, result);
+        return result;
+    }
+
     for (i = 0u; i < count; ++i) {
         const unsigned old_cf = (cpu->flags_raw & MD_X86_FLAG_CF) != 0u;
         unsigned new_cf = 0u;
@@ -248,7 +284,6 @@ static inline uint16_t md_x86_shift16(MdX86 *cpu, unsigned operation,
                 result = (uint16_t)((result >> 1) | (uint16_t)(old_cf << 15));
                 break;
             case 4u: /* SHL/SAL */
-            case 6u:
                 new_cf = (result >> 15) & 1u;
                 result = (uint16_t)(result << 1);
                 break;
@@ -270,7 +305,7 @@ static inline uint16_t md_x86_shift16(MdX86 *cpu, unsigned operation,
     if (count == 1u) {
         cpu->flags_raw &= (uint16_t)~MD_X86_FLAG_OF;
         switch (operation & 7u) {
-            case 0u: case 2u: case 4u: case 6u:
+            case 0u: case 2u: case 4u:
                 if ((((result >> 15) & 1u) ^ ((cpu->flags_raw & MD_X86_FLAG_CF) != 0u)) != 0u)
                     cpu->flags_raw |= MD_X86_FLAG_OF;
                 break;
