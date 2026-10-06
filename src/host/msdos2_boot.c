@@ -1,4 +1,5 @@
 #include "msdos2_boot.h"
+#include "microdos/hot_code.h"
 
 #include <assert.h>
 #include <string.h>
@@ -66,14 +67,14 @@ enum {
     MD_DEV_ERR_READ_FAULT = 11u
 };
 
-static void md_read_far(const MdX86 *cpu, uint16_t segment, uint16_t offset,
+static void MD_DOS_HOT_FUNC(md_read_far)(const MdX86 *cpu, uint16_t segment, uint16_t offset,
                         uint16_t *target_offset, uint16_t *target_segment)
 {
     *target_offset = md_x86_read16(cpu, segment, offset);
     *target_segment = md_x86_read16(cpu, segment, (uint16_t)(offset + 2u));
 }
 
-static void md_write_far(MdX86 *cpu, uint16_t segment, uint16_t offset,
+static void MD_DOS_HOT_FUNC(md_write_far)(MdX86 *cpu, uint16_t segment, uint16_t offset,
                          uint16_t target_offset, uint16_t target_segment)
 {
     md_x86_write16(cpu, segment, offset, target_offset);
@@ -98,7 +99,7 @@ static void md_write_device_header(MdX86 *cpu, uint16_t segment, uint16_t offset
     }
 }
 
-static bool md_known_device_offset(uint16_t offset)
+static bool MD_DOS_HOT_FUNC(md_known_device_offset)(uint16_t offset)
 {
     return offset == MD_MSDOS2_CON_OFFSET ||
            offset == MD_MSDOS2_AUX_OFFSET ||
@@ -356,19 +357,19 @@ void md_msdos2_boot_prepare_cpu(MdRuntime *runtime, MdMsdos2Boot *boot,
     md_x86_push(cpu, MD_MSDOS2_RETURN_OFFSET);
 }
 
-static void md_device_status(MdRuntime *runtime, const MdMsdos2Boot *boot, uint16_t status)
+static void MD_DOS_HOT_FUNC(md_device_status)(MdRuntime *runtime, const MdMsdos2Boot *boot, uint16_t status)
 {
     md_x86_write16(&runtime->cpu, boot->request_segment,
                    (uint16_t)(boot->request_offset + MD_REQ_STATUS), status);
 }
 
-static void md_device_error(MdRuntime *runtime, const MdMsdos2Boot *boot, uint8_t code)
+static void MD_DOS_HOT_FUNC(md_device_error)(MdRuntime *runtime, const MdMsdos2Boot *boot, uint8_t code)
 {
     md_device_status(runtime, boot,
                      (uint16_t)(MD_DEV_STATUS_ERROR | MD_DEV_STATUS_DONE | code));
 }
 
-static void md_console_write(MdRuntime *runtime, MdMsdos2Boot *boot)
+static void MD_DOS_HOT_FUNC(md_console_write)(MdRuntime *runtime, MdMsdos2Boot *boot)
 {
     MdX86 *cpu = &runtime->cpu;
     uint16_t data_offset;
@@ -431,7 +432,7 @@ static void md_console_write(MdRuntime *runtime, MdMsdos2Boot *boot)
     md_device_status(runtime, boot, MD_DEV_STATUS_DONE);
 }
 
-static void md_console_read_nondestructive(MdRuntime *runtime, MdMsdos2Boot *boot)
+static void MD_DOS_HOT_FUNC(md_console_read_nondestructive)(MdRuntime *runtime, MdMsdos2Boot *boot)
 {
     uint8_t value = 0u;
     ++boot->console_poll_calls;
@@ -445,7 +446,7 @@ static void md_console_read_nondestructive(MdRuntime *runtime, MdMsdos2Boot *boo
     }
 }
 
-static bool md_console_read(MdRuntime *runtime, MdMsdos2Boot *boot)
+static bool MD_DOS_HOT_FUNC(md_console_read)(MdRuntime *runtime, MdMsdos2Boot *boot)
 {
     MdX86 *cpu = &runtime->cpu;
     uint16_t data_offset;
@@ -473,7 +474,7 @@ static bool md_console_read(MdRuntime *runtime, MdMsdos2Boot *boot)
     return true;
 }
 
-static bool md_console_service(MdRuntime *runtime, MdMsdos2Boot *boot)
+static bool MD_DOS_HOT_FUNC(md_console_service)(MdRuntime *runtime, MdMsdos2Boot *boot)
 {
     switch (boot->last_request_function) {
         case MD_DEV_READ:
@@ -504,7 +505,7 @@ static bool md_console_service(MdRuntime *runtime, MdMsdos2Boot *boot)
     }
 }
 
-static bool md_clock_service(MdRuntime *runtime, MdMsdos2Boot *boot)
+static bool MD_DOS_HOT_FUNC(md_clock_service)(MdRuntime *runtime, MdMsdos2Boot *boot)
 {
     MdX86 *cpu = &runtime->cpu;
     uint16_t data_offset;
@@ -540,7 +541,7 @@ static bool md_clock_service(MdRuntime *runtime, MdMsdos2Boot *boot)
     return true;
 }
 
-static bool md_disk_transfer(MdRuntime *runtime, MdMsdos2Boot *boot, bool write)
+static bool MD_DOS_HOT_FUNC(md_disk_transfer)(MdRuntime *runtime, MdMsdos2Boot *boot, bool write)
 {
     MdX86 *cpu = &runtime->cpu;
     const uint8_t unit = md_x86_read8(cpu, boot->request_segment,
@@ -614,7 +615,7 @@ static bool md_disk_transfer(MdRuntime *runtime, MdMsdos2Boot *boot, bool write)
     return true;
 }
 
-static bool md_disk_service(MdRuntime *runtime, MdMsdos2Boot *boot)
+static bool MD_DOS_HOT_FUNC(md_disk_service)(MdRuntime *runtime, MdMsdos2Boot *boot)
 {
     MdX86 *cpu = &runtime->cpu;
     const uint8_t unit = md_x86_read8(cpu, boot->request_segment,
@@ -661,7 +662,7 @@ static bool md_disk_service(MdRuntime *runtime, MdMsdos2Boot *boot)
     }
 }
 
-static void md_device_init(MdRuntime *runtime, MdMsdos2Boot *boot)
+static void MD_DOS_HOT_FUNC(md_device_init)(MdRuntime *runtime, MdMsdos2Boot *boot)
 {
     MdX86 *cpu = &runtime->cpu;
 
@@ -680,7 +681,7 @@ static void md_device_init(MdRuntime *runtime, MdMsdos2Boot *boot)
     }
 }
 
-bool md_msdos2_boot_interrupt(MdRuntime *runtime, uint8_t vector, void *user)
+bool MD_DOS_HOT_FUNC(md_msdos2_boot_interrupt)(MdRuntime *runtime, uint8_t vector, void *user)
 {
     MdMsdos2Boot *boot = (MdMsdos2Boot *)user;
     MdX86 *cpu = &runtime->cpu;

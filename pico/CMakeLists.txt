@@ -354,6 +354,55 @@ pico_set_program_name(microdos_pico_m25_nv2_hot "microDOS M26 hot-SRAM")
 md_m26_m25_nv2(microdos_pico_m25_nv2_hot256 0 1 256)
 pico_set_program_name(microdos_pico_m25_nv2_hot256 "microDOS M26 hot-SRAM 256K")
 
+# M26b: keep compilers/emitters/cold support in XIP, but place the actual
+# interpreter/translator/Native-v2 execution machinery in SRAM.  Arena remains
+# 160 KiB so the placement effect is isolated from code-cache capacity.
+md_m26_m25_nv2(microdos_pico_m25_nv2_exec 0 1 160)
+target_compile_definitions(microdos_pico_m25_nv2_exec PRIVATE
+    MICRODOS_PICO_EXEC_HOT_CODE=1)
+pico_set_program_name(microdos_pico_m25_nv2_exec "microDOS M26b EXEC-SRAM")
+
+# M26c: QMI/XIP attribution builds. Keep the existing binaries untouched so
+# profiler overhead can be compared with the M26b measurements.
+md_m26_m25_nv2(microdos_pico_m25_nv2_qmi_sram 1 0 160)
+target_compile_definitions(microdos_pico_m25_nv2_qmi_sram PRIVATE
+    MICRODOS_PICO_QMI_PROFILE=1)
+pico_set_program_name(microdos_pico_m25_nv2_qmi_sram "microDOS M26c QMI SRAM")
+
+md_m26_m25_nv2(microdos_pico_m25_nv2_exec_qmi 0 1 160)
+target_compile_definitions(microdos_pico_m25_nv2_exec_qmi PRIVATE
+    MICRODOS_PICO_EXEC_HOT_CODE=1
+    MICRODOS_PICO_QMI_PROFILE=1)
+pico_set_program_name(microdos_pico_m25_nv2_exec_qmi "microDOS M26c QMI EXEC-SRAM")
+
+# M26d: isolate which measured dependency class deserves SRAM.  Every target
+# keeps the same 160 KiB arena and M26b EXEC set; only one category changes.
+md_m26_m25_nv2(microdos_pico_m25_nv2_exec_comp_qmi 0 1 160)
+target_compile_definitions(microdos_pico_m25_nv2_exec_comp_qmi PRIVATE
+    MICRODOS_PICO_EXEC_HOT_CODE=1 MICRODOS_PICO_QMI_PROFILE=1
+    MICRODOS_PICO_COMPILER_HOT_CODE=1)
+pico_set_program_name(microdos_pico_m25_nv2_exec_comp_qmi "microDOS M26d EXEC+COMP")
+
+md_m26_m25_nv2(microdos_pico_m25_nv2_exec_interp_qmi 0 1 160)
+target_compile_definitions(microdos_pico_m25_nv2_exec_interp_qmi PRIVATE
+    MICRODOS_PICO_EXEC_HOT_CODE=1 MICRODOS_PICO_QMI_PROFILE=1
+    MICRODOS_PICO_INTERP_HELPERS_HOT=1)
+pico_set_program_name(microdos_pico_m25_nv2_exec_interp_qmi "microDOS M26d EXEC+INTERP")
+
+md_m26_m25_nv2(microdos_pico_m25_nv2_exec_dos_qmi 0 1 160)
+target_compile_definitions(microdos_pico_m25_nv2_exec_dos_qmi PRIVATE
+    MICRODOS_PICO_EXEC_HOT_CODE=1 MICRODOS_PICO_QMI_PROFILE=1
+    MICRODOS_PICO_DOS_HOT_CODE=1)
+pico_set_program_name(microdos_pico_m25_nv2_exec_dos_qmi "microDOS M26d EXEC+DOS")
+
+md_m26_m25_nv2(microdos_pico_m25_nv2_exec_combo_qmi 0 1 160)
+target_compile_definitions(microdos_pico_m25_nv2_exec_combo_qmi PRIVATE
+    MICRODOS_PICO_EXEC_HOT_CODE=1 MICRODOS_PICO_QMI_PROFILE=1
+    MICRODOS_PICO_COMPILER_HOT_CODE=1
+    MICRODOS_PICO_INTERP_HELPERS_HOT=1
+    MICRODOS_PICO_DOS_HOT_CODE=1)
+pico_set_program_name(microdos_pico_m25_nv2_exec_combo_qmi "microDOS M26d EXEC+COMBO")
+
 # M25 translator on-device check: differential test (interpreter vs
 # translated Thumb-2, guest RAM in PSRAM) plus interpreter-vs-translator
 # loop benchmarks. Run with scripts/md_translate_diff_pico.ps1.

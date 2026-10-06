@@ -27,6 +27,7 @@
 
 #include "microdos/translate.h"
 #include "microdos/hot_code.h"
+#include "microdos/qmi_profile.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -78,7 +79,7 @@ static void md_tr_cyc_enable(void) {}
 #endif
 static MdTranslator *g_md_tr_stats;   /* helpers account into this translator */
 
-static uint32_t md_tr_seg_off(unsigned seg)   /* 0 ES, 1 CS, 2 SS, 3 DS */
+static uint32_t MD_COMPILER_HOT_FUNC(md_tr_seg_off)(unsigned seg)   /* 0 ES, 1 CS, 2 SS, 3 DS */
 {
     switch (seg & 3u) {
         case 0u: return (uint32_t)(offsetof(MdRuntime, cpu) + offsetof(MdX86, es));
@@ -197,6 +198,7 @@ static uint32_t MD_HOT_FUNC(md_tr_h_cond)(MdRuntime *rt, uint32_t cc)
 static uint32_t MD_HOT_FUNC(md_tr_h_step)(MdRuntime *rt, uint32_t next_ip)
 {
     const uint32_t c0 = MD_TR_CYC();
+    md_qmi_profile_enter(rt, MD_QMI_STEP);
     const uint16_t cs = rt->cpu.cs;
     const uint32_t e = MD_TR_WRITE_EPOCH(rt);
     uint32_t stop;
@@ -220,6 +222,7 @@ static uint32_t MD_HOT_FUNC(md_tr_h_step)(MdRuntime *rt, uint32_t next_ip)
     if (next_ip <= 0xFFFFu)               /* straight-line step: must fall through */
         stop |= rt->cpu.cs != cs || rt->cpu.ip != (uint16_t)next_ip;
     if (g_md_tr_stats != NULL) g_md_tr_stats->stats.cyc_step += (uint32_t)(MD_TR_CYC() - c0);
+    md_qmi_profile_leave(rt);
     return stop ? 1u : 0u;
 }
 
@@ -247,20 +250,20 @@ static uint32_t md_tr_addr(const void *p) { return (uint32_t)(uintptr_t)p; }
 
 /* ---- emission helpers ------------------------------------------------------ */
 
-static void em_reload(MdTrCtx *c)
+static void MD_COMPILER_HOT_FUNC(em_reload)(MdTrCtx *c)
 {
     t2_mov32(&c->b, RCPU, md_tr_addr(c->rt));
     t2_mov32(&c->b, RMEM, md_tr_addr(c->rt->cpu.memory));
 }
 
-static void em_call(MdTrCtx *c, const void *fn)
+static void MD_COMPILER_HOT_FUNC(em_call)(MdTrCtx *c, const void *fn)
 {
     t2_mov32(&c->b, RCPU, md_tr_addr(fn));
     t2_blx(&c->b, RCPU);
     em_reload(c);
 }
 
-static void em_add_imm(MdTrCtx *c, unsigned rd, unsigned rn, uint32_t imm)
+static void MD_COMPILER_HOT_FUNC(em_add_imm)(MdTrCtx *c, unsigned rd, unsigned rn, uint32_t imm)
 {
     imm &= 0xFFFFu;
     if (imm == 0u) { if (rd != rn) t2_mov(&c->b, rd, rn); return; }
@@ -270,7 +273,7 @@ static void em_add_imm(MdTrCtx *c, unsigned rd, unsigned rn, uint32_t imm)
     t2_dp_reg(&c->b, T2_ADD, 0u, rd, rn, rd == rn ? T2_R3 : rd, T2_LSL, 0u);
 }
 
-static void em_stub(MdTrCtx *c, unsigned cond, unsigned kind, uint16_t ip, unsigned addback)
+static void MD_COMPILER_HOT_FUNC(em_stub)(MdTrCtx *c, unsigned cond, unsigned kind, uint16_t ip, unsigned addback)
 {
     MdTrStub *s;
     if (c->nstubs >= sizeof(c->stubs) / sizeof(c->stubs[0])) { c->b.failed = 1; return; }
@@ -286,7 +289,7 @@ static unsigned md_tr_bits(void) { return MD_X86_ADDRESS_BITS; }
 
 /* Effective address: roff = 16-bit offset, rlin = (seg << 4) + offset
    (not yet wrapped to the address space). Uses only roff and rlin. */
-static void em_ea(MdTrCtx *c, const MdTrEa *ea, unsigned roff, unsigned rlin)
+static void MD_COMPILER_HOT_FUNC(em_ea)(MdTrCtx *c, const MdTrEa *ea, unsigned roff, unsigned rlin)
 {
     MdT2Buf *b = &c->b;
     if (ea->base == NOREG) {
@@ -329,7 +332,7 @@ static unsigned em_hostptr(MdTrCtx *c, unsigned rlin, unsigned rtmp)
 
 /* Load width-bit value at EA into rd (r0 or r1, or a pinned reg).
    Clobbers r0-r3 on the slow path. */
-static void em_load(MdTrCtx *c, const MdTrEa *ea, unsigned width, unsigned rd)
+static void MD_COMPILER_HOT_FUNC(em_load)(MdTrCtx *c, const MdTrEa *ea, unsigned width, unsigned rd)
 {
     MdT2Buf *b = &c->b;
     em_ea(c, ea, T2_R2, T2_R3);
@@ -362,12 +365,12 @@ static void em_load(MdTrCtx *c, const MdTrEa *ea, unsigned width, unsigned rd)
 
 /* Store rv (not r2/r3/rtmp) to the EA. op_index identifies the guest
    instruction for the side-exit stub (exit ip = exit_ip). */
-static void em_string_delta(MdTrCtx *c, unsigned width, unsigned which);
+static void MD_COMPILER_HOT_FUNC(em_string_delta)(MdTrCtx *c, unsigned width, unsigned which);
 
-static void em_store_ex(MdTrCtx *c, const MdTrEa *ea, unsigned width, unsigned rv,
+static void MD_COMPILER_HOT_FUNC(em_store_ex)(MdTrCtx *c, const MdTrEa *ea, unsigned width, unsigned rv,
                         unsigned rtmp, unsigned k, uint16_t exit_ip, unsigned after_w, unsigned after);
 
-static void em_store(MdTrCtx *c, const MdTrEa *ea, unsigned width, unsigned rv,
+static void MD_COMPILER_HOT_FUNC(em_store)(MdTrCtx *c, const MdTrEa *ea, unsigned width, unsigned rv,
                      unsigned rtmp, unsigned k, uint16_t exit_ip)
 {
     em_store_ex(c, ea, width, rv, rtmp, k, exit_ip, 0u, 0u);
@@ -375,7 +378,7 @@ static void em_store(MdTrCtx *c, const MdTrEa *ea, unsigned width, unsigned rv,
 
 /* after: 0 none, 1 DI += delta, 3 SI and DI += delta (string ops). Runs on
    both paths before a possible side exit, so the exit state is complete. */
-static void em_store_ex(MdTrCtx *c, const MdTrEa *ea, unsigned width, unsigned rv,
+static void MD_COMPILER_HOT_FUNC(em_store_ex)(MdTrCtx *c, const MdTrEa *ea, unsigned width, unsigned rv,
                         unsigned rtmp, unsigned k, uint16_t exit_ip, unsigned after_w, unsigned after)
 {
     MdT2Buf *b = &c->b;
@@ -434,7 +437,7 @@ static unsigned r8_lsb(unsigned reg) { return (reg & 4u) ? 8u : 0u; }
 
 /* Lazy write. a/b registers hold zero-extended (8-bit) or low-16-valid
    (16-bit) values; NOREG means 0 (logic) or the constant 1 (inc/dec b). */
-static void em_lazy(MdTrCtx *c, unsigned lazy_op, unsigned ra, unsigned rb, unsigned rres,
+static void MD_COMPILER_HOT_FUNC(em_lazy)(MdTrCtx *c, unsigned lazy_op, unsigned ra, unsigned rb, unsigned rres,
                     int b_is_one)
 {
     MdT2Buf *b = &c->b;
@@ -464,7 +467,7 @@ static unsigned lazy_code(unsigned cls, unsigned width)
 }
 
 /* x86 cc -> ARM cond for a producer class, or -1 if not fusable. */
-static int fuse_cond(unsigned cls, unsigned cc)
+static int MD_COMPILER_HOT_FUNC(fuse_cond)(unsigned cls, unsigned cc)
 {
     static const int8_t sub[16] = { T2_VS, T2_VC, T2_CC, T2_CS, T2_EQ, T2_NE, T2_LS, T2_HI,
                                     T2_MI, T2_PL, -1, -1, T2_LT, T2_GE, T2_LE, T2_GT };
@@ -481,7 +484,7 @@ static int fuse_cond(unsigned cls, unsigned cc)
     }
 }
 
-static void em_carry_capture(MdTrCtx *c, const MdTrOp *op)
+static void MD_COMPILER_HOT_FUNC(em_carry_capture)(MdTrCtx *c, const MdTrOp *op)
 {
     MdT2Buf *b = &c->b;
     switch (op->carry_src) {
@@ -519,7 +522,7 @@ static unsigned em_operand(MdTrCtx *c, const MdTrOperand *o, unsigned width, uns
 /* Write lazy_carry = CF of this producer, computed from its operands, so a
    later INC/DEC lazy write needs neither this producer's lazy fields nor a
    reload. Uses r3 and APSR. */
-static void em_producer_carry(MdTrCtx *c, unsigned cls, unsigned sh, unsigned ra, unsigned rb)
+static void MD_COMPILER_HOT_FUNC(em_producer_carry)(MdTrCtx *c, unsigned cls, unsigned sh, unsigned ra, unsigned rb)
 {
     MdT2Buf *b = &c->b;
     if (cls == CL_LOGIC) {
@@ -540,7 +543,7 @@ static void em_producer_carry(MdTrCtx *c, unsigned cls, unsigned sh, unsigned ra
     t2_ldst(b, T2_STRB_I, T2_R3, RCPU, OFF_LCARRY);
 }
 
-static void em_alu(MdTrCtx *c, const MdTrOp *op, unsigned k)
+static void MD_COMPILER_HOT_FUNC(em_alu)(MdTrCtx *c, const MdTrOp *op, unsigned k)
 {
     MdT2Buf *b = &c->b;
     const unsigned w = op->width, sh = w == 16u ? 16u : 24u;
@@ -613,7 +616,7 @@ static void em_alu(MdTrCtx *c, const MdTrOp *op, unsigned k)
     }
 }
 
-static void em_incdec(MdTrCtx *c, const MdTrOp *op, unsigned k)
+static void MD_COMPILER_HOT_FUNC(em_incdec)(MdTrCtx *c, const MdTrOp *op, unsigned k)
 {
     MdT2Buf *b = &c->b;
     const unsigned w = op->width, sh = w == 16u ? 16u : 24u;
@@ -650,7 +653,7 @@ static void em_incdec(MdTrCtx *c, const MdTrOp *op, unsigned k)
     }
 }
 
-static void em_mov(MdTrCtx *c, const MdTrOp *op, unsigned k)
+static void MD_COMPILER_HOT_FUNC(em_mov)(MdTrCtx *c, const MdTrOp *op, unsigned k)
 {
     MdT2Buf *b = &c->b;
     const unsigned w = op->width;
@@ -671,7 +674,7 @@ static void em_mov(MdTrCtx *c, const MdTrOp *op, unsigned k)
 
 /* Lazy write of the deferred producer (the op before the latch Jcc). Its
    registers are still live here: nothing but the fused compare ran since. */
-static void em_deferred_lazy(MdTrCtx *c, const MdTrOp *p)
+static void MD_COMPILER_HOT_FUNC(em_deferred_lazy)(MdTrCtx *c, const MdTrOp *p)
 {
     const unsigned code = lazy_code(p->cls, p->width);
     if (p->kind == K_INC || p->kind == K_DEC) {
@@ -689,14 +692,14 @@ static void em_deferred_lazy(MdTrCtx *c, const MdTrOp *p)
    generated code, exactly as md_tr_hash()/md_tr_lookup() would, and jump
    to the target's guard (which re-checks generations and the budget).
    On a miss, leave through the dynamic exit; C translates the target. */
-static void em_dispatch_cs(MdTrCtx *c, int dynamic_cs);
+static void MD_COMPILER_HOT_FUNC(em_dispatch_cs)(MdTrCtx *c, int dynamic_cs);
 
-static void em_dispatch(MdTrCtx *c)
+static void MD_COMPILER_HOT_FUNC(em_dispatch)(MdTrCtx *c)
 {
     em_dispatch_cs(c, 0);
 }
 
-static void em_dispatch_cs(MdTrCtx *c, int dynamic_cs)
+static void MD_COMPILER_HOT_FUNC(em_dispatch_cs)(MdTrCtx *c, int dynamic_cs)
 {
     MdT2Buf *b = &c->b;
     MdTranslator *tr = c->tr;
@@ -731,7 +734,7 @@ static void em_dispatch_cs(MdTrCtx *c, int dynamic_cs)
 }
 
 /* SI/DI += (DF ? -size : +size). Uses r3 only (r0 may hold a helper result). */
-static void em_string_delta(MdTrCtx *c, unsigned width, unsigned which)
+static void MD_COMPILER_HOT_FUNC(em_string_delta)(MdTrCtx *c, unsigned width, unsigned which)
 {
     MdT2Buf *b = &c->b;
     const unsigned size = width / 8u;
@@ -746,7 +749,7 @@ static void em_string_delta(MdTrCtx *c, unsigned width, unsigned which)
 /* B: in-block interpreter step through the shared thunk: r1 = ip,
    r2 = next ip (0x10000 = control transfer, any CS:IP allowed),
    r3 = budget add-back if translated execution has to stop here. */
-static void em_step_call(MdTrCtx *c, const MdTrOp *op, unsigned k, int control)
+static void MD_COMPILER_HOT_FUNC(em_step_call)(MdTrCtx *c, const MdTrOp *op, unsigned k, int control)
 {
     MdT2Buf *b = &c->b;
     t2_movw(b, T2_R1, op->ip);
@@ -757,7 +760,7 @@ static void em_step_call(MdTrCtx *c, const MdTrOp *op, unsigned k, int control)
 }
 
 /* Result write-back for helper ops: r0 holds the value. */
-static void em_writeback(MdTrCtx *c, const MdTrOp *op, unsigned k)
+static void MD_COMPILER_HOT_FUNC(em_writeback)(MdTrCtx *c, const MdTrOp *op, unsigned k)
 {
     MdT2Buf *b = &c->b;
     if (op->dst.kind == OPK_R16) t2_mov(b, kG[op->dst.reg], T2_R0);
@@ -766,7 +769,7 @@ static void em_writeback(MdTrCtx *c, const MdTrOp *op, unsigned k)
 }
 
 /* C: ADC/SBB/NEG through md_x86_alu8/16 (exact lazy flags, CF in). */
-static void em_halu(MdTrCtx *c, const MdTrOp *op, unsigned k)
+static void MD_COMPILER_HOT_FUNC(em_halu)(MdTrCtx *c, const MdTrOp *op, unsigned k)
 {
     MdT2Buf *b = &c->b;
     const unsigned w = op->width;
@@ -788,7 +791,7 @@ static void em_halu(MdTrCtx *c, const MdTrOp *op, unsigned k)
     em_writeback(c, op, k);
 }
 
-static void em_shift(MdTrCtx *c, const MdTrOp *op, unsigned k)
+static void MD_COMPILER_HOT_FUNC(em_shift)(MdTrCtx *c, const MdTrOp *op, unsigned k)
 {
     MdT2Buf *b = &c->b;
     const unsigned w = op->width;
@@ -805,9 +808,9 @@ static void em_shift(MdTrCtx *c, const MdTrOp *op, unsigned k)
 }
 
 /* D: indirect transfer with CS from memory (after a control step). */
-static void em_dispatch_cs(MdTrCtx *c, int dynamic_cs);
+static void MD_COMPILER_HOT_FUNC(em_dispatch_cs)(MdTrCtx *c, int dynamic_cs);
 
-static void em_ea_sp(MdTrEa *ea)
+static void MD_COMPILER_HOT_FUNC(em_ea_sp)(MdTrEa *ea)
 {
     ea->base = MD_X86_SP;
     ea->index = NOREG;
@@ -815,7 +818,7 @@ static void em_ea_sp(MdTrEa *ea)
     ea->disp = 0u;
 }
 
-static void em_op(MdTrCtx *c, unsigned i)
+static void MD_COMPILER_HOT_FUNC(em_op)(MdTrCtx *c, unsigned i)
 {
     MdT2Buf *b = &c->b;
     const MdTrOp *op = &c->ops[i];
@@ -1016,7 +1019,7 @@ static void em_op(MdTrCtx *c, unsigned i)
 
 /* ---- front end: 8086 bytes -> IR ------------------------------------------- */
 
-static int parse_modrm(const uint8_t *p, size_t avail, unsigned seg_override,
+static int MD_COMPILER_HOT_FUNC(parse_modrm)(const uint8_t *p, size_t avail, unsigned seg_override,
                        MdTrOperand *rm_out, MdTrEa *ea, unsigned width, unsigned *consumed)
 {
     const unsigned modrm = p[0];
@@ -1067,13 +1070,13 @@ static unsigned alu_class(unsigned alu)
 }
 
 /* ADC/SBB: carried-in CF, so they go through md_x86_alu8/16. */
-static void md_tr_fix_alu(MdTrOp *op)
+static void MD_COMPILER_HOT_FUNC(md_tr_fix_alu)(MdTrOp *op)
 {
     if (op->cls == CL_NONE) { op->kind = K_HALU; op->cls = CL_STEP; }
 }
 
 /* Fills *op from one decoded instruction; returns 0 if not lowered. */
-static int md_tr_parse(const uint8_t *p, size_t avail, const MdDecodedInstruction *in, MdTrOp *op)
+static int MD_COMPILER_HOT_FUNC(md_tr_parse)(const uint8_t *p, size_t avail, const MdDecodedInstruction *in, MdTrOp *op)
 {
     unsigned seg = 0u, i, pc = in->prefix_count;
     const uint8_t opc = in->opcode;
@@ -1303,12 +1306,12 @@ static int md_tr_parse(const uint8_t *p, size_t avail, const MdDecodedInstructio
     return 0;
 }
 
-static int md_tr_is_terminator(unsigned kind)
+static int MD_COMPILER_HOT_FUNC(md_tr_is_terminator)(unsigned kind)
 {
     return kind >= K_JCC;
 }
 
-static int md_tr_writes_memory(const MdTrOp *op)
+static int MD_COMPILER_HOT_FUNC(md_tr_writes_memory)(const MdTrOp *op)
 {
     switch (op->kind) {
         case K_ALU: return op->dst.kind == OPK_MEM && !op->nowrite;
@@ -1319,12 +1322,12 @@ static int md_tr_writes_memory(const MdTrOp *op)
     }
 }
 
-static void md_tr_analyze_carry(MdTrCtx *c);
-static void md_tr_analyze_defer(MdTrCtx *c);
+static void MD_COMPILER_HOT_FUNC(md_tr_analyze_carry)(MdTrCtx *c);
+static void MD_COMPILER_HOT_FUNC(md_tr_analyze_defer)(MdTrCtx *c);
 
 /* Flag liveness: which producers must write the lazy state, Jcc fusion,
    and the carry source of INC/DEC lazy writes. */
-static void md_tr_analyze(MdTrCtx *c)
+static void MD_COMPILER_HOT_FUNC(md_tr_analyze)(MdTrCtx *c)
 {
     int p = -1;
     unsigned i;
@@ -1349,7 +1352,7 @@ static void md_tr_analyze(MdTrCtx *c)
     md_tr_analyze_defer(c);
 }
 
-static void md_tr_analyze_carry(MdTrCtx *c)
+static void MD_COMPILER_HOT_FUNC(md_tr_analyze_carry)(MdTrCtx *c)
 {
     unsigned i;
     for (i = 0u; i < c->n; ++i) {
@@ -1381,7 +1384,7 @@ static void md_tr_analyze_carry(MdTrCtx *c)
    first producer comes before any possible side exit and does not read the
    incoming CF (the producer itself may: memory still holds the pre-loop
    state, which is exactly what its deferred capture needs). */
-static void md_tr_analyze_defer(MdTrCtx *c)
+static void MD_COMPILER_HOT_FUNC(md_tr_analyze_defer)(MdTrCtx *c)
 {
     MdTrOp *last, *p;
     unsigned i;
@@ -1414,7 +1417,7 @@ static void md_tr_analyze_defer(MdTrCtx *c)
    the page generation). When the pool is exhausted the page falls back to
    page-granular MD_X86_PAGE_TRANSLATED tracking, which is always correct. */
 #if MICRODOS_TRANSLATION_SUPPORT
-static void md_tr_mark_live(MdTranslator *tr, uint16_t cs, uint16_t ip, size_t len)
+static void MD_COMPILER_HOT_FUNC(md_tr_mark_live)(MdTranslator *tr, uint16_t cs, uint16_t ip, size_t len)
 {
     MdRuntime *rt = tr->rt;
     size_t i;
@@ -1442,7 +1445,7 @@ static void md_tr_mark_live(MdTranslator *tr, uint16_t cs, uint16_t ip, size_t l
 
 /* ---- arena / trampolines --------------------------------------------------- */
 
-static void md_tr_sync(MdTranslator *tr, uint32_t from, uint32_t to)
+static void MD_COMPILER_HOT_FUNC(md_tr_sync)(MdTranslator *tr, uint32_t from, uint32_t to)
 {
 #if MD_TR_HOST_THUMB2
 #if defined(__linux__)
@@ -1456,7 +1459,7 @@ static void md_tr_sync(MdTranslator *tr, uint32_t from, uint32_t to)
 #endif
 }
 
-static void md_tr_emit_trampolines(MdTranslator *tr)
+static void MD_COMPILER_HOT_FUNC(md_tr_emit_trampolines)(MdTranslator *tr)
 {
     MdT2Buf b = { tr->arena, tr->arena_size, 0u, 0 };
     unsigned i;
@@ -1516,7 +1519,7 @@ static void md_tr_emit_trampolines(MdTranslator *tr)
     md_tr_sync(tr, 0u, b.at);
 }
 
-void md_tr_flush(MdTranslator *tr)
+void MD_COMPILER_HOT_FUNC(md_tr_flush)(MdTranslator *tr)
 {
 #if MICRODOS_TRANSLATION_SUPPORT
     unsigned page;
@@ -1565,14 +1568,14 @@ int md_tr_init(MdTranslator *tr, MdRuntime *rt, uint8_t *arena, uint32_t arena_s
 
 /* ---- block translation ------------------------------------------------------ */
 
-static unsigned md_tr_hash(uint16_t cs, uint16_t ip)
+static unsigned MD_EXEC_HOT_FUNC(md_tr_hash)(uint16_t cs, uint16_t ip)
 {
     const uint32_t x = ((uint32_t)cs << 4) + ip;
     return (unsigned)((x ^ (x >> 9)) & (MD_TR_SLOTS - 1u));
 }
 
 #if MICRODOS_TRANSLATION_SUPPORT
-static int md_tr_block_fresh(const MdTranslator *tr, const MdTrBlock *blk)
+static int MD_EXEC_HOT_FUNC(md_tr_block_fresh)(const MdTranslator *tr, const MdTrBlock *blk)
 {
     unsigned i;
     for (i = 0u; i < blk->page_count; ++i)
@@ -1582,7 +1585,7 @@ static int md_tr_block_fresh(const MdTranslator *tr, const MdTrBlock *blk)
 
 /* Adds a code page to the block's (at most two) pages. Takes the array and
    count explicitly so GCC's object-size analysis sees the real bound. */
-static int md_tr_add_page(uint8_t pages[2], unsigned *count, unsigned page)
+static int MD_COMPILER_HOT_FUNC(md_tr_add_page)(uint8_t pages[2], unsigned *count, unsigned page)
 {
     if (*count >= 1u && pages[0] == page) return 1;
     if (*count >= 2u && pages[1] == page) return 1;
@@ -1594,7 +1597,7 @@ static int md_tr_add_page(uint8_t pages[2], unsigned *count, unsigned page)
 
 /* Returns 1 and fills blk on success; 0 if the first instruction is not
    lowered (blk becomes an untranslatable marker). */
-static int md_tr_translate(MdTranslator *tr, MdTrBlock *blk, uint16_t cs, uint16_t ip, int retry)
+static int MD_COMPILER_HOT_FUNC(md_tr_translate)(MdTranslator *tr, MdTrBlock *blk, uint16_t cs, uint16_t ip, int retry)
 {
     static MdTrCtx ctx;                         /* compile scratch, not per block */
     MdTrCtx *c = &ctx;
@@ -1739,26 +1742,26 @@ static int md_tr_translate(MdTranslator *tr, MdTrBlock *blk, uint16_t cs, uint16
     return 1;
 }
 
-static int md_tr_match(const MdTranslator *tr, const MdTrBlock *blk, uint16_t cs, uint16_t ip)
+static int MD_EXEC_HOT_FUNC(md_tr_match)(const MdTranslator *tr, const MdTrBlock *blk, uint16_t cs, uint16_t ip)
 {
     return blk->state != 0u && blk->cs == cs && blk->ip == ip && md_tr_block_fresh(tr, blk);
 }
 
-static uint8_t *md_tr_heat(MdTranslator *tr, uint16_t cs, uint16_t ip)
+static uint8_t *MD_EXEC_HOT_FUNC(md_tr_heat)(MdTranslator *tr, uint16_t cs, uint16_t ip)
 {
     const uint32_t x = ((uint32_t)cs << 4) + ip;
     return &tr->heat[(x ^ (x >> 7) ^ (x >> 13)) & (MD_TR_HEAT_SLOTS - 1u)];
 }
 
 /* B: loop heads (back-edges) heat 4x faster than plain edge targets. */
-static void md_tr_heat_bump(MdTranslator *tr, uint16_t cs, uint16_t ip, unsigned w)
+static void MD_EXEC_HOT_FUNC(md_tr_heat_bump)(MdTranslator *tr, uint16_t cs, uint16_t ip, unsigned w)
 {
     uint8_t *h = md_tr_heat(tr, cs, ip);
     *h = (uint8_t)(*h + w > 0xFFu ? 0xFFu : *h + w);
 }
 
 /* E: the block whose code contains arena offset `off` (chain source). */
-static const MdTrBlock *md_tr_block_at(const MdTranslator *tr, uint32_t off)
+static const MdTrBlock *MD_EXEC_HOT_FUNC(md_tr_block_at)(const MdTranslator *tr, uint32_t off)
 {
     unsigned i;
     for (i = 0u; i < MD_TR_SLOTS; ++i) {
@@ -1768,7 +1771,7 @@ static const MdTrBlock *md_tr_block_at(const MdTranslator *tr, uint32_t off)
     return NULL;
 }
 
-static int md_tr_pages_subset(const MdTrBlock *to, const MdTrBlock *from)
+static int MD_EXEC_HOT_FUNC(md_tr_pages_subset)(const MdTrBlock *to, const MdTrBlock *from)
 {
     unsigned i, j;
     for (i = 0u; i < to->page_count; ++i) {
@@ -1779,12 +1782,14 @@ static int md_tr_pages_subset(const MdTrBlock *to, const MdTrBlock *from)
     return 1;
 }
 
-static MdTrBlock *md_tr_lookup(MdTranslator *tr, uint16_t cs, uint16_t ip)
+static MdTrBlock *MD_EXEC_HOT_FUNC(md_tr_lookup)(MdTranslator *tr, uint16_t cs, uint16_t ip)
 {
     MdTrBlock *blk = &tr->blocks[md_tr_hash(cs, ip)];
     if (blk->state != 0u && blk->cs == cs && blk->ip == ip && md_tr_block_fresh(tr, blk))
         return blk;
+    md_qmi_profile_enter(tr->rt, MD_QMI_TRANSLATE);
     (void)md_tr_translate(tr, blk, cs, ip, 1);
+    md_qmi_profile_leave(tr->rt);
     return blk;
 }
 #endif
@@ -1826,7 +1831,9 @@ MdStopReason MD_HOT_FUNC(md_tr_run)(MdTranslator *tr, uint64_t budget)
         if (!md_tr_match(tr, blk, cs, ip)) {
             if (tr->eager || *md_tr_heat(tr, cs, ip) >= MD_TR_HOT_THRESHOLD) {
                 cyc = MD_TR_CYC();
+                md_qmi_profile_enter(rt, MD_QMI_TRANSLATE);
                 (void)md_tr_translate(tr, blk, cs, ip, 1);
+                md_qmi_profile_leave(rt);
                 tr->stats.cyc_translate += (uint32_t)(MD_TR_CYC() - cyc);
             }
             else
@@ -1855,7 +1862,11 @@ MdStopReason MD_HOT_FUNC(md_tr_run)(MdTranslator *tr, uint64_t budget)
                         /* F: a specialised loop engine (Native v2) gets the
                            loop head first; M25 takes whatever it rejects */
                         const uint64_t h0 = rt->instructions;
-                        if (tr->loop_hook(tr->loop_user, rt, budget)) {
+                        int hook_taken;
+                        md_qmi_profile_enter(rt, MD_QMI_NATIVE_V2);
+                        hook_taken = tr->loop_hook(tr->loop_user, rt, budget);
+                        md_qmi_profile_leave(rt);
+                        if (hook_taken) {
                             const uint64_t r = rt->instructions - h0;
                             budget = budget > r ? budget - r : 0u;
                             tr->stats.hook_instructions += r;
@@ -1874,7 +1885,9 @@ MdStopReason MD_HOT_FUNC(md_tr_run)(MdTranslator *tr, uint64_t budget)
                 continue;
             }
 #endif
+            md_qmi_profile_enter(rt, MD_QMI_INTERP);
             (void)md_interp_step(rt);
+            md_qmi_profile_leave(rt);
             --budget;
             ++tr->stats.interp_instructions;
             continue;
@@ -1883,7 +1896,9 @@ MdStopReason MD_HOT_FUNC(md_tr_run)(MdTranslator *tr, uint64_t budget)
         chunk = budget > 0x3FFFFFFFu ? 0x3FFFFFFFu : (uint32_t)budget;
         enter = (MdTrEnter)(uintptr_t)(md_tr_addr(tr->arena + tr->enter_off) | 1u);
         cyc = MD_TR_CYC();
+        md_qmi_profile_enter(rt, MD_QMI_M25_NATIVE);
         info = enter(md_tr_addr(tr->arena + blk->entry) | 1u, chunk);
+        md_qmi_profile_leave(rt);
         tr->stats.cyc_native += (uint32_t)(MD_TR_CYC() - cyc);
         retired = chunk - tr->remaining;
         rt->instructions += retired;
@@ -1905,8 +1920,11 @@ MdStopReason MD_HOT_FUNC(md_tr_run)(MdTranslator *tr, uint64_t budget)
                     to = &tr->blocks[md_tr_hash(rt->cpu.cs, rt->cpu.ip)];
                     if (!md_tr_match(tr, to, rt->cpu.cs, rt->cpu.ip)) {
                         md_tr_heat_bump(tr, rt->cpu.cs, rt->cpu.ip, 1u);
-                        if (*md_tr_heat(tr, rt->cpu.cs, rt->cpu.ip) >= MD_TR_HOT_THRESHOLD)
+                        if (*md_tr_heat(tr, rt->cpu.cs, rt->cpu.ip) >= MD_TR_HOT_THRESHOLD) {
+                            md_qmi_profile_enter(rt, MD_QMI_TRANSLATE);
                             (void)md_tr_translate(tr, to, rt->cpu.cs, rt->cpu.ip, 1);
+                            md_qmi_profile_leave(rt);
+                        }
                     }
                 }
                 if (to->state == 1u && md_tr_match(tr, to, rt->cpu.cs, rt->cpu.ip) &&

@@ -265,6 +265,7 @@ $matches = [regex]::Matches(
     '\[perf\] wall\s+(?<wall>[0-9.]+) s\s+in-guest-loop\s+(?<loop>[0-9.]+) s\s*\r?\n' +
     '\[perf\] active\s+(?<active>[0-9.]+) s\s+idle-sleep\s+(?<idle>[0-9.]+) s.*?\r?\n' +
     '\[perf\] instructions\s+(?<inst>[0-9]+)\s+active\s+(?<mips>[0-9.]+) MIPS\s*\r?\n' +
+    '.*?' +
     '\[perf\] tiers:\s+static-aot\s+(?<aot>[0-9]+) \((?<aotpct>[0-9.]+)%\)\s+' +
     'old-jit\s+(?<jit>[0-9]+) \((?<jitpct>[0-9.]+)%\)\s+' +
     'native-v2\s+(?<native>[0-9]+) \((?<nativepct>[0-9.]+)%\)\s+' +

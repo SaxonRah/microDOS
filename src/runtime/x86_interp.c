@@ -1,5 +1,6 @@
 #include "microdos/runtime.h"
 #include "microdos/hot_code.h"
+#include "microdos/qmi_profile.h"
 #include "runtime_internal.h"
 
 #include <stddef.h>
@@ -41,7 +42,7 @@ void md_interp_opcode_profile_reset(void)
 
 #define MD_OPCODE_PROFILE_HIT(op) (++g_md_opcode_profile[(uint8_t)(op)])
 
-static inline unsigned md_unpref_modrm_profile_row(uint8_t opcode)
+MD_INTERP_INLINE unsigned md_unpref_modrm_profile_row(uint8_t opcode)
 {
     switch (opcode) {
         case 0x33u: return 0u;
@@ -54,7 +55,7 @@ static inline unsigned md_unpref_modrm_profile_row(uint8_t opcode)
     }
 }
 
-static inline void md_unpref_modrm_profile_hit(uint8_t opcode, uint8_t modrm)
+MD_INTERP_INLINE void md_unpref_modrm_profile_hit(uint8_t opcode, uint8_t modrm)
 {
     const unsigned row = md_unpref_modrm_profile_row(opcode);
     if (row < 6u) ++g_md_unpref_modrm_profile[row * 256u + modrm];
@@ -63,7 +64,7 @@ static inline void md_unpref_modrm_profile_hit(uint8_t opcode, uint8_t modrm)
 #define MD_UNPREF_MODRM_PROFILE_HIT(op, modrm) \
     md_unpref_modrm_profile_hit((uint8_t)(op), (uint8_t)(modrm))
 
-static inline unsigned md_prefix_profile_row(uint8_t prefix)
+MD_INTERP_INLINE unsigned md_prefix_profile_row(uint8_t prefix)
 {
     switch (prefix) {
         case 0x26u: return 0u;
@@ -77,7 +78,7 @@ static inline unsigned md_prefix_profile_row(uint8_t prefix)
     }
 }
 
-static inline void md_prefix_profile_hit(uint8_t prefix, uint8_t opcode)
+MD_INTERP_INLINE void md_prefix_profile_hit(uint8_t prefix, uint8_t opcode)
 {
     const unsigned row = md_prefix_profile_row(prefix);
     if (row < 7u) ++g_md_prefix_profile[row * 256u + opcode];
@@ -85,7 +86,7 @@ static inline void md_prefix_profile_hit(uint8_t prefix, uint8_t opcode)
 
 #define MD_PREFIX_PROFILE_HIT(prefix, op) md_prefix_profile_hit((uint8_t)(prefix), (uint8_t)(op))
 
-static inline unsigned md_hot_modrm_profile_row(uint8_t prefix, uint8_t opcode)
+MD_INTERP_INLINE unsigned md_hot_modrm_profile_row(uint8_t prefix, uint8_t opcode)
 {
     if (prefix == 0x36u) {
         switch (opcode) {
@@ -110,7 +111,7 @@ static inline unsigned md_hot_modrm_profile_row(uint8_t prefix, uint8_t opcode)
     return 10u;
 }
 
-static inline void md_hot_modrm_profile_hit(uint8_t prefix, uint8_t opcode, uint8_t modrm)
+MD_INTERP_INLINE void md_hot_modrm_profile_hit(uint8_t prefix, uint8_t opcode, uint8_t modrm)
 {
     const unsigned row = md_hot_modrm_profile_row(prefix, opcode);
     if (row < 10u) ++g_md_hot_modrm_profile[row * 256u + modrm];
@@ -138,14 +139,14 @@ typedef struct MdPrefixState {
     uint8_t lock;
 } MdPrefixState;
 
-static inline int md_is_prefix_byte(uint8_t opcode)
+MD_INTERP_INLINE int md_is_prefix_byte(uint8_t opcode)
 {
     /* 26/2E/36/3E share the pattern 001xx110; F0/F2/F3 are 111100xx minus F1. */
     return (opcode & 0xE7u) == 0x26u ||
            ((opcode & 0xFCu) == 0xF0u && opcode != 0xF1u);
 }
 
-static inline void md_apply_prefix(MdPrefixState *prefix, uint8_t opcode)
+MD_INTERP_INLINE void md_apply_prefix(MdPrefixState *prefix, uint8_t opcode)
 {
     switch (opcode) {
         case 0x26u: case 0x2Eu: case 0x36u: case 0x3Eu:
@@ -162,7 +163,7 @@ static inline void md_apply_prefix(MdPrefixState *prefix, uint8_t opcode)
     }
 }
 
-static inline uint16_t md_get_sreg(const MdX86 *cpu, unsigned reg)
+MD_INTERP_INLINE uint16_t md_get_sreg(const MdX86 *cpu, unsigned reg)
 {
     switch (reg & 3u) {
         case 0u: return cpu->es;
@@ -172,7 +173,7 @@ static inline uint16_t md_get_sreg(const MdX86 *cpu, unsigned reg)
     }
 }
 
-static inline uint16_t md_prefixed_segment(const MdX86 *cpu,
+MD_INTERP_INLINE uint16_t md_prefixed_segment(const MdX86 *cpu,
                                             const MdPrefixState *prefix,
                                             uint16_t fallback)
 {
@@ -181,7 +182,7 @@ static inline uint16_t md_prefixed_segment(const MdX86 *cpu,
     return md_get_sreg(cpu, (prefix->segment_override >> 3) & 3u);
 }
 
-static inline MdOperand md_decode_rm(MdRuntime *runtime, uint8_t modrm, const MdPrefixState *prefix)
+MD_INTERP_INLINE MdOperand md_decode_rm(MdRuntime *runtime, uint8_t modrm, const MdPrefixState *prefix)
 {
     MdX86 *cpu = &runtime->cpu;
     const unsigned mod = modrm >> 6;
@@ -230,31 +231,31 @@ static inline MdOperand md_decode_rm(MdRuntime *runtime, uint8_t modrm, const Md
     return op;
 }
 
-static inline uint8_t md_operand_read8(MdRuntime *runtime, MdOperand op)
+MD_INTERP_INLINE uint8_t md_operand_read8(MdRuntime *runtime, MdOperand op)
 {
     return op.is_register ? md_x86_get_reg8(&runtime->cpu, op.reg)
                           : md_x86_read8(&runtime->cpu, op.segment, op.offset);
 }
 
-static inline uint16_t md_operand_read16(MdRuntime *runtime, MdOperand op)
+MD_INTERP_INLINE uint16_t md_operand_read16(MdRuntime *runtime, MdOperand op)
 {
     return op.is_register ? runtime->cpu.r[op.reg]
                           : md_x86_read16(&runtime->cpu, op.segment, op.offset);
 }
 
-static inline void md_operand_write8(MdRuntime *runtime, MdOperand op, uint8_t value)
+MD_INTERP_INLINE void md_operand_write8(MdRuntime *runtime, MdOperand op, uint8_t value)
 {
     if (op.is_register) md_x86_set_reg8(&runtime->cpu, op.reg, value);
     else md_x86_write8(&runtime->cpu, op.segment, op.offset, value);
 }
 
-static inline void md_operand_write16(MdRuntime *runtime, MdOperand op, uint16_t value)
+MD_INTERP_INLINE void md_operand_write16(MdRuntime *runtime, MdOperand op, uint16_t value)
 {
     if (op.is_register) runtime->cpu.r[op.reg] = value;
     else md_x86_write16(&runtime->cpu, op.segment, op.offset, value);
 }
 
-static inline int md_set_sreg(MdX86 *cpu, unsigned reg, uint16_t value)
+MD_INTERP_INLINE int md_set_sreg(MdX86 *cpu, unsigned reg, uint16_t value)
 {
     switch (reg) {
         case 0u: cpu->es = value; return 1;
@@ -264,7 +265,7 @@ static inline int md_set_sreg(MdX86 *cpu, unsigned reg, uint16_t value)
     }
 }
 
-static inline void md_fault(MdRuntime *runtime, uint8_t opcode, uint16_t ip_before)
+MD_INTERP_INLINE void md_fault(MdRuntime *runtime, uint8_t opcode, uint16_t ip_before)
 {
     runtime->fault_opcode = opcode;
     runtime->fault_linear = md_x86_linear(runtime->cpu.cs, ip_before);
@@ -272,41 +273,41 @@ static inline void md_fault(MdRuntime *runtime, uint8_t opcode, uint16_t ip_befo
 }
 
 /* One ALU implementation for interpreter and generated code (ops.h). */
-static inline uint8_t md_alu8(MdX86 *cpu, unsigned operation, uint8_t lhs, uint8_t rhs)
+MD_INTERP_INLINE uint8_t md_alu8(MdX86 *cpu, unsigned operation, uint8_t lhs, uint8_t rhs)
 {
     return md_x86_alu8(cpu, operation, lhs, rhs);
 }
 
-static inline uint16_t md_alu16(MdX86 *cpu, unsigned operation, uint16_t lhs, uint16_t rhs)
+MD_INTERP_INLINE uint16_t md_alu16(MdX86 *cpu, unsigned operation, uint16_t lhs, uint16_t rhs)
 {
     return md_x86_alu16(cpu, operation, lhs, rhs);
 }
 
-static inline void md_op_mov_r8_imm(MdRuntime *runtime, uint8_t opcode)
+MD_INTERP_INLINE void md_op_mov_r8_imm(MdRuntime *runtime, uint8_t opcode)
 {
     md_x86_set_reg8(&runtime->cpu, opcode & 7u, md_fetch8(runtime));
 }
 
-static inline void md_op_mov_r16_imm(MdRuntime *runtime, uint8_t opcode)
+MD_INTERP_INLINE void md_op_mov_r16_imm(MdRuntime *runtime, uint8_t opcode)
 {
     runtime->cpu.r[opcode & 7u] = md_fetch16(runtime);
 }
 
-static inline void md_op_inc_r16(MdRuntime *runtime, uint8_t opcode)
+MD_INTERP_INLINE void md_op_inc_r16(MdRuntime *runtime, uint8_t opcode)
 {
     MdX86 *cpu = &runtime->cpu;
     const unsigned reg = opcode & 7u;
     cpu->r[reg] = md_x86_inc16(cpu, cpu->r[reg]);
 }
 
-static inline void md_op_dec_r16(MdRuntime *runtime, uint8_t opcode)
+MD_INTERP_INLINE void md_op_dec_r16(MdRuntime *runtime, uint8_t opcode)
 {
     MdX86 *cpu = &runtime->cpu;
     const unsigned reg = opcode & 7u;
     cpu->r[reg] = md_x86_dec16(cpu, cpu->r[reg]);
 }
 
-static inline void md_op_mov_rm_r(MdRuntime *runtime, uint8_t opcode, const MdPrefixState *prefix)
+MD_INTERP_INLINE void md_op_mov_rm_r(MdRuntime *runtime, uint8_t opcode, const MdPrefixState *prefix)
 {
     MdX86 *cpu = &runtime->cpu;
     const uint8_t modrm = md_fetch8(runtime);
@@ -319,7 +320,7 @@ static inline void md_op_mov_rm_r(MdRuntime *runtime, uint8_t opcode, const MdPr
     else cpu->r[reg] = md_operand_read16(runtime, rm);
 }
 
-static inline void md_op_mov_sreg(MdRuntime *runtime, uint8_t opcode, uint16_t ip_before, const MdPrefixState *prefix)
+MD_INTERP_INLINE void md_op_mov_sreg(MdRuntime *runtime, uint8_t opcode, uint16_t ip_before, const MdPrefixState *prefix)
 {
     MdX86 *cpu = &runtime->cpu;
     const uint8_t modrm = md_fetch8(runtime);
@@ -338,7 +339,7 @@ static inline void md_op_mov_sreg(MdRuntime *runtime, uint8_t opcode, uint16_t i
     }
 }
 
-static inline void md_op_mov_rm_imm(MdRuntime *runtime, uint8_t opcode, uint16_t ip_before, const MdPrefixState *prefix)
+MD_INTERP_INLINE void md_op_mov_rm_imm(MdRuntime *runtime, uint8_t opcode, uint16_t ip_before, const MdPrefixState *prefix)
 {
     const uint8_t modrm = md_fetch8(runtime);
     const unsigned ext = (modrm >> 3) & 7u;
@@ -352,7 +353,7 @@ static inline void md_op_mov_rm_imm(MdRuntime *runtime, uint8_t opcode, uint16_t
     else md_operand_write16(runtime, rm, md_fetch16(runtime));
 }
 
-static inline void md_op_alu_rm_r(MdRuntime *runtime, uint8_t opcode, const MdPrefixState *prefix)
+MD_INTERP_INLINE void md_op_alu_rm_r(MdRuntime *runtime, uint8_t opcode, const MdPrefixState *prefix)
 {
     MdX86 *cpu = &runtime->cpu;
     const uint8_t modrm = md_fetch8(runtime);
@@ -381,7 +382,7 @@ static inline void md_op_alu_rm_r(MdRuntime *runtime, uint8_t opcode, const MdPr
     }
 }
 
-static inline void md_op_alu_acc_imm(MdRuntime *runtime, uint8_t opcode)
+MD_INTERP_INLINE void md_op_alu_acc_imm(MdRuntime *runtime, uint8_t opcode)
 {
     MdX86 *cpu = &runtime->cpu;
     const unsigned operation = (opcode >> 3) & 7u;
@@ -398,7 +399,7 @@ static inline void md_op_alu_acc_imm(MdRuntime *runtime, uint8_t opcode)
     }
 }
 
-static inline void md_op_group1_imm(MdRuntime *runtime, uint8_t opcode, const MdPrefixState *prefix)
+MD_INTERP_INLINE void md_op_group1_imm(MdRuntime *runtime, uint8_t opcode, const MdPrefixState *prefix)
 {
     MdX86 *cpu = &runtime->cpu;
     const uint8_t modrm = md_fetch8(runtime);
@@ -421,20 +422,20 @@ static inline void md_op_group1_imm(MdRuntime *runtime, uint8_t opcode, const Md
     }
 }
 
-static inline int md_execute_opcode(MdRuntime *runtime, uint8_t opcode,
+MD_INTERP_INLINE int md_execute_opcode(MdRuntime *runtime, uint8_t opcode,
                                     uint16_t ip_before, const MdPrefixState *prefix);
 
-static inline int16_t md_string_delta(const MdX86 *cpu, unsigned width)
+MD_INTERP_INLINE int16_t md_string_delta(const MdX86 *cpu, unsigned width)
 {
     return (cpu->flags_raw & MD_X86_FLAG_DF) != 0u ? -(int16_t)width : (int16_t)width;
 }
 
-static inline void md_advance_index(uint16_t *value, int16_t delta)
+MD_INTERP_INLINE void md_advance_index(uint16_t *value, int16_t delta)
 {
     *value = (uint16_t)(*value + delta);
 }
 
-static inline void md_op_string_once(MdRuntime *runtime, uint8_t opcode,
+MD_INTERP_INLINE void md_op_string_once(MdRuntime *runtime, uint8_t opcode,
                                      const MdPrefixState *prefix)
 {
     MdX86 *cpu = &runtime->cpu;
@@ -502,7 +503,7 @@ static inline void md_op_string_once(MdRuntime *runtime, uint8_t opcode,
     }
 }
 
-static inline void md_op_string(MdRuntime *runtime, uint8_t opcode,
+MD_INTERP_INLINE void md_op_string(MdRuntime *runtime, uint8_t opcode,
                                 const MdPrefixState *prefix)
 {
     MdX86 *cpu = &runtime->cpu;
@@ -547,7 +548,7 @@ static inline void md_op_string(MdRuntime *runtime, uint8_t opcode,
     }
 }
 
-static inline void md_op_loop(MdRuntime *runtime, uint8_t opcode)
+MD_INTERP_INLINE void md_op_loop(MdRuntime *runtime, uint8_t opcode)
 {
     MdX86 *cpu = &runtime->cpu;
     const int8_t rel = (int8_t)md_fetch8(runtime);
@@ -567,13 +568,13 @@ static inline void md_op_loop(MdRuntime *runtime, uint8_t opcode)
     if (take) cpu->ip = (uint16_t)(cpu->ip + rel);
 }
 
-static inline void md_set_cf_of(MdX86 *cpu, int set)
+MD_INTERP_INLINE void md_set_cf_of(MdX86 *cpu, int set)
 {
     md_x86_update_flags(cpu, (uint16_t)(MD_X86_FLAG_CF | MD_X86_FLAG_OF),
                         set ? (uint16_t)(MD_X86_FLAG_CF | MD_X86_FLAG_OF) : 0u);
 }
 
-static inline void md_op_test_rm_r(MdRuntime *runtime, uint8_t opcode,
+MD_INTERP_INLINE void md_op_test_rm_r(MdRuntime *runtime, uint8_t opcode,
                                    const MdPrefixState *prefix)
 {
     MdX86 *cpu = &runtime->cpu;
@@ -590,7 +591,7 @@ static inline void md_op_test_rm_r(MdRuntime *runtime, uint8_t opcode,
     }
 }
 
-static inline void md_op_xchg_rm_r(MdRuntime *runtime, uint8_t opcode,
+MD_INTERP_INLINE void md_op_xchg_rm_r(MdRuntime *runtime, uint8_t opcode,
                                    const MdPrefixState *prefix)
 {
     MdX86 *cpu = &runtime->cpu;
@@ -611,7 +612,7 @@ static inline void md_op_xchg_rm_r(MdRuntime *runtime, uint8_t opcode,
     }
 }
 
-static inline void md_op_lea(MdRuntime *runtime, uint16_t ip_before,
+MD_INTERP_INLINE void md_op_lea(MdRuntime *runtime, uint16_t ip_before,
                              const MdPrefixState *prefix)
 {
     const uint8_t modrm = md_fetch8(runtime);
@@ -624,7 +625,7 @@ static inline void md_op_lea(MdRuntime *runtime, uint16_t ip_before,
     runtime->cpu.r[reg] = rm.offset;
 }
 
-static inline void md_op_pop_rm(MdRuntime *runtime, uint16_t ip_before,
+MD_INTERP_INLINE void md_op_pop_rm(MdRuntime *runtime, uint16_t ip_before,
                                 const MdPrefixState *prefix)
 {
     const uint8_t modrm = md_fetch8(runtime);
@@ -637,7 +638,7 @@ static inline void md_op_pop_rm(MdRuntime *runtime, uint16_t ip_before,
     md_operand_write16(runtime, rm, md_x86_pop(&runtime->cpu));
 }
 
-static inline void md_op_les_lds(MdRuntime *runtime, uint8_t opcode,
+MD_INTERP_INLINE void md_op_les_lds(MdRuntime *runtime, uint8_t opcode,
                                  uint16_t ip_before, const MdPrefixState *prefix)
 {
     MdX86 *cpu = &runtime->cpu;
@@ -658,7 +659,7 @@ static inline void md_op_les_lds(MdRuntime *runtime, uint8_t opcode,
     else cpu->ds = segment;
 }
 
-static inline void md_op_shift(MdRuntime *runtime, uint8_t opcode,
+MD_INTERP_INLINE void md_op_shift(MdRuntime *runtime, uint8_t opcode,
                                const MdPrefixState *prefix)
 {
     MdX86 *cpu = &runtime->cpu;
@@ -676,7 +677,7 @@ static inline void md_op_shift(MdRuntime *runtime, uint8_t opcode,
     }
 }
 
-static inline void md_divide_error(MdRuntime *runtime)
+MD_INTERP_INLINE void md_divide_error(MdRuntime *runtime)
 {
     /*
      * 8086 divide-by-zero and quotient overflow are Type-0 interrupts, not
@@ -689,7 +690,7 @@ static inline void md_divide_error(MdRuntime *runtime)
 /* MUL/IMUL/DIV/IDIV (M18): one implementation shared by the interpreter's
    group 3 and dosrecomp-generated code (md_interp_muldiv).  DIV/IDIV
    exceptions dispatch through real-mode vector 0. `ext` is ModR/M.reg (4..7). */
-static inline void md_muldiv_core(MdRuntime *runtime, uint8_t opcode, unsigned ext,
+MD_INTERP_INLINE void md_muldiv_core(MdRuntime *runtime, uint8_t opcode, unsigned ext,
                                   uint16_t operand, uint16_t ip_before,
                                   uint8_t repeat_prefix)
 {
@@ -798,7 +799,7 @@ static inline void md_muldiv_core(MdRuntime *runtime, uint8_t opcode, unsigned e
     }
 }
 
-static inline void md_op_group3(MdRuntime *runtime, uint8_t opcode,
+MD_INTERP_INLINE void md_op_group3(MdRuntime *runtime, uint8_t opcode,
                                 uint16_t ip_before, const MdPrefixState *prefix)
 {
     MdX86 *cpu = &runtime->cpu;
@@ -848,7 +849,7 @@ static inline void md_op_group3(MdRuntime *runtime, uint8_t opcode,
     }
 }
 
-static inline void md_op_group45(MdRuntime *runtime, uint8_t opcode,
+MD_INTERP_INLINE void md_op_group45(MdRuntime *runtime, uint8_t opcode,
                                  uint16_t ip_before, const MdPrefixState *prefix)
 {
     MdX86 *cpu = &runtime->cpu;
@@ -920,7 +921,7 @@ static inline void md_op_group45(MdRuntime *runtime, uint8_t opcode,
     }
 }
 
-static inline void md_op_daa(MdX86 *cpu)
+MD_INTERP_INLINE void md_op_daa(MdX86 *cpu)
 {
     md_x86_flags_materialize(cpu);   /* BCD adjusts stay eager (M18) */
     uint8_t al = md_x86_get_reg8(cpu, 0u);
@@ -959,7 +960,7 @@ static inline void md_op_daa(MdX86 *cpu)
     md_x86_set_szp8(cpu, al);
 }
 
-static inline void md_op_das(MdX86 *cpu)
+MD_INTERP_INLINE void md_op_das(MdX86 *cpu)
 {
     md_x86_flags_materialize(cpu);   /* BCD adjusts stay eager (M18) */
     uint8_t al = md_x86_get_reg8(cpu, 0u);
@@ -998,7 +999,7 @@ static inline void md_op_das(MdX86 *cpu)
     md_x86_set_szp8(cpu, al);
 }
 
-static inline void md_op_aaa(MdX86 *cpu, int subtract)
+MD_INTERP_INLINE void md_op_aaa(MdX86 *cpu, int subtract)
 {
     md_x86_flags_materialize(cpu);   /* BCD adjusts stay eager (M18) */
     uint8_t al = md_x86_get_reg8(cpu, 0u);
@@ -1014,31 +1015,31 @@ static inline void md_op_aaa(MdX86 *cpu, int subtract)
     md_x86_set_reg8(cpu, 4u, ah);
 }
 
-static inline uint8_t md_port_in8(MdRuntime *runtime, uint16_t port)
+MD_INTERP_INLINE uint8_t md_port_in8(MdRuntime *runtime, uint16_t port)
 {
     return runtime->hooks.in8 != NULL
         ? runtime->hooks.in8(runtime, port, runtime->hooks.user) : 0xFFu;
 }
 
-static inline void md_port_out8(MdRuntime *runtime, uint16_t port, uint8_t value)
+MD_INTERP_INLINE void md_port_out8(MdRuntime *runtime, uint16_t port, uint8_t value)
 {
     if (runtime->hooks.out8 != NULL) runtime->hooks.out8(runtime, port, value, runtime->hooks.user);
 }
 
-static inline uint16_t md_port_in16(MdRuntime *runtime, uint16_t port)
+MD_INTERP_INLINE uint16_t md_port_in16(MdRuntime *runtime, uint16_t port)
 {
     const uint16_t lo = md_port_in8(runtime, port);
     const uint16_t hi = md_port_in8(runtime, (uint16_t)(port + 1u));
     return (uint16_t)(lo | (uint16_t)(hi << 8));
 }
 
-static inline void md_port_out16(MdRuntime *runtime, uint16_t port, uint16_t value)
+MD_INTERP_INLINE void md_port_out16(MdRuntime *runtime, uint16_t port, uint16_t value)
 {
     md_port_out8(runtime, port, (uint8_t)value);
     md_port_out8(runtime, (uint16_t)(port + 1u), (uint8_t)(value >> 8));
 }
 
-static inline int md_execute_prefixed(MdRuntime *runtime, uint8_t first_prefix,
+MD_INTERP_INLINE int md_execute_prefixed(MdRuntime *runtime, uint8_t first_prefix,
                                       uint16_t ip_before)
 {
     MdPrefixState prefix;
@@ -1061,7 +1062,7 @@ static inline int md_execute_prefixed(MdRuntime *runtime, uint8_t first_prefix,
     return md_execute_opcode(runtime, opcode, ip_before, &prefix);
 }
 
-static inline int md_execute_opcode(MdRuntime *runtime, uint8_t opcode, uint16_t ip_before, const MdPrefixState *prefix)
+MD_INTERP_INLINE int md_execute_opcode(MdRuntime *runtime, uint8_t opcode, uint16_t ip_before, const MdPrefixState *prefix)
 {
     MdX86 *cpu = &runtime->cpu;
 
@@ -1343,7 +1344,7 @@ static inline int md_execute_opcode(MdRuntime *runtime, uint8_t opcode, uint16_t
 #if defined(MD_THREADED_DISPATCH) && (defined(__GNUC__) || defined(__clang__))
 
 #if defined(MICRODOS_ENABLE_NATIVE_V2) && defined(MICRODOS_NATIVE_V2_BACKEDGE_PROFILE)
-static inline void md_nv2_profile_backedge(MdRuntime *runtime,
+MD_INTERP_INLINE void md_nv2_profile_backedge(MdRuntime *runtime,
                                            uint8_t opcode,
                                            uint16_t source_ip,
                                            uint16_t target_ip)
@@ -1419,7 +1420,7 @@ static inline void md_nv2_profile_backedge(MdRuntime *runtime,
    soon as CS differs from its value on entry). Per-instruction counters are
    32-bit locals; runtime->instructions is updated on every exit and before
    interrupt hooks run, so observers still see exact counts. */
-static MdStopReason md_interp_run_threaded(MdRuntime *runtime, uint32_t instruction_budget,
+static MdStopReason MD_EXEC_HOT_FUNC(md_interp_run_threaded)(MdRuntime *runtime, uint32_t instruction_budget,
                                            int watch_cs)
 {
     static void *dispatch[256] = {0};
@@ -2371,7 +2372,7 @@ MdStopReason MD_HOT_FUNC(md_interp_step)(MdRuntime *runtime)
 
 /* Budgets above 2^30 are run in 32-bit chunks so the hot loop never does
    64-bit arithmetic; a chunk boundary is invisible to the guest. */
-static MdStopReason md_interp_run_chunked(MdRuntime *runtime, uint64_t instruction_budget,
+static MdStopReason MD_EXEC_HOT_FUNC(md_interp_run_chunked)(MdRuntime *runtime, uint64_t instruction_budget,
                                          int watch_cs)
 {
     const uint16_t cs0 = runtime->cpu.cs;
@@ -2379,11 +2380,13 @@ static MdStopReason md_interp_run_chunked(MdRuntime *runtime, uint64_t instructi
         const uint32_t chunk = instruction_budget > 0x40000000u ? 0x40000000u
                                                                 : (uint32_t)instruction_budget;
         MdStopReason st;
+        md_qmi_profile_enter(runtime, MD_QMI_INTERP);
 #if defined(MD_THREADED_DISPATCH) && (defined(__GNUC__) || defined(__clang__))
         st = md_interp_run_threaded(runtime, chunk, watch_cs);
 #else
         st = md_interp_run_switch(runtime, chunk, watch_cs);
 #endif
+        md_qmi_profile_leave(runtime);
         instruction_budget -= chunk;
         if (st != MD_STOP_BUDGET || instruction_budget == 0u) return st;
         if (watch_cs && runtime->cpu.cs != cs0) return st;

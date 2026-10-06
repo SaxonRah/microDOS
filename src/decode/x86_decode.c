@@ -1,4 +1,5 @@
 #include "microdos/decode.h"
+#include "microdos/hot_code.h"
 
 #include <string.h>
 
@@ -8,14 +9,14 @@ typedef struct MdDecodeCursor {
     size_t pos;
 } MdDecodeCursor;
 
-static int md_take(MdDecodeCursor *c, unsigned count)
+static int MD_COMPILER_HOT_FUNC(md_take)(MdDecodeCursor *c, unsigned count)
 {
     if (c->pos + count > c->size) return 0;
     c->pos += count;
     return 1;
 }
 
-static int md_is_prefix(uint8_t opcode)
+static int MD_COMPILER_HOT_FUNC(md_is_prefix)(uint8_t opcode)
 {
     switch (opcode) {
         case 0x26u: /* ES */
@@ -31,7 +32,7 @@ static int md_is_prefix(uint8_t opcode)
     }
 }
 
-static int md_take_modrm(MdDecodeCursor *c, MdDecodedInstruction *out)
+static int MD_COMPILER_HOT_FUNC(md_take_modrm)(MdDecodeCursor *c, MdDecodedInstruction *out)
 {
     uint8_t modrm;
     unsigned mod;
@@ -53,14 +54,14 @@ static int md_take_modrm(MdDecodeCursor *c, MdDecodedInstruction *out)
     return md_take(c, displacement);
 }
 
-static int md_take_modrm_imm(MdDecodeCursor *c,
+static int MD_COMPILER_HOT_FUNC(md_take_modrm_imm)(MdDecodeCursor *c,
                              MdDecodedInstruction *out,
                              unsigned immediate)
 {
     return md_take_modrm(c, out) && md_take(c, immediate);
 }
 
-static int md_in_image(size_t image_size, uint16_t image_base, uint16_t ip, size_t *offset)
+static int MD_COMPILER_HOT_FUNC(md_in_image)(size_t image_size, uint16_t image_base, uint16_t ip, size_t *offset)
 {
     const uint32_t begin = image_base;
     const uint32_t end = begin + (uint32_t)image_size;
@@ -70,7 +71,7 @@ static int md_in_image(size_t image_size, uint16_t image_base, uint16_t ip, size
     return 1;
 }
 
-bool md_decode_8086(const uint8_t *image,
+bool MD_COMPILER_HOT_FUNC(md_decode_8086)(const uint8_t *image,
                     size_t image_size,
                     uint16_t image_base,
                     uint16_t ip,
@@ -357,7 +358,7 @@ const char *md_decode_flow_name(MdDecodeFlow flow)
     }
 }
 
-static int md_base_interp_opcode(uint8_t opcode)
+static int MD_COMPILER_HOT_FUNC(md_base_interp_opcode)(uint8_t opcode)
 {
     if ((opcode & 0xF8u) == 0xB0u || (opcode & 0xF8u) == 0xB8u ||
         (opcode & 0xF8u) == 0x40u || (opcode & 0xF8u) == 0x48u ||
@@ -387,7 +388,7 @@ static int md_base_interp_opcode(uint8_t opcode)
     }
 }
 
-bool md_decode_interp_supported(const MdDecodedInstruction *inst)
+bool MD_COMPILER_HOT_FUNC(md_decode_interp_supported)(const MdDecodedInstruction *inst)
 {
     unsigned ext;
     unsigned mod;
@@ -410,7 +411,7 @@ bool md_decode_interp_supported(const MdDecodedInstruction *inst)
     return true;
 }
 
-bool md_decode_aot_supported(const MdDecodedInstruction *inst)
+bool MD_COMPILER_HOT_FUNC(md_decode_aot_supported)(const MdDecodedInstruction *inst)
 {
     uint8_t opcode;
     if (inst == NULL || !inst->valid_8086 || inst->prefix_count != 0u) return false;

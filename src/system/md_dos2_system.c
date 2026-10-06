@@ -1,4 +1,5 @@
 #include "md_dos2_system.h"
+#include "microdos/hot_code.h"
 
 #ifdef MICRODOS_ENABLE_JIT
 #include "microdos/jit.h"
@@ -186,7 +187,7 @@ static const MdAotProgram *md_aot_here(MdDos2System *sys)
 
 #if MICRODOS_SYSTEM_ENABLE_TRANSLATOR && defined(MICRODOS_ENABLE_NATIVE_V2)
 /* M25 F: Native v2 gets each loop head first; M25 runs what it rejects. */
-static int md_dos2_nv2_loop_hook(void *user, MdRuntime *rt, uint64_t budget)
+static int MD_EXEC_HOT_FUNC(md_dos2_nv2_loop_hook)(void *user, MdRuntime *rt, uint64_t budget)
 {
     MdDos2System *sys = (MdDos2System *)user;
     MdNativeV2RunResult result;
@@ -210,7 +211,7 @@ static int md_dos2_nv2_loop_hook(void *user, MdRuntime *rt, uint64_t budget)
 }
 #endif
 
-MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
+MdStopReason MD_EXEC_HOT_FUNC(md_dos2_system_run)(MdDos2System *sys, uint64_t budget)
 {
     MdRuntime *rt = &sys->runtime;
 

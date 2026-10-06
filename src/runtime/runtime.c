@@ -1,5 +1,7 @@
 #include "microdos/runtime.h"
 #include "microdos/ops.h"
+#include "microdos/hot_code.h"
+#include "microdos/qmi_profile.h"
 
 #include <string.h>
 
@@ -318,7 +320,7 @@ void md_x86_store16_tracked(MdX86 *cpu, uint32_t a0, uint16_t value)
     md_x86_write16_tracked_inline(cpu, a0, value);
 }
 
-void md_x86_write_block(MdX86 *cpu, uint16_t segment, uint16_t offset,
+void MD_DOS_HOT_FUNC(md_x86_write_block)(MdX86 *cpu, uint16_t segment, uint16_t offset,
                         const uint8_t *data, uint32_t len)
 {
     const uint32_t lin = md_x86_linear(segment, offset);
@@ -428,13 +430,15 @@ void md_runtime_request_exit(MdRuntime *runtime, uint8_t exit_code)
     runtime->stop_reason = MD_STOP_EXIT;
 }
 
-bool md_runtime_interrupt(MdRuntime *runtime, uint8_t vector)
+bool MD_DOS_HOT_FUNC(md_runtime_interrupt)(MdRuntime *runtime, uint8_t vector)
 {
     MdX86 *cpu = &runtime->cpu;
     const uint32_t ivt = (uint32_t)vector * 4u;
 
+    md_qmi_profile_enter(runtime, MD_QMI_DOS_SERVICE);
     if (runtime->hooks.interrupt != NULL &&
         runtime->hooks.interrupt(runtime, vector, runtime->hooks.user)) {
+        md_qmi_profile_leave(runtime);
         return true;
     }
 
@@ -445,6 +449,7 @@ bool md_runtime_interrupt(MdRuntime *runtime, uint8_t vector)
     cpu->flags_raw &= (uint16_t)~(MD_X86_FLAG_IF | MD_X86_FLAG_TF);   /* never lazy */
     cpu->ip = md_x86_read16_linear(cpu, ivt);
     cpu->cs = md_x86_read16_linear(cpu, ivt + 2u);
+    md_qmi_profile_leave(runtime);
     return false;
 }
 

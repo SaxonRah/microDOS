@@ -73,6 +73,18 @@ typedef bool (*MdInterruptHook)(MdRuntime *runtime, uint8_t vector, void *user);
 typedef uint8_t (*MdPortIn8Hook)(MdRuntime *runtime, uint16_t port, void *user);
 typedef void (*MdPortOut8Hook)(MdRuntime *runtime, uint16_t port, uint8_t value, void *user);
 
+typedef enum MdQmiCategory {
+    MD_QMI_INTERP = 0,
+    MD_QMI_M25_NATIVE,
+    MD_QMI_TRANSLATE,
+    MD_QMI_NATIVE_V2,
+    MD_QMI_STEP,
+    MD_QMI_DOS_SERVICE,
+    MD_QMI_CATEGORY_COUNT
+} MdQmiCategory;
+
+#define MD_QMI_PROFILE_STACK_DEPTH 8u
+
 typedef struct MdHooks {
     MdInterruptHook interrupt;
     MdPortIn8Hook in8;
@@ -94,6 +106,19 @@ struct MdRuntime {
     uint64_t rep_memory_bytes;
     uint64_t rep_op_instructions[10];   /* A4-A7, AA-AF */
     uint64_t rep_op_elements[10];
+
+    /* M26c exclusive QMI/XIP attribution. qmi_current is category+1; zero
+       means no active scope. Nested scopes charge the parent up to the
+       transition, then resume it on leave. */
+    uint64_t qmi_accesses[MD_QMI_CATEGORY_COUNT];
+    uint64_t qmi_misses[MD_QMI_CATEGORY_COUNT];
+    uint32_t qmi_last_access;
+    uint32_t qmi_last_hit;
+    uint32_t qmi_stack_overflows;
+    uint8_t qmi_current;
+    uint8_t qmi_depth;
+    uint8_t qmi_stack[MD_QMI_PROFILE_STACK_DEPTH];
+
     /* Subset of `instructions` retired by generated AOT code. */
     uint64_t aot_instructions;
     MdStopReason stop_reason;

@@ -120,8 +120,13 @@ static uint32_t g_disk_writes;
 #ifndef MICRODOS_PICO_HOT_CODE
 #define MICRODOS_PICO_HOT_CODE 0
 #endif
+#ifndef MICRODOS_PICO_EXEC_HOT_CODE
+#define MICRODOS_PICO_EXEC_HOT_CODE 0
+#endif
 #if MICRODOS_PICO_CODE_IN_SRAM
 #define MD_PICO_CODE_PLACEMENT "all SRAM (copy_to_ram)"
+#elif MICRODOS_PICO_EXEC_HOT_CODE
+#define MD_PICO_CODE_PLACEMENT "execution SRAM + cold flash XIP"
 #elif MICRODOS_PICO_HOT_CODE
 #define MD_PICO_CODE_PLACEMENT "hot SRAM + cold flash XIP"
 #else
@@ -147,6 +152,9 @@ typedef struct PicoPerf {
     uint64_t rep_op_elements[10];
     uint64_t xip_accesses;
     uint64_t xip_hits;
+    uint64_t qmi_accesses[MD_QMI_CATEGORY_COUNT];
+    uint64_t qmi_misses[MD_QMI_CATEGORY_COUNT];
+    uint32_t qmi_stack_overflows;
     uint64_t aot_instructions;
     uint64_t jit_owned_instructions;
     uint64_t jit_native_instructions;
@@ -349,6 +357,11 @@ static void md_perf_snapshot(PicoPerf *p)
     }
     p->xip_accesses = xip_ctrl_hw->ctr_acc;
     p->xip_hits = xip_ctrl_hw->ctr_hit;
+    for (rep_i = 0u; rep_i < MD_QMI_CATEGORY_COUNT; ++rep_i) {
+        p->qmi_accesses[rep_i] = g_sys.runtime.qmi_accesses[rep_i];
+        p->qmi_misses[rep_i] = g_sys.runtime.qmi_misses[rep_i];
+    }
+    p->qmi_stack_overflows = g_sys.runtime.qmi_stack_overflows;
     p->aot_instructions = g_sys.runtime.aot_instructions;
     p->jit_owned_instructions = g_sys.jit_instructions;
     p->jit_native_instructions = g_sys.jit_native_instructions;
@@ -431,6 +444,8 @@ static void md_perf_report(const char *label, const PicoPerf *now, const PicoPer
     const uint64_t xip_acc = md_u64_delta(now->xip_accesses, from->xip_accesses);
     const uint64_t xip_hit = md_u64_delta(now->xip_hits, from->xip_hits);
     const uint64_t xip_miss = xip_acc > xip_hit ? xip_acc - xip_hit : 0u;
+    uint64_t qmi_acc_sum = 0u, qmi_miss_sum = 0u;
+    unsigned qmi_i;
 
     md_say("[perf] --- %s ---\n", label);
     md_say("[perf] wall %9.3f s   in-guest-loop %9.3f s\n", (double)wall / 1e6, (double)run / 1e6);
@@ -442,6 +457,27 @@ static void md_perf_report(const char *label, const PicoPerf *now, const PicoPer
            (unsigned long long)xip_acc, (unsigned long long)xip_hit,
            (unsigned long long)xip_miss, xip_acc ? 100.0 * (double)xip_hit / (double)xip_acc : 0.0,
            instr ? (double)xip_miss / (double)instr : 0.0);
+    {
+        static const char *const qn[MD_QMI_CATEGORY_COUNT] = {
+            "interp", "m25-native", "translate", "native-v2", "step", "dos-int"
+        };
+        for (qmi_i = 0u; qmi_i < MD_QMI_CATEGORY_COUNT; ++qmi_i) {
+            const uint64_t qa = md_u64_delta(now->qmi_accesses[qmi_i], from->qmi_accesses[qmi_i]);
+            const uint64_t qm = md_u64_delta(now->qmi_misses[qmi_i], from->qmi_misses[qmi_i]);
+            qmi_acc_sum += qa; qmi_miss_sum += qm;
+            md_say("[qmi] %-10s accesses %llu misses %llu access/guest %.4f miss/guest %.4f\n",
+                   qn[qmi_i], (unsigned long long)qa, (unsigned long long)qm,
+                   instr ? (double)qa / (double)instr : 0.0,
+                   instr ? (double)qm / (double)instr : 0.0);
+        }
+        md_say("[qmi] attributed accesses %llu (%.1f%%) misses %llu (%.1f%%) stack-overflow %lu\n",
+               (unsigned long long)qmi_acc_sum, xip_acc ? 100.0*(double)qmi_acc_sum/(double)xip_acc : 0.0,
+               (unsigned long long)qmi_miss_sum, xip_miss ? 100.0*(double)qmi_miss_sum/(double)xip_miss : 0.0,
+               (unsigned long)(now->qmi_stack_overflows - from->qmi_stack_overflows));
+        md_say("[qmi] unattributed accesses %llu misses %llu\n",
+               (unsigned long long)(xip_acc > qmi_acc_sum ? xip_acc - qmi_acc_sum : 0u),
+               (unsigned long long)(xip_miss > qmi_miss_sum ? xip_miss - qmi_miss_sum : 0u));
+    }
     md_say("[rep] instructions %llu  elements %llu  payload %llu B  traffic %llu B\n",
            (unsigned long long)rep_instr, (unsigned long long)rep_elem,
            (unsigned long long)rep_payload, (unsigned long long)rep_memory);
