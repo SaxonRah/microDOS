@@ -192,6 +192,20 @@ static int md_dos2_nv2_loop_hook(void *user, MdRuntime *rt, uint64_t budget)
     MdNativeV2RunResult result;
     if (!md_native_v2_runtime_try_execute(&sys->native_v2, rt, budget, &result)) return 0;
     sys->native_v2_instructions += result.retired;
+    if (result.rep_string_loop && result.rep_words != 0u) {
+        const uint64_t outer = result.iterations;
+        const uint64_t each = outer * (uint64_t)result.rep_words;
+        const unsigned opidx[4] = { 5u, 1u, 3u, 9u }; /* STOSW MOVSW CMPSW SCASW */
+        unsigned i;
+        rt->rep_instructions += outer * 4u;
+        rt->rep_elements += each * 4u;
+        rt->rep_payload_bytes += each * 8u;            /* four 16-bit streams */
+        rt->rep_memory_bytes += each * 12u;            /* 2 + 4 + 4 + 2 B */
+        for (i = 0u; i < 4u; ++i) {
+            rt->rep_op_instructions[opidx[i]] += outer;
+            rt->rep_op_elements[opidx[i]] += each;
+        }
+    }
     return 1;
 }
 #endif

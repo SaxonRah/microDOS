@@ -1,4 +1,5 @@
 #include "microdos/runtime.h"
+#include "microdos/hot_code.h"
 #include "runtime_internal.h"
 
 #include <stddef.h>
@@ -506,6 +507,7 @@ static inline void md_op_string(MdRuntime *runtime, uint8_t opcode,
 {
     MdX86 *cpu = &runtime->cpu;
     const uint8_t repeat = prefix != NULL ? prefix->repeat : 0u;
+    const unsigned width = (opcode & 1u) != 0u ? 2u : 1u;
     const int compares = opcode == 0xA6u || opcode == 0xA7u ||
                          opcode == 0xAEu || opcode == 0xAFu;
 
@@ -514,13 +516,33 @@ static inline void md_op_string(MdRuntime *runtime, uint8_t opcode,
         return;
     }
 
-    while (cpu->r[MD_X86_CX] != 0u) {
-        md_op_string_once(runtime, opcode, prefix);
-        cpu->r[MD_X86_CX] = (uint16_t)(cpu->r[MD_X86_CX] - 1u);
+    {
+        const uint16_t start_cx = cpu->r[MD_X86_CX];
+        uint64_t elements;
+        unsigned idx;
+        unsigned streams;
 
-        if (compares) {
-            const int zf = md_x86_zf(cpu);
-            if ((repeat == 0xF3u && !zf) || (repeat == 0xF2u && zf)) break;
+        while (cpu->r[MD_X86_CX] != 0u) {
+            md_op_string_once(runtime, opcode, prefix);
+            cpu->r[MD_X86_CX] = (uint16_t)(cpu->r[MD_X86_CX] - 1u);
+
+            if (compares) {
+                const int zf = md_x86_zf(cpu);
+                if ((repeat == 0xF3u && !zf) || (repeat == 0xF2u && zf)) break;
+            }
+        }
+
+        elements = (uint64_t)(uint16_t)(start_cx - cpu->r[MD_X86_CX]);
+        idx = opcode <= 0xA7u ? (unsigned)(opcode - 0xA4u)
+                              : 4u + (unsigned)(opcode - 0xAAu);
+        streams = (opcode >= 0xA4u && opcode <= 0xA7u) ? 2u : 1u;
+        ++runtime->rep_instructions;
+        runtime->rep_elements += elements;
+        runtime->rep_payload_bytes += elements * width;
+        runtime->rep_memory_bytes += elements * width * streams;
+        if (idx < 10u) {
+            ++runtime->rep_op_instructions[idx];
+            runtime->rep_op_elements[idx] += elements;
         }
     }
 }
@@ -2334,7 +2356,7 @@ static MdStopReason md_interp_run_switch(MdRuntime *runtime, uint32_t instructio
 }
 #endif
 
-MdStopReason md_interp_step(MdRuntime *runtime)
+MdStopReason MD_HOT_FUNC(md_interp_step)(MdRuntime *runtime)
 {
     uint16_t ip_before;
     uint8_t opcode;
@@ -2369,25 +2391,25 @@ static MdStopReason md_interp_run_chunked(MdRuntime *runtime, uint64_t instructi
     }
 }
 
-MdStopReason md_interp_run(MdRuntime *runtime, uint64_t instruction_budget)
+MdStopReason MD_HOT_FUNC(md_interp_run)(MdRuntime *runtime, uint64_t instruction_budget)
 {
     return md_interp_run_chunked(runtime, instruction_budget, 0);
 }
 
-MdStopReason md_interp_run_until_cs_change(MdRuntime *runtime, uint64_t instruction_budget)
+MdStopReason MD_HOT_FUNC(md_interp_run_until_cs_change)(MdRuntime *runtime, uint64_t instruction_budget)
 {
     return md_interp_run_chunked(runtime, instruction_budget, 1);
 }
 
 /* ---- M18 exports for dosrecomp-generated code -------------------------- */
 
-void md_interp_muldiv(MdRuntime *runtime, uint8_t opcode, unsigned ext, uint16_t operand,
+void MD_HOT_FUNC(md_interp_muldiv)(MdRuntime *runtime, uint8_t opcode, unsigned ext, uint16_t operand,
                       uint16_t ip_before)
 {
     md_muldiv_core(runtime, opcode, ext, operand, ip_before, 0u);
 }
 
-void md_interp_string_op(MdRuntime *runtime, uint8_t opcode, uint8_t segment_prefix,
+void MD_HOT_FUNC(md_interp_string_op)(MdRuntime *runtime, uint8_t opcode, uint8_t segment_prefix,
                          uint8_t repeat_prefix)
 {
     MdPrefixState prefix;

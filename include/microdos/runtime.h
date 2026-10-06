@@ -84,6 +84,16 @@ struct MdRuntime {
     MdX86 cpu;
     MdHooks hooks;
     uint64_t instructions;
+    /* REP telemetry counts architectural REP instructions separately from
+       their internal string-element work. payload_bytes counts one logical
+       string element width; memory_bytes estimates guest-memory traffic
+       (MOVS/CMPS touch two streams, the other string forms one). */
+    uint64_t rep_instructions;
+    uint64_t rep_elements;
+    uint64_t rep_payload_bytes;
+    uint64_t rep_memory_bytes;
+    uint64_t rep_op_instructions[10];   /* A4-A7, AA-AF */
+    uint64_t rep_op_elements[10];
     /* Subset of `instructions` retired by generated AOT code. */
     uint64_t aot_instructions;
     MdStopReason stop_reason;

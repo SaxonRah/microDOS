@@ -39,6 +39,7 @@
 
 #include "hardware/clocks.h"
 #include "hardware/psram.h"
+#include "hardware/structs/xip_ctrl.h"
 #include "pico/stdio_usb.h"
 #include "pico/stdlib.h"
 
@@ -116,6 +117,16 @@ static uint32_t g_disk_writes;
 #ifndef MICRODOS_PICO_CODE_IN_SRAM
 #define MICRODOS_PICO_CODE_IN_SRAM 0
 #endif
+#ifndef MICRODOS_PICO_HOT_CODE
+#define MICRODOS_PICO_HOT_CODE 0
+#endif
+#if MICRODOS_PICO_CODE_IN_SRAM
+#define MD_PICO_CODE_PLACEMENT "all SRAM (copy_to_ram)"
+#elif MICRODOS_PICO_HOT_CODE
+#define MD_PICO_CODE_PLACEMENT "hot SRAM + cold flash XIP"
+#else
+#define MD_PICO_CODE_PLACEMENT "all flash XIP"
+#endif
 #ifndef MICRODOS_PICO_KERNEL_AOT
 #define MICRODOS_PICO_KERNEL_AOT 0
 #endif
@@ -128,6 +139,14 @@ typedef struct PicoPerf {
     uint64_t input_wait_us;
     uint64_t disk_us;
     uint64_t instructions;
+    uint64_t rep_instructions;
+    uint64_t rep_elements;
+    uint64_t rep_payload_bytes;
+    uint64_t rep_memory_bytes;
+    uint64_t rep_op_instructions[10];
+    uint64_t rep_op_elements[10];
+    uint64_t xip_accesses;
+    uint64_t xip_hits;
     uint64_t aot_instructions;
     uint64_t jit_owned_instructions;
     uint64_t jit_native_instructions;
@@ -318,7 +337,18 @@ static bool md_psram_ok(void)
 
 static void md_perf_snapshot(PicoPerf *p)
 {
+    unsigned rep_i;
     p->instructions = g_sys.runtime.instructions;
+    p->rep_instructions = g_sys.runtime.rep_instructions;
+    p->rep_elements = g_sys.runtime.rep_elements;
+    p->rep_payload_bytes = g_sys.runtime.rep_payload_bytes;
+    p->rep_memory_bytes = g_sys.runtime.rep_memory_bytes;
+    for (rep_i = 0u; rep_i < 10u; ++rep_i) {
+        p->rep_op_instructions[rep_i] = g_sys.runtime.rep_op_instructions[rep_i];
+        p->rep_op_elements[rep_i] = g_sys.runtime.rep_op_elements[rep_i];
+    }
+    p->xip_accesses = xip_ctrl_hw->ctr_acc;
+    p->xip_hits = xip_ctrl_hw->ctr_hit;
     p->aot_instructions = g_sys.runtime.aot_instructions;
     p->jit_owned_instructions = g_sys.jit_instructions;
     p->jit_native_instructions = g_sys.jit_native_instructions;
@@ -394,6 +424,13 @@ static void md_perf_report(const char *label, const PicoPerf *now, const PicoPer
     const uint64_t native_total = aot + jnative + nv2;
     const uint64_t interp = instr > native_total ? instr - native_total : 0u;
     const uint64_t interp_other = interp > bios ? interp - bios : 0u;
+    const uint64_t rep_instr = md_u64_delta(now->rep_instructions, from->rep_instructions);
+    const uint64_t rep_elem = md_u64_delta(now->rep_elements, from->rep_elements);
+    const uint64_t rep_payload = md_u64_delta(now->rep_payload_bytes, from->rep_payload_bytes);
+    const uint64_t rep_memory = md_u64_delta(now->rep_memory_bytes, from->rep_memory_bytes);
+    const uint64_t xip_acc = md_u64_delta(now->xip_accesses, from->xip_accesses);
+    const uint64_t xip_hit = md_u64_delta(now->xip_hits, from->xip_hits);
+    const uint64_t xip_miss = xip_acc > xip_hit ? xip_acc - xip_hit : 0u;
 
     md_say("[perf] --- %s ---\n", label);
     md_say("[perf] wall %9.3f s   in-guest-loop %9.3f s\n", (double)wall / 1e6, (double)run / 1e6);
@@ -401,6 +438,33 @@ static void md_perf_report(const char *label, const PicoPerf *now, const PicoPer
            (double)active / 1e6, (double)sleep / 1e6, (double)out / 1e6, (double)in / 1e6, (double)disk / 1e6);
     md_say("[perf] instructions %llu   active %.3f MIPS\n",
            (unsigned long long)instr, active ? (double)instr/(double)active : 0.0);
+    md_say("[xip] accesses %llu  hits %llu  misses %llu  hit-rate %.2f%%  misses/guest %.4f\n",
+           (unsigned long long)xip_acc, (unsigned long long)xip_hit,
+           (unsigned long long)xip_miss, xip_acc ? 100.0 * (double)xip_hit / (double)xip_acc : 0.0,
+           instr ? (double)xip_miss / (double)instr : 0.0);
+    md_say("[rep] instructions %llu  elements %llu  payload %llu B  traffic %llu B\n",
+           (unsigned long long)rep_instr, (unsigned long long)rep_elem,
+           (unsigned long long)rep_payload, (unsigned long long)rep_memory);
+    if (active != 0u && rep_elem != 0u) {
+        md_say("[rep] rate elements %.3f M/s  payload %.3f MiB/s  traffic %.3f MiB/s  1.44MB-eq %.3f/s\n",
+               (double)rep_elem / (double)active,
+               (double)rep_payload * 1.0e6 / (double)active / 1048576.0,
+               (double)rep_memory * 1.0e6 / (double)active / 1048576.0,
+               (double)rep_payload * 1.0e6 / (double)active / 1474560.0);
+    }
+    {
+        static const char *const rn[10] = {
+            "MOVSB","MOVSW","CMPSB","CMPSW","STOSB",
+            "STOSW","LODSB","LODSW","SCASB","SCASW"
+        };
+        unsigned ri;
+        md_say("[rep] elements by op:");
+        for (ri = 0u; ri < 10u; ++ri) {
+            const uint64_t d = md_u64_delta(now->rep_op_elements[ri], from->rep_op_elements[ri]);
+            if (d != 0u) md_say(" %s=%llu", rn[ri], (unsigned long long)d);
+        }
+        md_say("\n");
+    }
     md_say("[perf] tiers: static-aot %llu (%.1f%%)   old-jit %llu (%.1f%%)   native-v2 %llu (%.1f%%)   interpreted %llu (%.1f%%)\n",
            (unsigned long long)aot, instr ? 100.0*(double)aot/(double)instr : 0.0,
            (unsigned long long)jnative, instr ? 100.0*(double)jnative/(double)instr : 0.0,
@@ -526,7 +590,7 @@ static void md_stats(uint64_t start_us)
     md_perf_snapshot(&now);
     md_say("\n[perf] config: M23, clk %lu MHz, code %s, block cache %s, kernel AOT %s, old JIT %s, Native v2 %s, guest %s\n",
            (unsigned long)(clock_get_hz(clk_sys)/1000000u),
-           MICRODOS_PICO_CODE_IN_SRAM?"SRAM (copy_to_ram)":"flash XIP",
+           MD_PICO_CODE_PLACEMENT,
            MICRODOS_PICO_CACHE?"ON":"OFF", g_sys.kernel_attached?"ON":"OFF",
            MICRODOS_PICO_JIT?"ON":"OFF", MICRODOS_PICO_NATIVE_V2?"ON":"OFF",
            MICRODOS_PICO_GUEST_SRAM?"SRAM":"PSRAM");
@@ -746,7 +810,7 @@ int main(void)
     md_say("  aot:     DOS2TEST.COM: not compiled in this firmware\n");
 #endif
     md_say("  config:  code %s, block cache %s, old JIT %s, Native v2 %s\n",
-           MICRODOS_PICO_CODE_IN_SRAM?"SRAM (copy_to_ram)":"flash XIP",
+           MD_PICO_CODE_PLACEMENT,
            MICRODOS_PICO_CACHE?"ON":"OFF", MICRODOS_PICO_JIT?"ON":"OFF",
            MICRODOS_PICO_NATIVE_V2?"ON":"OFF");
     md_say("  keys:    Ctrl+] -> tier/native statistics (boot + interval)\n");

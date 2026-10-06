@@ -26,6 +26,7 @@
  */
 
 #include "microdos/translate.h"
+#include "microdos/hot_code.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -158,7 +159,7 @@ typedef struct MdTrCtx {
 
 /* ---- C helpers called from generated code ---------------------------------- */
 
-static uint32_t md_tr_h_load16(MdRuntime *rt, uint32_t seg, uint32_t off)
+static uint32_t MD_HOT_FUNC(md_tr_h_load16)(MdRuntime *rt, uint32_t seg, uint32_t off)
 {
     return md_x86_read16(&rt->cpu, (uint16_t)seg, (uint16_t)off);
 }
@@ -169,21 +170,21 @@ static uint32_t md_tr_h_load16(MdRuntime *rt, uint32_t seg, uint32_t off)
 #define MD_TR_WRITE_EPOCH(rt) 0u
 #endif
 
-static uint32_t md_tr_h_store8(MdRuntime *rt, uint32_t seg, uint32_t off, uint32_t v)
+static uint32_t MD_HOT_FUNC(md_tr_h_store8)(MdRuntime *rt, uint32_t seg, uint32_t off, uint32_t v)
 {
     const uint32_t e = MD_TR_WRITE_EPOCH(rt);
     md_x86_write8(&rt->cpu, (uint16_t)seg, (uint16_t)off, (uint8_t)v);
     return MD_TR_WRITE_EPOCH(rt) != e;
 }
 
-static uint32_t md_tr_h_store16(MdRuntime *rt, uint32_t seg, uint32_t off, uint32_t v)
+static uint32_t MD_HOT_FUNC(md_tr_h_store16)(MdRuntime *rt, uint32_t seg, uint32_t off, uint32_t v)
 {
     const uint32_t e = MD_TR_WRITE_EPOCH(rt);
     md_x86_write16(&rt->cpu, (uint16_t)seg, (uint16_t)off, (uint16_t)v);
     return MD_TR_WRITE_EPOCH(rt) != e;
 }
 
-static uint32_t md_tr_h_cond(MdRuntime *rt, uint32_t cc)
+static uint32_t MD_HOT_FUNC(md_tr_h_cond)(MdRuntime *rt, uint32_t cc)
 {
     return md_x86_condition(&rt->cpu, cc) ? 1u : 0u;
 }
@@ -193,7 +194,7 @@ static uint32_t md_tr_h_cond(MdRuntime *rt, uint32_t cc)
    the interpreter's own count is undone. Returns nonzero if translated
    execution must stop here: a stop, CS:IP not at the next instruction (e.g.
    INT 0 from DIV), or a write that may have modified translated code. */
-static uint32_t md_tr_h_step(MdRuntime *rt, uint32_t next_ip)
+static uint32_t MD_HOT_FUNC(md_tr_h_step)(MdRuntime *rt, uint32_t next_ip)
 {
     const uint32_t c0 = MD_TR_CYC();
     const uint16_t cs = rt->cpu.cs;
@@ -223,21 +224,21 @@ static uint32_t md_tr_h_step(MdRuntime *rt, uint32_t next_ip)
 }
 
 /* C: fast helpers with exact ops.h semantics (lazy flags in memory). */
-static uint32_t md_tr_h_alu(MdRuntime *rt, uint32_t opw, uint32_t a, uint32_t b)
+static uint32_t MD_HOT_FUNC(md_tr_h_alu)(MdRuntime *rt, uint32_t opw, uint32_t a, uint32_t b)
 {
     if (g_md_tr_stats != NULL) ++g_md_tr_stats->stats.helper_calls;
     return (opw >> 8) == 16u ? md_x86_alu16(&rt->cpu, opw & 7u, (uint16_t)a, (uint16_t)b)
                              : md_x86_alu8(&rt->cpu, opw & 7u, (uint8_t)a, (uint8_t)b);
 }
 
-static uint32_t md_tr_h_shift(MdRuntime *rt, uint32_t opw, uint32_t v, uint32_t count)
+static uint32_t MD_HOT_FUNC(md_tr_h_shift)(MdRuntime *rt, uint32_t opw, uint32_t v, uint32_t count)
 {
     if (g_md_tr_stats != NULL) ++g_md_tr_stats->stats.helper_calls;
     return (opw >> 8) == 16u ? md_x86_shift16(&rt->cpu, opw & 7u, (uint16_t)v, count & 0xFFu)
                              : md_x86_shift8(&rt->cpu, opw & 7u, (uint8_t)v, count & 0xFFu);
 }
 
-static void md_tr_h_capture_cf(MdRuntime *rt)
+static void MD_HOT_FUNC(md_tr_h_capture_cf)(MdRuntime *rt)
 {
     rt->cpu.lazy_carry = (uint8_t)md_x86_cf(&rt->cpu);
 }
@@ -1790,7 +1791,7 @@ static MdTrBlock *md_tr_lookup(MdTranslator *tr, uint16_t cs, uint16_t ip)
 
 /* ---- run loop ------------------------------------------------------------------ */
 
-MdStopReason md_tr_run(MdTranslator *tr, uint64_t budget)
+MdStopReason MD_HOT_FUNC(md_tr_run)(MdTranslator *tr, uint64_t budget)
 {
     MdRuntime *rt = tr->rt;
 #if !MD_TR_HOST_THUMB2 || !MICRODOS_TRANSLATION_SUPPORT

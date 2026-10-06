@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import json
 import pathlib
 import re
 import sys
@@ -206,6 +207,19 @@ def parse_snapshot(phase: int, text: str, app_text: str) -> dict:
         "code_size": integer(r"code=\d+/(\d+) B", jit),
         "checksum": "",
         "app_cs": "",
+        "rep_instructions": integer(r"\[rep\] instructions\s+(\d+)", perf),
+        "rep_elements": integer(r"\[rep\] instructions\s+\d+\s+elements\s+(\d+)", perf),
+        "rep_payload_bytes": integer(r"payload\s+(\d+) B", perf),
+        "rep_memory_bytes": integer(r"traffic\s+(\d+) B", perf),
+        "rep_elements_mps": floating(r"rate elements\s+([0-9.]+) M/s", perf),
+        "rep_payload_mib_s": floating(r"payload\s+([0-9.]+) MiB/s", perf),
+        "rep_traffic_mib_s": floating(r"traffic\s+([0-9.]+) MiB/s", perf),
+        "rep_floppy144_s": floating(r"1\.44MB-eq\s+([0-9.]+)/s", perf),
+        "xip_accesses": integer(r"\[xip\] accesses\s+(\d+)", perf),
+        "xip_hits": integer(r"\[xip\] accesses\s+\d+\s+hits\s+(\d+)", perf),
+        "xip_misses": integer(r"misses\s+(\d+)", perf),
+        "xip_hit_pct": floating(r"hit-rate\s+([0-9.]+)%", perf),
+        "xip_miss_per_guest": floating(r"misses/guest\s+([0-9.]+)", perf),
     }
     m = re.search(r"checksum = 0x([0-9A-Fa-f]{4})", app_text)
     if m:
@@ -229,12 +243,12 @@ def parse_phases(value: str) -> list[int]:
 
 def print_summary(rows: list[dict]) -> None:
     print("\n\nMDSTRESS v2 phase summary")
-    print("phase  name                 active(s)      instr     MIPS   JIT-native   fallback    zero")
-    print("-----  -------------------  ---------  ---------  -------  ----------  ---------  ---------")
+    print("phase  name                 active(s)      instr     MIPS   REP elem M/s  REP traffic MiB/s")
+    print("-----  -------------------  ---------  ---------  -------  ------------  -----------------")
     for r in rows:
         print(f"{r['phase']:>5}  {r['name']:<19}  {r['active_s']:>9.3f}  "
-              f"{r['instructions']:>9}  {r['mips']:>7.3f}  {r['jit_native']:>10}  "
-              f"{r['fallback']:>9}  {r['zero']:>9}")
+              f"{r['instructions']:>9}  {r['mips']:>7.3f}  {r['rep_elements_mps']:>12.3f}  "
+              f"{r['rep_traffic_mib_s']:>17.3f}")
 
 def main() -> int:
     ap = argparse.ArgumentParser()

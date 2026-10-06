@@ -1,4 +1,5 @@
 #include "microdos/native_v2.h"
+#include "microdos/hot_code.h"
 #include "microdos/decode.h"
 
 #include <stddef.h>
@@ -4311,7 +4312,7 @@ static uint32_t md_nv2_call_thumb(MdX86 *cpu, uintptr_t entry)
 
 #endif
 
-uint32_t md_native_v2_execute(MdX86 *cpu, const MdNativeV2Code *code)
+uint32_t MD_HOT_FUNC(md_native_v2_execute)(MdX86 *cpu, const MdNativeV2Code *code)
 {
 #if defined(__arm__) || defined(__thumb__)
     uintptr_t entry;

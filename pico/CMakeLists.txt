@@ -325,6 +325,35 @@ target_compile_definitions(microdos_pico_m25_nv2 PRIVATE
     "MICRODOS_PICO_M25_ARENA=(160u*1024u)")
 pico_set_program_name(microdos_pico_m25_nv2 "microDOS M25+NV2")
 
+# M26 memory-placement A/B. All variants keep guest RAM in PSRAM and use the
+# same M25+Native-v2 engine. Only firmware placement / arena size changes.
+function(md_m26_m25_nv2 target code_in_sram hot_code arena_kib)
+    md_pico_dos(${target} ${code_in_sram} 0 300000 0 0 0 0 0 0)
+    target_sources(${target} PRIVATE
+        "${MD_ROOT}/src/runtime/translate.c"
+        "${MD_ROOT}/src/runtime/x86_block_cache.c"
+        "${MD_ROOT}/src/runtime/native_v2.c"
+        "${MD_ROOT}/src/runtime/native_v2_runtime.c"
+        "${MD_ROOT}/src/decode/x86_decode.c")
+    target_compile_definitions(${target} PRIVATE
+        MICRODOS_PICO_M25=1
+        MICRODOS_SYSTEM_ENABLE_TRANSLATOR=1
+        MICRODOS_ENABLE_BACKEDGE_EXIT=1
+        MICRODOS_ENABLE_NATIVE_V2=1
+        MICRODOS_PICO_NATIVE_V2=1
+        MICRODOS_PICO_HOT_CODE=${hot_code}
+        MD_TR_SLOTS=1024u
+        "MICRODOS_PICO_M25_ARENA=(${arena_kib}u*1024u)")
+endfunction()
+
+# Existing microdos_pico_m25_nv2 is the all-SRAM / 160 KiB control.
+md_m26_m25_nv2(microdos_pico_m25_nv2_xip    0 0 160)
+pico_set_program_name(microdos_pico_m25_nv2_xip "microDOS M26 XIP")
+md_m26_m25_nv2(microdos_pico_m25_nv2_hot    0 1 160)
+pico_set_program_name(microdos_pico_m25_nv2_hot "microDOS M26 hot-SRAM")
+md_m26_m25_nv2(microdos_pico_m25_nv2_hot256 0 1 256)
+pico_set_program_name(microdos_pico_m25_nv2_hot256 "microDOS M26 hot-SRAM 256K")
+
 # M25 translator on-device check: differential test (interpreter vs
 # translated Thumb-2, guest RAM in PSRAM) plus interpreter-vs-translator
 # loop benchmarks. Run with scripts/md_translate_diff_pico.ps1.

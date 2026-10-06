@@ -1,4 +1,5 @@
 #include "microdos/native_v2_runtime.h"
+#include "microdos/hot_code.h"
 
 #include <string.h>
 
@@ -231,7 +232,7 @@ void md_native_v2_runtime_init(MdNativeV2Runtime *runtime)
         memset(runtime, 0, sizeof(*runtime));
 }
 
-bool md_native_v2_runtime_try_execute(MdNativeV2Runtime *runtime,
+bool MD_HOT_FUNC(md_native_v2_runtime_try_execute)(MdNativeV2Runtime *runtime,
                                       MdRuntime *machine,
                                       uint64_t budget,
                                       MdNativeV2RunResult *result)
@@ -785,7 +786,9 @@ execute:
             side_exited ? side_completed : run_iterations);
         result->cs = slot->cs;
         result->ip = slot->ip;
+        result->rep_words = slot->code.rep_words;
         result->entered = 1u;
+        result->rep_string_loop = slot->code.safe_rep_string_loop ? 1u : 0u;
     }
 
     return true;

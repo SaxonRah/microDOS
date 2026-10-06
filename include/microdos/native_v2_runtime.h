@@ -85,7 +85,9 @@ typedef struct MdNativeV2RunResult {
     uint32_t iterations;
     uint16_t cs;
     uint16_t ip;
+    uint16_t rep_words;
     uint8_t entered;
+    uint8_t rep_string_loop;
 } MdNativeV2RunResult;
 
 void md_native_v2_runtime_init(MdNativeV2Runtime *runtime);
