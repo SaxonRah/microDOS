@@ -49,6 +49,10 @@ typedef struct MdDos2System {
     MdNativeV2Runtime native_v2;
     uint64_t native_v2_instructions;
 #endif
+    /* M25: when set (and MICRODOS_SYSTEM_ENABLE_TRANSLATOR), the general
+       Thumb-2 translator runs guest code; it falls back to the canonical
+       interpreter per instruction, so BIOS/DOS hooks are unchanged. */
+    struct MdTranslator *translator;
 
     uint32_t aot_attaches;
     uint32_t aot_enters;

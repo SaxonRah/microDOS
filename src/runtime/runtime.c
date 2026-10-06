@@ -339,7 +339,10 @@ void md_x86_write_block(MdX86 *cpu, uint16_t segment, uint16_t offset,
             const unsigned f = md_x86_page_flags(cpu, a);
             if (f & MD_X86_PAGE_TRANSLATED) md_x86_note_page_write(cpu, a);
             if (f != 0u) {
-                for (; a < stop; ++a) md_x86_note_aot_write(cpu, a);
+                for (; a < stop; ++a) {
+                    if (f & MD_X86_PAGE_TRBYTES) md_x86_note_tr_write(cpu, a);
+                    md_x86_note_aot_write(cpu, a);
+                }
             }
             a = stop;
         }

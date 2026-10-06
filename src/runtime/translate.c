@@ -104,7 +104,7 @@ enum { CS_NONE = 0, CS_INCOMING };
 typedef struct MdTrOp {
     uint16_t ip, next_ip, target, imm;
     uint8_t kind, width, alu, nowrite;
-    uint8_t cls, emit_lazy, fused, carry_src, carry_width, emit_carry, cc, _pad;
+    uint8_t cls, emit_lazy, fused, carry_src, carry_width, emit_carry, cc, defer_lazy;
     MdTrOperand dst, src;
     MdTrEa ea;
 } MdTrOp;
@@ -129,6 +129,9 @@ typedef struct MdTrCtx {
     uint8_t page[2];
     unsigned page_count;
     int track;           /* store tracking present */
+    uint32_t ops_at;     /* first op after the guard (self-loop latch target) */
+    int defer;           /* self-loop latch with a deferred lazy write */
+    unsigned def_ra, def_rb, def_rres;   /* deferred producer's registers */
 } MdTrCtx;
 
 /* ---- C helpers called from generated code ---------------------------------- */
@@ -496,7 +499,11 @@ static void em_alu(MdTrCtx *c, const MdTrOp *op, unsigned k)
 
     if (op->emit_carry) em_producer_carry(c, op->cls, w == 16u ? 16u : 24u, ra, rb);
 
-    if (lazy) {
+    if (op->defer_lazy) {                 /* written on the latch's exits */
+        c->def_ra = op->cls == CL_LOGIC ? NOREG : ra;
+        c->def_rb = op->cls == CL_LOGIC ? NOREG : rb;
+        c->def_rres = rres;
+    } else if (lazy) {
         if (op->cls == CL_LOGIC) em_lazy(c, lazy_code(op->cls, w), NOREG, NOREG, rres, 0);
         else em_lazy(c, lazy_code(op->cls, w), ra, rb, rres, 0);
     }
@@ -527,7 +534,7 @@ static void em_incdec(MdTrCtx *c, const MdTrOp *op, unsigned k)
     const int lazy = op->emit_lazy, fused = op->fused;
     unsigned ra, rres;
 
-    if (lazy) em_carry_capture(c, op);
+    if (lazy && !op->defer_lazy) em_carry_capture(c, op);
 
     if (op->dst.kind == OPK_MEM) { em_load(c, &op->ea, w, T2_R0); ra = T2_R0; }
     else if (op->dst.kind == OPK_R16) {
@@ -544,7 +551,8 @@ static void em_incdec(MdTrCtx *c, const MdTrOp *op, unsigned k)
         if (w == 8u) t2_uxtb(b, rres, rres);
         if (op->dst.kind == OPK_R8) t2_bfi(b, kG[op->dst.reg & 3u], rres, r8_lsb(op->dst.reg), 8u);
     }
-    if (lazy) em_lazy(c, lazy_code(op->cls, w), ra, NOREG, rres, 1);
+    if (op->defer_lazy) c->def_rres = rres;
+    else if (lazy) em_lazy(c, lazy_code(op->cls, w), ra, NOREG, rres, 1);
     if (op->dst.kind == OPK_MEM) {
         t2_mov(b, T2_R0, rres);
         em_store(c, &op->ea, w, T2_R0, T2_R1, k, op->next_ip);
@@ -572,6 +580,59 @@ static void em_mov(MdTrCtx *c, const MdTrOp *op, unsigned k)
         const unsigned v = em_operand(c, &op->src, w, T2_R0);
         em_store(c, &op->ea, w, v, v == T2_R0 ? T2_R1 : T2_R0, k, op->next_ip);
     }
+}
+
+/* Lazy write of the deferred producer (the op before the latch Jcc). Its
+   registers are still live here: nothing but the fused compare ran since. */
+static void em_deferred_lazy(MdTrCtx *c, const MdTrOp *p)
+{
+    const unsigned code = lazy_code(p->cls, p->width);
+    if (p->kind == K_INC || p->kind == K_DEC) {
+        /* the loop never wrote lazy state, so memory still holds the state
+           from before the loop: capture CF from it, then rebuild a = res -/+ 1 */
+        if (p->carry_src == CS_INCOMING) em_carry_capture(c, p);
+        t2_dp_imm(&c->b, p->kind == K_INC ? T2_SUB : T2_ADD, 0u, T2_R0, c->def_rres, 1u);
+        em_lazy(c, code, T2_R0, NOREG, c->def_rres, 1);
+    } else {
+        em_lazy(c, code, c->def_ra, c->def_rb, c->def_rres, 0);
+    }
+}
+
+/* Indirect transfer (RET): r1 = target IP. Probe the block table from
+   generated code, exactly as md_tr_hash()/md_tr_lookup() would, and jump
+   to the target's guard (which re-checks generations and the budget).
+   On a miss, leave through the dynamic exit; C translates the target. */
+static void em_dispatch(MdTrCtx *c)
+{
+    MdT2Buf *b = &c->b;
+    MdTranslator *tr = c->tr;
+    uint32_t miss1, miss2;
+    unsigned slot_bits = 0u;
+    while ((1u << slot_bits) < MD_TR_SLOTS) ++slot_bits;
+
+    if (tr->inline_dispatch) {
+        t2_movw(b, T2_R2, c->cs);                                       /* near RET: same CS */
+        t2_dp_reg(b, T2_ADD, 0u, T2_R3, T2_R1, T2_R2, T2_LSL, 4u);       /* x = (cs<<4)+ip */
+        t2_dp_reg(b, T2_EOR, 0u, T2_R3, T2_R3, T2_R3, T2_LSR, 9u);       /* x ^ (x>>9) */
+        t2_ubfx(b, T2_R3, T2_R3, 0u, slot_bits);
+        t2_mov32(b, T2_R0, md_tr_addr(tr->blocks));
+        t2_dp_reg(b, T2_ADD, 0u, T2_R0, T2_R0, T2_R3, T2_LSL, 5u);       /* 32-byte entries */
+        t2_ldst(b, T2_LDR_I, T2_R3, T2_R0, (uint32_t)offsetof(MdTrBlock, cs));
+        t2_dp_reg(b, T2_ORR, 0u, T2_R2, T2_R2, T2_R1, T2_LSL, 16u);      /* cs | ip<<16 */
+        t2_cmp_reg(b, T2_R3, T2_R2, T2_LSL, 0u);
+        miss1 = t2_b_fwd(b);
+        t2_ldst(b, T2_LDRB_I, T2_R3, T2_R0, (uint32_t)offsetof(MdTrBlock, state));
+        t2_dp_imm(b, T2_SUB, 1u, T2_PC, T2_R3, 1u);
+        miss2 = t2_b_fwd(b);
+        t2_ldst(b, T2_LDR_I, T2_R3, T2_R0, (uint32_t)offsetof(MdTrBlock, entry));
+        t2_mov32(b, T2_R2, md_tr_addr(tr->arena) | 1u);
+        t2_dp_reg(b, T2_ADD, 0u, T2_R3, T2_R3, T2_R2, T2_LSL, 0u);
+        t2_bx(b, T2_R3);
+        t2_patch_bcc(b, miss1, T2_NE, t2_here(b));
+        t2_patch_bcc(b, miss2, T2_NE, t2_here(b));
+    }
+    t2_mov32(b, T2_R0, (uint32_t)MD_TR_EXIT_DYNAMIC << 24);
+    t2_b_to(b, tr->exit_off);
 }
 
 static void em_ea_sp(MdTrEa *ea)
@@ -623,6 +684,25 @@ static void em_op(MdTrCtx *c, unsigned i)
         case K_JCC: {
             int cond = -1;
             if (op->fused) cond = fuse_cond(c->ops[i - 1u].cls, op->cc);
+            if (c->defer && i + 1u == c->n) {
+                /* self-loop latch: the producer's lazy write happens only on
+                   the two ways out (loop exit, budget exhausted) */
+                const MdTrOp *p = &c->ops[i - 1u];
+                uint32_t j_taken, j_budget;
+                j_taken = t2_b_fwd(b);
+                em_deferred_lazy(c, p);
+                em_stub(c, T2_AL, MD_TR_EXIT_EDGE, op->next_ip, 0u);
+                t2_patch_bcc(b, j_taken, (unsigned)cond, t2_here(b));
+                t2_ldst(b, T2_LDR_I, T2_R3, T2_SP, 0u);
+                t2_dp_imm(b, T2_SUB, 1u, T2_R3, T2_R3, c->n);
+                j_budget = t2_b_fwd(b);
+                t2_ldst(b, T2_STR_I, T2_R3, T2_SP, 0u);
+                t2_b_to(b, c->ops_at);
+                t2_patch_bcc(b, j_budget, T2_LT, t2_here(b));
+                em_deferred_lazy(c, p);
+                em_stub(c, T2_AL, MD_TR_EXIT_BUDGET, c->ip0, 0u);
+                break;
+            }
             if (cond < 0) {
                 t2_mov(b, T2_R0, RCPU);
                 t2_movi(b, T2_R1, op->cc);
@@ -657,8 +737,7 @@ static void em_op(MdTrCtx *c, unsigned i)
         case K_RET: {
             em_load(c, &sp, 16u, T2_R1);
             em_add_imm(c, kG[MD_X86_SP], kG[MD_X86_SP], 2u + op->imm);
-            t2_mov32(b, T2_R0, (uint32_t)MD_TR_EXIT_DYNAMIC << 24);
-            t2_b_to(b, c->tr->exit_off);
+            em_dispatch(c);
             break;
         }
         default:
@@ -901,6 +980,9 @@ static int md_tr_writes_memory(const MdTrOp *op)
     }
 }
 
+static void md_tr_analyze_carry(MdTrCtx *c);
+static void md_tr_analyze_defer(MdTrCtx *c);
+
 /* Flag liveness: which producers must write the lazy state, Jcc fusion,
    and the carry source of INC/DEC lazy writes. */
 static void md_tr_analyze(MdTrCtx *c)
@@ -922,6 +1004,13 @@ static void md_tr_analyze(MdTrCtx *c)
     }
     if (p >= 0) c->ops[p].emit_lazy = 1u;                      /* live-out */
 
+    md_tr_analyze_carry(c);
+    md_tr_analyze_defer(c);
+}
+
+static void md_tr_analyze_carry(MdTrCtx *c)
+{
+    unsigned i;
     for (i = 0u; i < c->n; ++i) {
         MdTrOp *op = &c->ops[i];
         int j;
@@ -943,6 +1032,70 @@ static void md_tr_analyze(MdTrCtx *c)
         }
     }
 }
+
+/* Self-loop latch with a deferred lazy write: the block ends in a fused Jcc
+   back to its own start, and the producer right before it writes the lazy
+   state only on the exits. Legal when the flags are dead on loop entry: the
+   first producer comes before any possible side exit and does not read the
+   incoming CF (the producer itself may: memory still holds the pre-loop
+   state, which is exactly what its deferred capture needs). */
+static void md_tr_analyze_defer(MdTrCtx *c)
+{
+    MdTrOp *last, *p;
+    unsigned i;
+    c->defer = 0;
+    if (c->n < 2u) return;
+    last = &c->ops[c->n - 1u];
+    p = &c->ops[c->n - 2u];
+    if (last->kind != K_JCC || !last->fused || last->target != c->ip0) return;
+    if (p->cls == CL_NONE || p->dst.kind == OPK_MEM || p->emit_carry) return;
+    if ((p->kind == K_INC || p->kind == K_DEC) && p->dst.kind != OPK_R16) return;
+    for (i = 0u; i + 1u < c->n; ++i) {
+        const MdTrOp *op = &c->ops[i];
+        if (op->cls != CL_NONE) {
+            if (op != p && (op->kind == K_INC || op->kind == K_DEC) &&
+                op->emit_lazy && op->carry_src == CS_INCOMING) return;
+            break;
+        }
+        if (c->track && md_tr_writes_memory(op)) return;
+    }
+    p->defer_lazy = 1u;
+    c->defer = 1;
+    ++c->tr->stats.deferred_latches;
+}
+
+/* ---- byte-exact code tracking ------------------------------------------------ */
+
+/* Marks the guest bytes of a block as translated. Pages get a byte bitmap
+   from a small pool (MD_X86_PAGE_TRBYTES: only stores to covered bytes bump
+   the page generation). When the pool is exhausted the page falls back to
+   page-granular MD_X86_PAGE_TRANSLATED tracking, which is always correct. */
+#if MICRODOS_TRANSLATION_SUPPORT
+static void md_tr_mark_live(MdTranslator *tr, uint16_t cs, uint16_t ip, size_t len)
+{
+    MdRuntime *rt = tr->rt;
+    size_t i;
+    for (i = 0u; i < len; ++i) {
+        const uint32_t a = md_x86_linear(cs, (uint16_t)(ip + i)) & MD_X86_ADDRESS_MASK;
+        const unsigned page = (unsigned)(a >> MD_X86_CODE_PAGE_SHIFT);
+        uint8_t *bm = tr->live_table[page];
+        if (bm == NULL) {
+            if (rt->code_page_executable[page] & MD_X86_PAGE_TRANSLATED) continue;
+            if (tr->live_used >= MD_TR_LIVE_PAGES) {
+                rt->code_page_executable[page] |= MD_X86_PAGE_TRANSLATED;
+                ++tr->stats.live_fallback_pages;
+                continue;
+            }
+            bm = tr->live_pool[tr->live_used++];
+            memset(bm, 0, sizeof(tr->live_pool[0]));
+            tr->live_table[page] = bm;
+            rt->code_page_executable[page] |= MD_X86_PAGE_TRBYTES;
+            ++tr->stats.live_pages;
+        }
+        bm[(a & MD_X86_CODE_PAGE_MASK) >> 3] |= (uint8_t)(1u << (a & 7u));
+    }
+}
+#endif
 
 /* ---- arena / trampolines --------------------------------------------------- */
 
@@ -992,6 +1145,16 @@ static void md_tr_emit_trampolines(MdTranslator *tr)
 
 void md_tr_flush(MdTranslator *tr)
 {
+#if MICRODOS_TRANSLATION_SUPPORT
+    unsigned page;
+    for (page = 0u; page < MD_X86_CODE_PAGE_COUNT; ++page) {
+        if (tr->live_table[page] != NULL) {
+            tr->rt->code_page_executable[page] &= (uint8_t)~MD_X86_PAGE_TRBYTES;
+            tr->live_table[page] = NULL;
+        }
+    }
+    tr->live_used = 0u;
+#endif
     memset(tr->blocks, 0, sizeof(tr->blocks));
     if (tr->arena != NULL) md_tr_emit_trampolines(tr);
 #if MICRODOS_TRANSLATION_SUPPORT
@@ -1013,6 +1176,12 @@ int md_tr_init(MdTranslator *tr, MdRuntime *rt, uint8_t *arena, uint32_t arena_s
     tr->arena = arena;
     tr->arena_size = arena_size;
     tr->mem_aligned = (md_tr_addr(rt->cpu.memory) & (MD_X86_ADDRESS_SPACE - 1u)) == 0u;
+    /* inline RET dispatch reads cs|ip as one word from 32-byte entries */
+    tr->inline_dispatch = sizeof(MdTrBlock) == 32u &&
+                          (offsetof(MdTrBlock, cs) & 3u) == 0u &&
+                          offsetof(MdTrBlock, ip) == offsetof(MdTrBlock, cs) + 2u &&
+                          (MD_TR_SLOTS & (MD_TR_SLOTS - 1u)) == 0u;
+    rt->cpu.tr_live_bits = tr->live_table;
     md_tr_flush(tr);
     tr->stats.flushes = 0u;
     return 1;
@@ -1105,7 +1274,7 @@ static int md_tr_translate(MdTranslator *tr, MdTrBlock *blk, uint16_t cs, uint16
     }
 
     md_tr_analyze(c);
-    md_runtime_mark_code_range(rt, cs, ip, (size_t)(cur - ip));
+    md_tr_mark_live(tr, cs, ip, (size_t)(cur - ip));
 
     c->b.base = tr->arena;
     c->b.size = tr->arena_size;
@@ -1131,6 +1300,7 @@ static int md_tr_translate(MdTranslator *tr, MdTrBlock *blk, uint16_t cs, uint16
     t2_dp_imm(&c->b, T2_SUB, 1u, T2_R0, T2_R0, c->n);
     em_stub(c, T2_LT, MD_TR_EXIT_BUDGET, ip, 0u);
     t2_ldst(&c->b, T2_STR_I, T2_R0, T2_SP, 0u);
+    c->ops_at = t2_here(&c->b);
 
     for (s = 0u; s < c->n; ++s) em_op(c, s);
     if (!md_tr_is_terminator(c->ops[c->n - 1u].kind))
@@ -1186,6 +1356,9 @@ MdStopReason md_tr_run(MdTranslator *tr, uint64_t budget)
 {
     MdRuntime *rt = tr->rt;
 #if !MD_TR_HOST_THUMB2 || !MICRODOS_TRANSLATION_SUPPORT
+#if MICRODOS_TRANSLATION_SUPPORT
+    (void)md_tr_lookup;              /* compiled everywhere, executed on Thumb-2 */
+#endif
     return md_interp_run(rt, budget);
 #else
     typedef uint32_t (*MdTrEnter)(uint32_t entry, uint32_t budget);

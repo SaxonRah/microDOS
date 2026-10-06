@@ -274,6 +274,123 @@ static unsigned md_translate_diff_run(unsigned cases, uint32_t seed, int unalign
     return fails;
 }
 
+/*
+ * Directed programs for paths random code rarely reaches: self-loop latches
+ * with deferred flag writes (including CF preserved across INC/DEC), data
+ * stores to the code page (byte-exact tracking: no invalidation), real
+ * self-modifying code inside a running loop, and deep CALL/RET (inline
+ * dispatch). Each runs at many budgets so budget exits land everywhere.
+ */
+typedef struct DirectedProg { const char *name; const uint8_t *code; size_t size; } DirectedProg;
+
+/* stc / mov cx,7 / l: dec cx / jnz l / pushf / pop ax / hlt */
+static const uint8_t kDecLoopCF[] = { 0xF9, 0xB9, 0x07, 0x00, 0x49, 0x75, 0xFD, 0x9C, 0x58, 0xF4 };
+/* mov si,0 / l: inc si / cmp si,40h / jb l / pushf / pop ax / hlt */
+static const uint8_t kCmpLoop[] = { 0xBE, 0x00, 0x00, 0x46, 0x83, 0xFE, 0x40, 0x72, 0xFA, 0x9C, 0x58, 0xF4 };
+/* mov cx,30 / mov bx,0F00h / l: add ax,bx / dec cx / jnz l / pushf / pop dx / hlt */
+static const uint8_t kAddDecLoop[] = { 0xB9, 0x1E, 0x00, 0xBB, 0x00, 0x0F, 0x01, 0xD8, 0x49, 0x75, 0xFB, 0x9C, 0x5A, 0xF4 };
+/* data on the code page: mov si,180h / mov cx,40h / mov al,5Ah /
+   l: mov [si],al / inc si / inc al / dec cx / jnz l / hlt */
+static const uint8_t kSamePageStore[] = {
+    0xBE, 0x80, 0x01, 0xB9, 0x40, 0x00, 0xB0, 0x5A,
+    0x88, 0x04, 0x46, 0xFE, 0xC0, 0x49, 0x75, 0xF8, 0xF4
+};
+/* self-modifying loop: mov cx,20 / xor dx,dx /
+   l: mov [patch+1],cl / patch: mov al,00 / add dl,al / dec cx / jnz l / hlt
+   (patch at 0x10C; its immediate byte at 0x10D) */
+static const uint8_t kSmcLoop[] = {
+    0xB9, 0x14, 0x00, 0x31, 0xD2,
+    0x88, 0x0E, 0x0D, 0x01,        /* 105: mov [010Dh],cl */
+    0xB0, 0x00,                    /* 109: mov al,00 -- wait: fixed below */
+    0x00, 0xC2, 0x49, 0x75, 0xF5, 0xF4
+};
+/* recursion: mov cx,40 / call f / hlt / f: dec cx / jz done / call f / done: ret */
+static const uint8_t kRecurse[] = {
+    0xB9, 0x28, 0x00, 0xE8, 0x01, 0x00, 0xF4,
+    0x49, 0x74, 0x03, 0xE8, 0xFA, 0xFF, 0xC3
+};
+/* byte compare scanner: mov si,200h / l: mov al,[si] / inc si / cmp al,0 / jne l / hlt,
+   with a NUL 37 bytes in */
+static const uint8_t kScan8[] = { 0xBE, 0x00, 0x02, 0x8A, 0x04, 0x46, 0x3C, 0x00, 0x75, 0xF9, 0xF4 };
+
+static unsigned md_translate_directed(uint8_t *mem_a, uint8_t *b_region, int unaligned,
+                                      uint8_t *arena, uint32_t arena_size)
+{
+    static MdRuntime A, B;
+    static MdTranslator T;
+    static uint8_t smc[sizeof(kSmcLoop)];
+    DirectedProg progs[7];
+    uint8_t *mem_b = b_region + (unaligned ? 16u : 0u);
+    MdHooks hooks;
+    unsigned k, fails = 0u, runs = 0u;
+    uint32_t latches = 0, live = 0, invalid = 0, store_exits = 0;
+    uint64_t budget;
+
+    /* kSmcLoop as written above has the patch target off by the prefix
+       bytes; build the real layout: the store hits the immediate of the
+       mov al,imm8 that follows it inside the same loop block. */
+    memcpy(smc, kSmcLoop, sizeof(smc));
+    smc[7] = 0x0A; smc[8] = 0x01;             /* mov [010Ah],cl -> imm of mov al at 0109h */
+    smc[15] = (uint8_t)(0x05 - 0x10);          /* jnz back to l (0105h) */
+
+    progs[0] = (DirectedProg){ "dec-loop-cf", kDecLoopCF, sizeof(kDecLoopCF) };
+    progs[1] = (DirectedProg){ "cmp-loop", kCmpLoop, sizeof(kCmpLoop) };
+    progs[2] = (DirectedProg){ "add-dec-loop", kAddDecLoop, sizeof(kAddDecLoop) };
+    progs[3] = (DirectedProg){ "same-page-store", kSamePageStore, sizeof(kSamePageStore) };
+    progs[4] = (DirectedProg){ "smc-loop", smc, sizeof(smc) };
+    progs[5] = (DirectedProg){ "recurse", kRecurse, sizeof(kRecurse) };
+    progs[6] = (DirectedProg){ "scan8", kScan8, sizeof(kScan8) };
+
+    memset(&hooks, 0, sizeof(hooks));
+    for (k = 0u; k < 7u; ++k) {
+        for (budget = 1u; budget <= 400u; budget += (budget < 64u ? 1u : 7u)) {
+            unsigned d;
+            memset(mem_a, 0, MD_X86_ADDRESS_SPACE);
+            memset(mem_b, 0, MD_X86_ADDRESS_SPACE);
+            md_runtime_init(&A, mem_a, &hooks);
+            md_runtime_init(&B, mem_b, &hooks);
+            md_runtime_load_com(&A, progs[k].code, progs[k].size, 0x1000u);
+            md_runtime_load_com(&B, progs[k].code, progs[k].size, 0x1000u);
+            A.cpu.memory[0x10200u + 37u] = 0u; B.cpu.memory[0x10200u + 37u] = 0u;
+            {
+                unsigned i;
+                for (i = 0; i < 37u; ++i) {
+                    A.cpu.memory[0x10200u + i] = (uint8_t)(i + 1u);
+                    B.cpu.memory[0x10200u + i] = (uint8_t)(i + 1u);
+                }
+            }
+            A.cpu.r[0] = B.cpu.r[0] = 0x1234u;
+            if (!md_tr_init(&T, &B, arena, arena_size)) return 1u;
+            (void)md_interp_run(&A, budget);
+            (void)md_tr_run(&T, budget);
+            d = (unsigned)compare(&A, &B);
+            ++runs;
+            latches += T.stats.deferred_latches;
+            live += T.stats.live_pages;
+            invalid += T.stats.exit_invalid;
+            store_exits += T.stats.exit_store;
+            if (k == 3u && budget > 200u && (T.stats.exit_invalid != 0u || T.stats.exit_store != 0u)) {
+                printf("[translate-directed] same-page-store invalidated translated code (invalid=%u store=%u)\n",
+                       (unsigned)T.stats.exit_invalid, (unsigned)T.stats.exit_store);
+                ++fails;
+            }
+            if (d != 0u) {
+                MdX86 ca = A.cpu, cb = B.cpu;
+                if (fails++ < 8u)
+                    printf("[translate-directed] MISMATCH %s budget=%llu kind=%u ip %04X/%04X ax %04X/%04X cx %04X/%04X fl %04X/%04X n %llu/%llu\n",
+                           progs[k].name, (unsigned long long)budget, d, A.cpu.ip, B.cpu.ip,
+                           A.cpu.r[0], B.cpu.r[0], A.cpu.r[1], B.cpu.r[1],
+                           md_x86_flags(&ca), md_x86_flags(&cb),
+                           (unsigned long long)A.instructions, (unsigned long long)B.instructions);
+            }
+        }
+    }
+    printf("[translate-directed] %s runs=%u fails=%u deferred-latches=%u live-pages=%u invalid-exits=%u store-exits=%u\n",
+           unaligned ? "unaligned" : "aligned", runs, fails, (unsigned)latches, (unsigned)live,
+           (unsigned)invalid, (unsigned)store_exits);
+    return fails;
+}
+
 #if !defined(MD_TRANSLATE_DIFF_NO_MAIN)
 int main(int argc, char **argv)
 {
@@ -294,7 +411,11 @@ int main(int argc, char **argv)
 #endif
     b_region = (uint8_t *)(((uintptr_t)raw_b + MD_X86_ADDRESS_SPACE - 1u) &
                            ~(uintptr_t)(MD_X86_ADDRESS_SPACE - 1u));
-    return md_translate_diff_run(cases, seed, unaligned, only, mem_a, b_region,
-                                 arena, 256u * 1024u) != 0u;
+    {
+        unsigned fails = md_translate_directed(mem_a, b_region, unaligned, arena, 256u * 1024u);
+        fails += md_translate_diff_run(cases, seed, unaligned, only, mem_a, b_region,
+                                       arena, 256u * 1024u);
+        return fails != 0u;
+    }
 }
 #endif

@@ -128,6 +128,10 @@ typedef struct MdX86 {
        cleared per chunk as chunks die (re-derived from other live guards).
        NULL table = always take the guard path (standalone MdX86 users). */
     uint8_t **aot_live_bits;
+    /* M25: per-code-page bitmap of bytes covered by translated blocks (one
+       bit per byte; NULL = page-granular). Only consulted for pages flagged
+       MD_X86_PAGE_TRBYTES. Owned by the translator (translate.c). */
+    uint8_t **tr_live_bits;
 } MdX86;
 
 /* ---- M18 lazy flags ---------------------------------------------------- */
@@ -296,6 +300,9 @@ static inline int md_aot_chunks_ok(const MdAotGuard *guard, uint32_t first, uint
    kernel stack/data stores no longer pay for generation bumps nobody reads. */
 #define MD_X86_PAGE_TRANSLATED 0x01u
 #define MD_X86_PAGE_AOT 0x02u
+/* M25: the page holds translated blocks tracked byte-exactly through
+   tr_live_bits; only a store to a covered byte bumps the page generation. */
+#define MD_X86_PAGE_TRBYTES 0x04u
 
 /* Pure-interpreter targets have nothing translated to invalidate.  Compile
    store tracking out entirely there: self-modifying code remains naturally
@@ -405,10 +412,22 @@ static inline void md_x86_note_aot_guards(MdX86 *cpu, uint32_t a)
     for (i = 0; i < cpu->aot_guard_count; ++i) md_x86_aot_check_guard(cpu, &cpu->aot_guards[i], a);
 }
 
+/* M25 byte-exact check: a store to data that merely shares a page with
+   translated code (the normal .COM layout) neither bumps the page
+   generation nor invalidates anything. */
+static inline void md_x86_note_tr_write(MdX86 *cpu, uint32_t address)
+{
+    const uint32_t a = address & MD_X86_ADDRESS_MASK;
+    const uint8_t *bm = cpu->tr_live_bits != NULL ? cpu->tr_live_bits[a >> MD_X86_CODE_PAGE_SHIFT] : NULL;
+    if (bm != NULL && ((bm[(a & MD_X86_CODE_PAGE_MASK) >> 3] >> (a & 7u)) & 1u) == 0u) return;
+    md_x86_note_page_write(cpu, a);
+}
+
 static inline void md_x86_note_code_write(MdX86 *cpu, uint32_t address)
 {
     const unsigned f = md_x86_page_flags(cpu, address);
     if (f & MD_X86_PAGE_TRANSLATED) md_x86_note_page_write(cpu, address);
+    if (f & MD_X86_PAGE_TRBYTES) md_x86_note_tr_write(cpu, address);
     if (f != 0u) md_x86_note_aot_write(cpu, address);
 }
 
@@ -457,6 +476,8 @@ static inline void md_x86_write16_tracked_inline(MdX86 *cpu, uint32_t a0, uint16
     /* Page generations: once per touched TRANSLATED page. AOT: every byte. */
     if (f0 & MD_X86_PAGE_TRANSLATED) md_x86_note_page_write(cpu, a0);
     if ((f1 & MD_X86_PAGE_TRANSLATED) && p1 != p0) md_x86_note_page_write(cpu, a1);
+    if (f0 & MD_X86_PAGE_TRBYTES) md_x86_note_tr_write(cpu, a0);
+    if (f1 & MD_X86_PAGE_TRBYTES) md_x86_note_tr_write(cpu, a1);
     if (f0 != 0u) md_x86_note_aot_write(cpu, a0);
     if (f1 != 0u) md_x86_note_aot_write(cpu, a1);
 }

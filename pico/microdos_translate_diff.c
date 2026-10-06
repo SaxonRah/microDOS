@@ -81,6 +81,11 @@ static const uint8_t kMemsum[] = {
     0xBE, 0x00, 0x30, 0xB9, 0x00, 0x10, 0x31, 0xD2,
     0x8B, 0x04, 0x01, 0xC2, 0x83, 0xC6, 0x02, 0x49, 0x75, 0xF6, 0xEB, 0xEC
 };
+/* mov si,0 / l: mov al,[si] / inc si / cmp al,0FFh / jne l / jmp start
+   (scans zeroed memory: the byte-scanner shape of DOS string loops) */
+static const uint8_t kScan[] = {
+    0xBE, 0x00, 0x00, 0x8A, 0x04, 0x46, 0x3C, 0xFF, 0x75, 0xF9, 0xEB, 0xF4
+};
 /* l: call f / dec cx / jnz l / jmp l / f: add bx,ax / inc ax / ret */
 static const uint8_t kCallmix[] = {
     0xE8, 0x05, 0x00, 0x49, 0x75, 0xFA, 0xEB, 0xF8, 0x01, 0xC3, 0x40, 0xC3
@@ -90,6 +95,7 @@ static const Bench kBench[] = {
     { "dec-jnz loop", kLoop, sizeof(kLoop) },
     { "memory-sum loop", kMemsum, sizeof(kMemsum) },
     { "call/ret loop", kCallmix, sizeof(kCallmix) },
+    { "byte-scan loop", kScan, sizeof(kScan) },
 };
 
 static int run_bench(const Bench *bench)
@@ -154,6 +160,10 @@ static int run_all(void)
         return 0;
     }
 
+    fails += md_translate_directed(g_mem_a, g_mem_b, 0, g_arena, MD_TD_ARENA_BYTES);
+    stdio_flush();
+    fails += md_translate_directed(g_mem_a, g_mem_b, 1, g_arena, MD_TD_ARENA_BYTES);
+    stdio_flush();
     fails += md_translate_diff_run(MD_TD_CASES, 0x4D32355Bu, 0, -1, g_mem_a, g_mem_b,
                                    g_arena, MD_TD_ARENA_BYTES);
     stdio_flush();

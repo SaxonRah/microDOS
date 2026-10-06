@@ -291,6 +291,19 @@ target_compile_definitions(microdos_nativev2_usbsmoke PRIVATE
     MICRODOS_PICO_SYS_KHZ=0)
 pico_set_program_name(microdos_nativev2_usbsmoke "microDOS NV2 USB smoke")
 
+# M25 DOS firmware: general Thumb-2 translator, everything else off
+# (no kernel AOT, no Native v2, no old JIT, no block cache) so splitbench
+# intervals compare directly against the g128/interpreted baselines.
+md_pico_dos(microdos_pico_m25 1 0 300000 0 0 0 0 0 0)
+target_sources(microdos_pico_m25 PRIVATE
+    "${MD_ROOT}/src/runtime/translate.c"
+    "${MD_ROOT}/src/runtime/x86_block_cache.c"
+    "${MD_ROOT}/src/decode/x86_decode.c")
+target_compile_definitions(microdos_pico_m25 PRIVATE
+    MICRODOS_PICO_M25=1
+    MICRODOS_SYSTEM_ENABLE_TRANSLATOR=1)
+pico_set_program_name(microdos_pico_m25 "microDOS M25")
+
 # M25 translator on-device check: differential test (interpreter vs
 # translated Thumb-2, guest RAM in PSRAM) plus interpreter-vs-translator
 # loop benchmarks. Run with scripts/md_translate_diff_pico.ps1.

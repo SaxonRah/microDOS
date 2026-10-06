@@ -18,6 +18,15 @@
 #ifndef MICRODOS_PICO_JIT
 #define MICRODOS_PICO_JIT 0
 #endif
+#ifndef MICRODOS_PICO_M25
+#define MICRODOS_PICO_M25 0           /* M25 general Thumb-2 translator */
+#endif
+#if MICRODOS_PICO_M25
+#include "microdos/translate.h"
+#ifndef MICRODOS_PICO_M25_ARENA
+#define MICRODOS_PICO_M25_ARENA (32u * 1024u)
+#endif
+#endif
 #ifndef MICRODOS_PICO_NATIVE_V2
 #define MICRODOS_PICO_NATIVE_V2 0
 #endif
@@ -61,13 +70,23 @@ extern const uint8_t md_blob_disk[], md_blob_disk_end[];
 #if MICRODOS_PICO_GUEST_SRAM
 static uint8_t g_guest[MD_GUEST_BYTES] __attribute__((aligned(16)));
 #else
+#if MICRODOS_PICO_M25
+/* aligned to its own size: translated code forms host addresses with one BFI */
+static uint8_t __uninitialized_psram("md_guest") __attribute__((aligned(MD_GUEST_BYTES)))
+    g_guest[MD_GUEST_BYTES];
+#else
 static uint8_t __uninitialized_psram("md_guest") __attribute__((aligned(16)))
     g_guest[MD_GUEST_BYTES];
+#endif
 #endif
 static uint8_t __uninitialized_psram("md_disk") __attribute__((aligned(16)))
     g_disk[MD_DISK_BYTES];
 
 static MdDos2System g_sys;
+#if MICRODOS_PICO_M25
+static MdTranslator g_tr;
+static uint8_t __attribute__((aligned(8))) g_tr_arena[MICRODOS_PICO_M25_ARENA];
+#endif
 #if MICRODOS_PICO_CACHE
 static MdBlockCache g_cache;
 #endif
@@ -304,7 +323,10 @@ static void md_perf_snapshot(PicoPerf *p)
     p->jit_owned_instructions = g_sys.jit_instructions;
     p->jit_native_instructions = g_sys.jit_native_instructions;
     p->jit_fallback_instructions = g_sys.jit_fallback_instructions;
-#if MICRODOS_PICO_NATIVE_V2
+#if MICRODOS_PICO_M25
+    /* reported in the native-v2 column so existing log parsers keep working */
+    p->native_v2_instructions = g_tr.stats.native_instructions;
+#elif MICRODOS_PICO_NATIVE_V2
     p->native_v2_instructions = g_sys.native_v2_instructions;
 #else
     p->native_v2_instructions = 0u;
@@ -503,6 +525,9 @@ static void md_stats(uint64_t start_us)
            MICRODOS_PICO_CACHE?"ON":"OFF", g_sys.kernel_attached?"ON":"OFF",
            MICRODOS_PICO_JIT?"ON":"OFF", MICRODOS_PICO_NATIVE_V2?"ON":"OFF",
            MICRODOS_PICO_GUEST_SRAM?"SRAM":"PSRAM");
+#if MICRODOS_PICO_M25
+    md_say("[perf] note: M25 translator ON; the native-v2 tier column counts M25 translated instructions\n");
+#endif
     md_perf_report("since boot",&now,&zero,start_us);
     md_perf_report("since previous Ctrl+]",&now,&g_perf_mark,g_perf_mark.at_us?g_perf_mark.at_us:start_us);
     md_say("[perf] aot: kernel compiled %llu   non-kernel AOT %llu   attached-segment steps %llu\n",
@@ -520,6 +545,19 @@ static void md_stats(uint64_t start_us)
 #endif
         md_jit_report("since boot",&now,&zero);
         md_jit_report("since previous Ctrl+]",&now,&g_perf_mark);
+    }
+#endif
+#if MICRODOS_PICO_M25
+    {
+        const MdTrStats *t = &g_tr.stats;
+        md_say("[m25] native=%llu interp=%llu episodes=%lu translations=%lu untranslatable=%lu chains=%lu flushes=%lu code=%lu B\n",
+               (unsigned long long)t->native_instructions, (unsigned long long)t->interp_instructions,
+               (unsigned long)t->episodes, (unsigned long)t->translations, (unsigned long)t->untranslatable,
+               (unsigned long)t->chains, (unsigned long)t->flushes, (unsigned long)t->code_bytes);
+        md_say("[m25] exits edge=%lu dynamic=%lu budget=%lu invalid=%lu store=%lu   live-pages=%lu fallback-pages=%lu latches=%lu\n",
+               (unsigned long)t->exit_edge, (unsigned long)t->exit_dynamic, (unsigned long)t->exit_budget,
+               (unsigned long)t->exit_invalid, (unsigned long)t->exit_store, (unsigned long)t->live_pages,
+               (unsigned long)t->live_fallback_pages, (unsigned long)t->deferred_latches);
     }
 #endif
 #if MICRODOS_PICO_NATIVE_V2
@@ -650,6 +688,16 @@ int main(void)
     md_dos2_system_set_aot(&g_sys,g_programs,MD_PICO_PROGRAM_COUNT,true);
     if(!md_dos2_system_start(&g_sys,md_blob_msdos_sys,kernel_size)){md_say("microDOS: embedded MSDOS.SYS rejected (%lu bytes); halting.\n",(unsigned long)kernel_size);for(;;)sleep_ms(1000);}
     md_say("  kernel:  MSDOS.SYS %lu bytes\n",(unsigned long)kernel_size);
+#if MICRODOS_PICO_M25
+    if (md_tr_init(&g_tr, &g_sys.runtime, g_tr_arena, MICRODOS_PICO_M25_ARENA)) {
+        g_sys.translator = &g_tr;
+        md_say("  m25:     translator ON, %lu KiB arena at %p, guest %s\n",
+               (unsigned long)(MICRODOS_PICO_M25_ARENA / 1024u), (void *)g_tr_arena,
+               g_tr.mem_aligned ? "1 MiB-aligned (BFI)" : "unaligned");
+    } else {
+        md_say("  m25:     translator unavailable; interpreter only\n");
+    }
+#endif
 #if MICRODOS_PICO_KERNEL_AOT
     md_say("  aot:     MSDOS.SYS kernel (%lu compiled, %lu holes) %s\n",(unsigned long)md_recomp_msdos2_program.compiled_instructions,(unsigned long)md_recomp_msdos2_program.hole_instructions,g_sys.kernel_attached?"attached":"NOT ATTACHED");
 #else

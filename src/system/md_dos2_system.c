@@ -15,6 +15,13 @@ static MdJit g_md_system_jit;
 
 #include <string.h>
 
+#ifndef MICRODOS_SYSTEM_ENABLE_TRANSLATOR
+#define MICRODOS_SYSTEM_ENABLE_TRANSLATOR 0
+#endif
+#if MICRODOS_SYSTEM_ENABLE_TRANSLATOR
+#include "microdos/translate.h"
+#endif
+
 #ifndef MICRODOS_SYSTEM_ENABLE_AOT
 #define MICRODOS_SYSTEM_ENABLE_AOT 1
 #endif
@@ -180,6 +187,18 @@ static const MdAotProgram *md_aot_here(MdDos2System *sys)
 MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
 {
     MdRuntime *rt = &sys->runtime;
+
+#if MICRODOS_SYSTEM_ENABLE_TRANSLATOR
+    if (sys->translator != NULL) {
+        /* Same contract as md_interp_run(): exact budget, same stop reasons. */
+        const MdStopReason st = md_tr_run(sys->translator, budget);
+        if (st == MD_STOP_BUDGET) {
+            rt->stop_reason = MD_STOP_NONE;
+            return MD_STOP_NONE;
+        }
+        return st;
+    }
+#endif
 
 #ifdef MICRODOS_ENABLE_NATIVE_V2
     rt->native_v2_backedge_hit = 0u;

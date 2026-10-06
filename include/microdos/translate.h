@@ -30,6 +30,9 @@ extern "C" {
 #ifndef MD_TR_MAX_OPS
 #define MD_TR_MAX_OPS 32u
 #endif
+#ifndef MD_TR_LIVE_PAGES
+#define MD_TR_LIVE_PAGES 16u        /* pages tracked byte-exactly (512 B each) */
+#endif
 
 typedef struct MdTrBlock {
     uint32_t entry;                 /* arena offset of guard entry */
@@ -55,6 +58,9 @@ typedef struct MdTrStats {
     uint32_t exit_edge, exit_dynamic, exit_budget, exit_invalid, exit_store;
     uint32_t flushes;
     uint32_t code_bytes;
+    uint32_t live_pages;            /* pages tracked byte-exactly */
+    uint32_t live_fallback_pages;   /* pool exhausted: page-granular */
+    uint32_t deferred_latches;      /* self-loops with deferred flag writes */
 } MdTrStats;
 
 typedef struct MdTranslator {
@@ -67,7 +73,12 @@ typedef struct MdTranslator {
     uint32_t mem_aligned;           /* guest RAM aligned to its own size */
     uint32_t epoch;                 /* rt->code_epoch seen at last flush */
     volatile uint32_t remaining;    /* written by the common exit */
+    uint32_t inline_dispatch;       /* RET looks up blocks in generated code */
     MdTrBlock blocks[MD_TR_SLOTS];
+    /* M25 byte-exact SMC tracking: rt->cpu.tr_live_bits points here. */
+    uint8_t *live_table[MD_X86_CODE_PAGE_COUNT];
+    uint8_t live_pool[MD_TR_LIVE_PAGES][(1u << MD_X86_CODE_PAGE_SHIFT) / 8u];
+    uint32_t live_used;
     MdTrStats stats;
 } MdTranslator;
 
