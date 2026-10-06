@@ -31,6 +31,32 @@
 #endif
 
 static uint32_t g_rng;
+/* 1: translate every block on first sight (maximum translated coverage);
+   0: tiered, as in firmware (needs MICRODOS_ENABLE_BACKEDGE_EXIT to tier). */
+static int g_td_eager = 1;
+
+/* Reference interpreter run with md_interp_run()'s plain contract: with
+   back-edge exits compiled in, md_interp_run() also returns at loop heads,
+   so keep calling it until the budget is used or a real stop occurs. */
+static MdStopReason td_ref_run(MdRuntime *r, uint64_t budget)
+{
+    const uint64_t start = r->instructions;
+    MdStopReason st;
+    for (;;) {
+        st = md_interp_run(r, budget - (r->instructions - start));
+        if (st != MD_STOP_NONE) return st;
+#if MD_INTERP_BACKEDGE_EXIT
+        r->native_v2_backedge_hit = 0u;
+#endif
+    }
+}
+
+static int td_init(MdTranslator *t, MdRuntime *b, uint8_t *arena, uint32_t size)
+{
+    const int ok = md_tr_init(t, b, arena, size);
+    t->eager = (uint32_t)g_td_eager;
+    return ok;
+}
 static uint32_t rnd(void)
 {
     g_rng ^= g_rng << 13; g_rng ^= g_rng >> 17; g_rng ^= g_rng << 5;
@@ -182,7 +208,7 @@ static unsigned md_translate_diff_run(unsigned cases, uint32_t seed, int unalign
         md_runtime_init(&B, mem_b, &hooks);
         setup(&A, &p, regs, flags, data);
         setup(&B, &p, regs, flags, data);
-        if (!md_tr_init(&T, &B, arena, arena_size)) {
+        if (!td_init(&T, &B, arena, arena_size)) {
             printf("[translate-diff] translator unavailable on this host\n");
             return cases;
         }
@@ -197,7 +223,7 @@ static unsigned md_translate_diff_run(unsigned cases, uint32_t seed, int unalign
             for (i = 0; i < 8; ++i) printf(" %04X", regs[i]);
             printf(" flags %04X\n", flags);
         }
-        (void)md_interp_run(&A, budget);
+        (void)td_ref_run(&A, budget);
         (void)md_tr_run(&T, budget);
         d = (unsigned)compare(&A, &B);
         if (d != 0u && only >= 0) {
@@ -208,13 +234,13 @@ static unsigned md_translate_diff_run(unsigned cases, uint32_t seed, int unalign
                 memset(mem_a, 0, MD_X86_ADDRESS_SPACE); memset(mem_b, 0, MD_X86_ADDRESS_SPACE);
                 md_runtime_init(&A, mem_a, &hooks); md_runtime_init(&B, mem_b, &hooks);
                 setup(&A, &p, regs, flags, data); setup(&B, &p, regs, flags, data);
-                md_tr_init(&T, &B, arena, arena_size);
-                (void)md_interp_run(&A, mid); (void)md_tr_run(&T, mid);
+                td_init(&T, &B, arena, arena_size);
+                (void)td_ref_run(&A, mid); (void)md_tr_run(&T, mid);
                 if (compare(&A, &B)) hi = mid; else lo = mid;
             }
             memset(mem_a, 0, MD_X86_ADDRESS_SPACE);
             md_runtime_init(&A, mem_a, &hooks); setup(&A, &p, regs, flags, data);
-            (void)md_interp_run(&A, lo);
+            (void)td_ref_run(&A, lo);
             {
                 const uint32_t lin = md_x86_linear(A.cpu.cs, A.cpu.ip);
                 MdX86 ca = A.cpu;
@@ -228,8 +254,8 @@ static unsigned md_translate_diff_run(unsigned cases, uint32_t seed, int unalign
             memset(mem_a, 0, MD_X86_ADDRESS_SPACE); memset(mem_b, 0, MD_X86_ADDRESS_SPACE);
             md_runtime_init(&A, mem_a, &hooks); md_runtime_init(&B, mem_b, &hooks);
             setup(&A, &p, regs, flags, data); setup(&B, &p, regs, flags, data);
-            md_tr_init(&T, &B, arena, arena_size);
-            (void)md_interp_run(&A, hi); (void)md_tr_run(&T, hi);
+            td_init(&T, &B, arena, arena_size);
+            (void)td_ref_run(&A, hi); (void)md_tr_run(&T, hi);
             d = (unsigned)compare(&A, &B);
             {
                 unsigned s2;
@@ -267,8 +293,8 @@ static unsigned md_translate_diff_run(unsigned cases, uint32_t seed, int unalign
             }
         }
     }
-    printf("[translate-diff] cases=%u seed=%08X %s fails=%u native=%.1f%% chains=%llu instr/episode=%.1f\n",
-           cases, (unsigned)seed, unaligned ? "unaligned" : "aligned", fails,
+    printf("[translate-diff] %s cases=%u seed=%08X %s fails=%u native=%.1f%% chains=%llu instr/episode=%.1f\n",
+           g_td_eager ? "eager" : "tiered", cases, (unsigned)seed, unaligned ? "unaligned" : "aligned", fails,
            total ? 100.0 * (double)native / (double)total : 0.0,
            (unsigned long long)chains, episodes ? (double)native / (double)episodes : 0.0);
     return fails;
@@ -360,8 +386,8 @@ static unsigned md_translate_directed(uint8_t *mem_a, uint8_t *b_region, int una
                 }
             }
             A.cpu.r[0] = B.cpu.r[0] = 0x1234u;
-            if (!md_tr_init(&T, &B, arena, arena_size)) return 1u;
-            (void)md_interp_run(&A, budget);
+            if (!td_init(&T, &B, arena, arena_size)) return 1u;
+            (void)td_ref_run(&A, budget);
             (void)md_tr_run(&T, budget);
             d = (unsigned)compare(&A, &B);
             ++runs;
@@ -385,8 +411,8 @@ static unsigned md_translate_directed(uint8_t *mem_a, uint8_t *b_region, int una
             }
         }
     }
-    printf("[translate-directed] %s runs=%u fails=%u deferred-latches=%u live-pages=%u invalid-exits=%u store-exits=%u\n",
-           unaligned ? "unaligned" : "aligned", runs, fails, (unsigned)latches, (unsigned)live,
+    printf("[translate-directed] %s %s runs=%u fails=%u deferred-latches=%u live-pages=%u invalid-exits=%u store-exits=%u\n",
+           g_td_eager ? "eager" : "tiered", unaligned ? "unaligned" : "aligned", runs, fails, (unsigned)latches, (unsigned)live,
            (unsigned)invalid, (unsigned)store_exits);
     return fails;
 }
@@ -412,9 +438,14 @@ int main(int argc, char **argv)
     b_region = (uint8_t *)(((uintptr_t)raw_b + MD_X86_ADDRESS_SPACE - 1u) &
                            ~(uintptr_t)(MD_X86_ADDRESS_SPACE - 1u));
     {
-        unsigned fails = md_translate_directed(mem_a, b_region, unaligned, arena, 256u * 1024u);
-        fails += md_translate_diff_run(cases, seed, unaligned, only, mem_a, b_region,
-                                       arena, 256u * 1024u);
+        unsigned fails = 0u;
+        int mode;
+        for (mode = 1; mode >= 0; --mode) {          /* eager, then tiered */
+            g_td_eager = mode;
+            fails += md_translate_directed(mem_a, b_region, unaligned, arena, 256u * 1024u);
+            fails += md_translate_diff_run(cases, seed, unaligned, only, mem_a, b_region,
+                                           arena, 256u * 1024u);
+        }
         return fails != 0u;
     }
 }

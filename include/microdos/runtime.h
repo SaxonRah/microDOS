@@ -36,6 +36,22 @@ typedef struct MdRuntime MdRuntime;
 struct MdBlockCache;
 typedef struct MdBlockCache MdBlockCache;
 
+/* The threaded interpreter can return at taken JNZ/LOOP back-edges so a
+   native tier (Native v2, or the M25 translator's tiering) can take over at
+   loop heads. Native v2 builds always enable it. */
+#if defined(MICRODOS_ENABLE_NATIVE_V2) || defined(MICRODOS_ENABLE_BACKEDGE_EXIT)
+#define MD_INTERP_BACKEDGE_EXIT 1
+#else
+#define MD_INTERP_BACKEDGE_EXIT 0
+#endif
+/* M25 tiering also exits at every taken backward short Jcc and JMP (loops
+   closed by JB/JL/JMP). Native v2 keeps its original JNZ/LOOP-only set. */
+#if defined(MICRODOS_ENABLE_BACKEDGE_EXIT) && !defined(MICRODOS_ENABLE_NATIVE_V2)
+#define MD_INTERP_BACKEDGE_ALL 1
+#else
+#define MD_INTERP_BACKEDGE_ALL 0
+#endif
+
 #if defined(MICRODOS_ENABLE_NATIVE_V2) && defined(MICRODOS_NATIVE_V2_BACKEDGE_PROFILE)
 #ifndef MD_NATIVE_V2_BACKEDGE_SLOTS
 #define MD_NATIVE_V2_BACKEDGE_SLOTS 64u
@@ -75,7 +91,7 @@ struct MdRuntime {
     uint8_t fault_opcode;
     uint8_t exit_code;
 
-#ifdef MICRODOS_ENABLE_NATIVE_V2
+#if MD_INTERP_BACKEDGE_EXIT
     uint16_t native_v2_backedge_cs;
     uint16_t native_v2_backedge_ip;
     uint8_t native_v2_backedge_hit;

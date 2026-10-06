@@ -1149,7 +1149,7 @@ void md_tr_flush(MdTranslator *tr)
     unsigned page;
     for (page = 0u; page < MD_X86_CODE_PAGE_COUNT; ++page) {
         if (tr->live_table[page] != NULL) {
-            tr->rt->code_page_executable[page] &= (uint8_t)~MD_X86_PAGE_TRBYTES;
+            tr->rt->code_page_executable[page] &= (uint8_t)(0xFFu ^ MD_X86_PAGE_TRBYTES);   /* no truncating cast (MSVC C4310) */
             tr->live_table[page] = NULL;
         }
     }
@@ -1238,7 +1238,11 @@ static int md_tr_translate(MdTranslator *tr, MdTrBlock *blk, uint16_t cs, uint16
     c->ip0 = ip;
     c->track = rt->cpu.code_page_executable != NULL;
     if ((size_t)(0x10000u - ip) < wlen) wlen = (size_t)(0x10000u - ip);
-    for (i = 0u; i < wlen; ++i) win[i] = md_x86_read8(&rt->cpu, cs, (uint16_t)(ip + i));
+    {
+        const uint32_t lin = md_x86_linear(cs, ip) & MD_X86_ADDRESS_MASK;
+        if (lin + wlen <= MD_X86_ADDRESS_SPACE) memcpy(win, rt->cpu.memory + lin, wlen);
+        else for (i = 0u; i < wlen; ++i) win[i] = md_x86_read8(&rt->cpu, cs, (uint16_t)(ip + i));
+    }
 
     memset(blk, 0, sizeof(*blk));
     blk->cs = cs;
@@ -1340,6 +1344,23 @@ static int md_tr_translate(MdTranslator *tr, MdTrBlock *blk, uint16_t cs, uint16
     return 1;
 }
 
+static int md_tr_match(const MdTranslator *tr, const MdTrBlock *blk, uint16_t cs, uint16_t ip)
+{
+    return blk->state != 0u && blk->cs == cs && blk->ip == ip && md_tr_block_fresh(tr, blk);
+}
+
+static uint8_t *md_tr_heat(MdTranslator *tr, uint16_t cs, uint16_t ip)
+{
+    const uint32_t x = ((uint32_t)cs << 4) + ip;
+    return &tr->heat[(x ^ (x >> 7) ^ (x >> 13)) & (MD_TR_HEAT_SLOTS - 1u)];
+}
+
+static void md_tr_heat_bump(MdTranslator *tr, uint16_t cs, uint16_t ip)
+{
+    uint8_t *h = md_tr_heat(tr, cs, ip);
+    if (*h != 0xFFu) ++*h;
+}
+
 static MdTrBlock *md_tr_lookup(MdTranslator *tr, uint16_t cs, uint16_t ip)
 {
     MdTrBlock *blk = &tr->blocks[md_tr_hash(cs, ip)];
@@ -1358,22 +1379,62 @@ MdStopReason md_tr_run(MdTranslator *tr, uint64_t budget)
 #if !MD_TR_HOST_THUMB2 || !MICRODOS_TRANSLATION_SUPPORT
 #if MICRODOS_TRANSLATION_SUPPORT
     (void)md_tr_lookup;              /* compiled everywhere, executed on Thumb-2 */
+    (void)md_tr_match;
+    (void)md_tr_heat_bump;
 #endif
     return md_interp_run(rt, budget);
 #else
     typedef uint32_t (*MdTrEnter)(uint32_t entry, uint32_t budget);
     if (tr->arena == NULL) return md_interp_run(rt, budget);
+#if MD_INTERP_BACKEDGE_EXIT
+    rt->native_v2_suppress_bloom[0] = 0u;
+    rt->native_v2_suppress_bloom[1] = 0u;
+#endif
 
     while (rt->stop_reason == MD_STOP_NONE) {
         MdTrBlock *blk;
         uint32_t chunk, info, kind, retired;
         MdTrEnter enter;
+        const uint16_t cs = rt->cpu.cs, ip = rt->cpu.ip;
 
         if (budget == 0u) { rt->stop_reason = MD_STOP_BUDGET; break; }
         if (rt->code_epoch != tr->epoch) md_tr_flush(tr);
 
-        blk = md_tr_lookup(tr, rt->cpu.cs, rt->cpu.ip);
-        if (blk->state != 1u || blk->ops > budget) {
+        blk = &tr->blocks[md_tr_hash(cs, ip)];
+        if (!md_tr_match(tr, blk, cs, ip)) {
+            if (tr->eager || *md_tr_heat(tr, cs, ip) >= MD_TR_HOT_THRESHOLD)
+                (void)md_tr_translate(tr, blk, cs, ip, 1);
+            else
+                blk = NULL;                          /* cold: interpret */
+        }
+        if (blk == NULL || blk->state != 1u || blk->ops > budget) {
+#if MD_INTERP_BACKEDGE_EXIT
+            if (!tr->eager) {
+                /* Cold or untranslatable code: run the threaded interpreter
+                   at full speed until it reaches a loop head (taken JNZ/LOOP
+                   back-edge), then let that loop head heat up. */
+                const uint64_t before = rt->instructions;
+                rt->native_v2_backedge_hit = 0u;
+                (void)md_interp_run(rt, budget);
+                retired = (uint32_t)(rt->instructions - before);
+                budget -= retired;
+                tr->stats.interp_instructions += retired;
+                if (rt->native_v2_backedge_hit) {
+                    const uint16_t bcs = rt->native_v2_backedge_cs, bip = rt->native_v2_backedge_ip;
+                    MdTrBlock *t = &tr->blocks[md_tr_hash(bcs, bip)];
+                    rt->native_v2_backedge_hit = 0u;
+                    ++tr->stats.backedge_exits;
+                    if (md_tr_match(tr, t, bcs, bip) && t->state == 2u) {
+                        const unsigned bit = ((unsigned)bcs ^ (unsigned)bip) & 63u;
+                        rt->native_v2_suppress_bloom[bit >> 5] |= (uint32_t)1u << (bit & 31u);
+                        ++tr->stats.suppressed;
+                    } else {
+                        md_tr_heat_bump(tr, bcs, bip);
+                    }
+                }
+                continue;
+            }
+#endif
             (void)md_interp_step(rt);
             --budget;
             ++tr->stats.interp_instructions;
@@ -1396,8 +1457,19 @@ MdStopReason md_tr_run(MdTranslator *tr, uint64_t budget)
                 const uint32_t flushes = tr->stats.flushes;
                 MdTrBlock *to;
                 ++tr->stats.exit_edge;
-                to = md_tr_lookup(tr, rt->cpu.cs, rt->cpu.ip);
-                if (to->state == 1u && tr->stats.flushes == flushes) {
+                if (tr->eager) {
+                    to = md_tr_lookup(tr, rt->cpu.cs, rt->cpu.ip);
+                } else {
+                    /* tiered: chain only to a target that is already hot */
+                    to = &tr->blocks[md_tr_hash(rt->cpu.cs, rt->cpu.ip)];
+                    if (!md_tr_match(tr, to, rt->cpu.cs, rt->cpu.ip)) {
+                        md_tr_heat_bump(tr, rt->cpu.cs, rt->cpu.ip);
+                        if (*md_tr_heat(tr, rt->cpu.cs, rt->cpu.ip) >= MD_TR_HOT_THRESHOLD)
+                            (void)md_tr_translate(tr, to, rt->cpu.cs, rt->cpu.ip, 1);
+                    }
+                }
+                if (to->state == 1u && md_tr_match(tr, to, rt->cpu.cs, rt->cpu.ip) &&
+                    tr->stats.flushes == flushes) {
                     MdT2Buf b = { tr->arena, tr->arena_size, 0u, 0 };
                     /* A block chained to itself skips its page-generation
                        check: within one native episode its code can only
@@ -1409,7 +1481,10 @@ MdStopReason md_tr_run(MdTranslator *tr, uint64_t budget)
                 }
                 break;
             }
-            case MD_TR_EXIT_DYNAMIC: ++tr->stats.exit_dynamic; break;
+            case MD_TR_EXIT_DYNAMIC:
+                ++tr->stats.exit_dynamic;
+                md_tr_heat_bump(tr, rt->cpu.cs, rt->cpu.ip);
+                break;
             case MD_TR_EXIT_BUDGET:  ++tr->stats.exit_budget; break;
             case MD_TR_EXIT_INVALID: ++tr->stats.exit_invalid; break;
             case MD_TR_EXIT_STORE:   ++tr->stats.exit_store; break;

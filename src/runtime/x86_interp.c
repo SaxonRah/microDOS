@@ -1734,7 +1734,7 @@ op_jnz8: {
         runtime->cpu.ip = target;
         if (rel < 0)
             MD_NV2_PROFILE_BACKEDGE(opcode, ip_before, target);
-#ifdef MICRODOS_ENABLE_NATIVE_V2
+#if MD_INTERP_BACKEDGE_EXIT
         if (rel < 0) {
             const unsigned bit =
                 ((unsigned)runtime->cpu.cs ^ (unsigned)target) & 63u;
@@ -1758,6 +1758,18 @@ op_jcc8: {
         runtime->cpu.ip = target;
         if (rel < 0)
             MD_NV2_PROFILE_BACKEDGE(opcode, ip_before, target);
+#if MD_INTERP_BACKEDGE_ALL
+        if (rel < 0) {
+            const unsigned bit = ((unsigned)runtime->cpu.cs ^ (unsigned)target) & 63u;
+            const uint32_t mask = (uint32_t)1u << (bit & 31u);
+            if ((runtime->native_v2_suppress_bloom[bit >> 5] & mask) == 0u) {
+                runtime->native_v2_backedge_cs = runtime->cpu.cs;
+                runtime->native_v2_backedge_ip = target;
+                runtime->native_v2_backedge_hit = 1u;
+                goto md_exit;
+            }
+        }
+#endif
     }
     MD_NEXT();
 }
@@ -2098,13 +2110,13 @@ op_mov_rm:
     MD_NEXT();
 
 op_loop: {
-#ifdef MICRODOS_ENABLE_NATIVE_V2
+#if MD_INTERP_BACKEDGE_EXIT
     const int8_t rel = (int8_t)MD_CODE_PEEK8();
     const uint16_t fallthrough = (uint16_t)(runtime->cpu.ip + 1u);
     const uint16_t target = (uint16_t)(fallthrough + rel);
 #endif
     md_op_loop(runtime, opcode);
-#ifdef MICRODOS_ENABLE_NATIVE_V2
+#if MD_INTERP_BACKEDGE_EXIT
     if (rel < 0 && runtime->cpu.ip == target) {
         MD_NV2_PROFILE_BACKEDGE(opcode, ip_before, target);
         if (opcode == 0xE2u) {
@@ -2191,6 +2203,18 @@ op_jmp8: {
     runtime->cpu.ip = target;
     if (rel < 0)
         MD_NV2_PROFILE_BACKEDGE(opcode, ip_before, target);
+#if MD_INTERP_BACKEDGE_ALL
+    if (rel < 0) {
+        const unsigned bit = ((unsigned)runtime->cpu.cs ^ (unsigned)target) & 63u;
+        const uint32_t mask = (uint32_t)1u << (bit & 31u);
+        if ((runtime->native_v2_suppress_bloom[bit >> 5] & mask) == 0u) {
+            runtime->native_v2_backedge_cs = runtime->cpu.cs;
+            runtime->native_v2_backedge_ip = target;
+            runtime->native_v2_backedge_hit = 1u;
+            goto md_exit;
+        }
+    }
+#endif
     MD_NEXT();
 }
 

@@ -301,7 +301,10 @@ target_sources(microdos_pico_m25 PRIVATE
     "${MD_ROOT}/src/decode/x86_decode.c")
 target_compile_definitions(microdos_pico_m25 PRIVATE
     MICRODOS_PICO_M25=1
-    MICRODOS_SYSTEM_ENABLE_TRANSLATOR=1)
+    MICRODOS_SYSTEM_ENABLE_TRANSLATOR=1
+    MICRODOS_ENABLE_BACKEDGE_EXIT=1       # tiering: interpreter returns at loop heads
+    MD_TR_SLOTS=1024u
+    "MICRODOS_PICO_M25_ARENA=(160u*1024u)")
 pico_set_program_name(microdos_pico_m25 "microDOS M25")
 
 # M25 translator on-device check: differential test (interpreter vs
@@ -318,7 +321,8 @@ add_executable(microdos_pico_translate_diff
 md_pico_common(microdos_pico_translate_diff 1)
 target_include_directories(microdos_pico_translate_diff PRIVATE "${MD_ROOT}/tests")
 target_compile_definitions(microdos_pico_translate_diff PRIVATE
-    MICRODOS_PICO_SYS_KHZ=300000)
+    MICRODOS_PICO_SYS_KHZ=300000
+    MICRODOS_ENABLE_BACKEDGE_EXIT=1)
 pico_set_program_name(microdos_pico_translate_diff "microDOS M25 translate diff")
 
 md_pico_bench(microdos_bench     1 300000)

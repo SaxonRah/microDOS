@@ -30,6 +30,12 @@ extern "C" {
 #ifndef MD_TR_MAX_OPS
 #define MD_TR_MAX_OPS 32u
 #endif
+#ifndef MD_TR_HEAT_SLOTS
+#define MD_TR_HEAT_SLOTS 512u        /* hotness counters (power of 2) */
+#endif
+#ifndef MD_TR_HOT_THRESHOLD
+#define MD_TR_HOT_THRESHOLD 2u       /* back-edge / exit hits before translating */
+#endif
 #ifndef MD_TR_LIVE_PAGES
 #define MD_TR_LIVE_PAGES 16u        /* pages tracked byte-exactly (512 B each) */
 #endif
@@ -61,6 +67,8 @@ typedef struct MdTrStats {
     uint32_t live_pages;            /* pages tracked byte-exactly */
     uint32_t live_fallback_pages;   /* pool exhausted: page-granular */
     uint32_t deferred_latches;      /* self-loops with deferred flag writes */
+    uint32_t backedge_exits;        /* interpreter returned at a loop head */
+    uint32_t suppressed;            /* loop heads that cannot be translated */
 } MdTrStats;
 
 typedef struct MdTranslator {
@@ -74,6 +82,11 @@ typedef struct MdTranslator {
     uint32_t epoch;                 /* rt->code_epoch seen at last flush */
     volatile uint32_t remaining;    /* written by the common exit */
     uint32_t inline_dispatch;       /* RET looks up blocks in generated code */
+    /* 0 = tiered (default): cold code runs in the threaded interpreter and
+       a block is translated once its start is hot. 1 = translate every
+       block on first sight (differential testing). */
+    uint32_t eager;
+    uint8_t heat[MD_TR_HEAT_SLOTS];
     MdTrBlock blocks[MD_TR_SLOTS];
     /* M25 byte-exact SMC tracking: rt->cpu.tr_live_bits points here. */
     uint8_t *live_table[MD_X86_CODE_PAGE_COUNT];
@@ -90,7 +103,10 @@ int md_tr_init(MdTranslator *tr, MdRuntime *rt, uint8_t *arena, uint32_t arena_s
 void md_tr_flush(MdTranslator *tr);
 
 /* Run up to `budget` guest instructions, mixing translated execution and
-   md_interp_step(). Same observable result as md_interp_run(rt, budget). */
+   the canonical interpreter. Same observable result as md_interp_run(rt,
+   budget). Tiering needs the interpreter's back-edge exit
+   (MICRODOS_ENABLE_BACKEDGE_EXIT or Native v2); without it the translator
+   behaves as eager and steps untranslatable instructions one at a time. */
 MdStopReason md_tr_run(MdTranslator *tr, uint64_t budget);
 
 #ifdef __cplusplus

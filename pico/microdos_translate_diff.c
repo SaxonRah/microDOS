@@ -113,7 +113,7 @@ static int run_bench(const Bench *bench)
     md_runtime_init(&ri, g_mem_a, &hooks);
     md_runtime_load_com(&ri, bench->code, bench->size, 0x1000u);
     t0 = time_us_64();
-    (void)md_interp_run(&ri, MD_TD_BENCH_INSNS);
+    (void)td_ref_run(&ri, MD_TD_BENCH_INSNS);
     t_interp = time_us_64() - t0;
 
     memset(g_mem_b, 0, MD_X86_ADDRESS_SPACE);
@@ -160,12 +160,15 @@ static int run_all(void)
         return 0;
     }
 
+    /* eager: every block translated (coverage); tiered: firmware behaviour */
+    g_td_eager = 1;
     fails += md_translate_directed(g_mem_a, g_mem_b, 0, g_arena, MD_TD_ARENA_BYTES);
-    stdio_flush();
-    fails += md_translate_directed(g_mem_a, g_mem_b, 1, g_arena, MD_TD_ARENA_BYTES);
     stdio_flush();
     fails += md_translate_diff_run(MD_TD_CASES, 0x4D32355Bu, 0, -1, g_mem_a, g_mem_b,
                                    g_arena, MD_TD_ARENA_BYTES);
+    stdio_flush();
+    g_td_eager = 0;
+    fails += md_translate_directed(g_mem_a, g_mem_b, 1, g_arena, MD_TD_ARENA_BYTES);
     stdio_flush();
     fails += md_translate_diff_run(MD_TD_CASES, 0x0BADF00Du, 1, -1, g_mem_a, g_mem_b,
                                    g_arena, MD_TD_ARENA_BYTES);
