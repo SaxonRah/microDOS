@@ -1,9 +1,0 @@
-{
-  "base_head": "773c6ac9102bfe4b6f42cb81b6f1fca602aee793",
-  "created": "20261006-062019",
-  "files": [
-    "src/runtime/translate.c",
-    "tests/test_translate_diff.c",
-    "pico/CMakeLists.txt"
-  ]
-}

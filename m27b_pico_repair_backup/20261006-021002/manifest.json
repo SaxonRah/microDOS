@@ -1,8 +1,0 @@
-{
-  "version": "M27b-profile-v3-pico-repair",
-  "source_m27a_backup": "C:\\microDOS\\m27b_backup\\20261006-014634",
-  "path": "pico/microdos_pico.c",
-  "broken": "2c11f980d6755f80a2124d3bfd73a8cfa6393afa265ce1656b4e9c1d526ceb3a",
-  "m27a_base": "14a57e2a8dd05ff4e3f7136ee52d66ebc4418773a8f219a5132d64f011a1dd64",
-  "fixed": "c302fcfa7e767bffeacaba6c33577be79adf8f6083be4749826564ec03ab4a36"
-}
