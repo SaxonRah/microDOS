@@ -92,11 +92,15 @@ typedef struct MdTrEa {
 
 enum {
     K_ALU = 1, K_INC, K_DEC, K_MOV, K_LEA, K_XCHG, K_CBW, K_CWD, K_NOP,
-    K_PUSH, K_POP, K_JCC, K_JMP, K_LOOP, K_JCXZ, K_CALL, K_RET
+    K_PUSH, K_POP, K_STEP, K_JCC, K_JMP, K_LOOP, K_JCXZ, K_CALL, K_RET
 };
 
 /* lazy classes */
-enum { CL_NONE = 0, CL_ADD, CL_SUB, CL_LOGIC, CL_INC, CL_DEC };
+enum { CL_NONE = 0, CL_ADD, CL_SUB, CL_LOGIC, CL_INC, CL_DEC, CL_STEP };
+
+#ifndef MD_TR_MAX_STEPS
+#define MD_TR_MAX_STEPS 8u      /* in-block interpreter steps per block */
+#endif
 
 /* carry source for INC/DEC lazy writes */
 enum { CS_NONE = 0, CS_INCOMING };
@@ -164,6 +168,21 @@ static uint32_t md_tr_h_store16(MdRuntime *rt, uint32_t seg, uint32_t off, uint3
 static uint32_t md_tr_h_cond(MdRuntime *rt, uint32_t cc)
 {
     return md_x86_condition(&rt->cpu, cc) ? 1u : 0u;
+}
+
+/* In-block step: executes one non-lowered, non-control-flow instruction
+   with the canonical interpreter. The block's guard already counted it, so
+   the interpreter's own count is undone. Returns nonzero if translated
+   execution must stop here: a stop, CS:IP not at the next instruction (e.g.
+   INT 0 from DIV), or a write that may have modified translated code. */
+static uint32_t md_tr_h_step(MdRuntime *rt, uint32_t next_ip)
+{
+    const uint16_t cs = rt->cpu.cs;
+    const uint32_t e = MD_TR_WRITE_EPOCH(rt);
+    (void)md_interp_step(rt);
+    rt->instructions -= 1u;
+    return (rt->stop_reason != MD_STOP_NONE || rt->cpu.cs != cs ||
+            rt->cpu.ip != (uint16_t)next_ip || MD_TR_WRITE_EPOCH(rt) != e) ? 1u : 0u;
 }
 
 static void md_tr_h_capture_cf(MdRuntime *rt)
@@ -681,6 +700,30 @@ static void em_op(MdTrCtx *c, unsigned i)
             t2_dp_imm(b, T2_ADD, 0u, kG[MD_X86_SP], kG[MD_X86_SP], 2u);
             t2_mov(b, kG[op->dst.reg], T2_R0);
             break;
+        case K_STEP: {
+            uint32_t j_ok;
+            unsigned r;
+            for (r = 0u; r < 8u; ++r) t2_ldst(b, T2_STRH_I, kG[r], RCPU, OFF_R(r));
+            t2_movw(b, T2_R1, op->ip);
+            t2_ldst(b, T2_STRH_I, T2_R1, RCPU, OFF_IP);
+            t2_mov(b, T2_R0, RCPU);
+            t2_movw(b, T2_R1, op->next_ip);
+            em_call(c, (const void *)md_tr_h_step);
+            for (r = 0u; r < 8u; ++r) t2_ldst(b, T2_LDRH_I, kG[r], RCPU, OFF_R(r));
+            t2_dp_imm(b, T2_SUB, 1u, T2_PC, T2_R0, 0u);
+            j_ok = t2_b_fwd(b);
+            /* leave at whatever CS:IP the interpreter produced */
+            t2_ldst(b, T2_LDRH_I, T2_R1, RCPU, OFF_IP);
+            if (c->n - k != 0u) {
+                t2_ldst(b, T2_LDR_I, T2_R2, T2_SP, 0u);
+                t2_addw(b, T2_R2, T2_R2, c->n - k);
+                t2_ldst(b, T2_STR_I, T2_R2, T2_SP, 0u);
+            }
+            t2_mov32(b, T2_R0, (uint32_t)MD_TR_EXIT_STORE << 24);
+            t2_b_to(b, c->tr->exit_off);
+            t2_patch_bcc(b, j_ok, T2_EQ, t2_here(b));
+            break;
+        }
         case K_JCC: {
             int cond = -1;
             if (op->fused) cond = fuse_cond(c->ops[i - 1u].cls, op->cc);
@@ -991,6 +1034,8 @@ static void md_tr_analyze(MdTrCtx *c)
     unsigned i;
     for (i = 0u; i < c->n; ++i) {
         MdTrOp *op = &c->ops[i];
+        /* an in-block step may read any flag: pending lazy state goes first */
+        if (op->kind == K_STEP && p >= 0) c->ops[p].emit_lazy = 1u;
         if (op->cls != CL_NONE) p = (int)i;
         if (c->track && md_tr_writes_memory(op) && p >= 0) c->ops[p].emit_lazy = 1u;
         if (op->kind == K_JCC) {
@@ -1019,6 +1064,7 @@ static void md_tr_analyze_carry(MdTrCtx *c)
         for (j = (int)i - 1; j >= 0; --j) {
             MdTrOp *q = &c->ops[j];
             if (q->cls == CL_NONE) continue;
+            if (q->cls == CL_STEP) { op->carry_src = CS_INCOMING; break; }   /* state in memory */
             if (q->cls == CL_INC || q->cls == CL_DEC) {
                 if (q->emit_lazy) { op->carry_src = CS_NONE; break; }
                 continue;
@@ -1048,10 +1094,11 @@ static void md_tr_analyze_defer(MdTrCtx *c)
     last = &c->ops[c->n - 1u];
     p = &c->ops[c->n - 2u];
     if (last->kind != K_JCC || !last->fused || last->target != c->ip0) return;
-    if (p->cls == CL_NONE || p->dst.kind == OPK_MEM || p->emit_carry) return;
+    if (p->cls == CL_NONE || p->cls == CL_STEP || p->dst.kind == OPK_MEM || p->emit_carry) return;
     if ((p->kind == K_INC || p->kind == K_DEC) && p->dst.kind != OPK_R16) return;
     for (i = 0u; i + 1u < c->n; ++i) {
         const MdTrOp *op = &c->ops[i];
+        if (op->kind == K_STEP) return;              /* reads incoming flags */
         if (op->cls != CL_NONE) {
             if (op != p && (op->kind == K_INC || op->kind == K_DEC) &&
                 op->emit_lazy && op->carry_src == CS_INCOMING) return;
@@ -1227,7 +1274,7 @@ static int md_tr_translate(MdTranslator *tr, MdTrBlock *blk, uint16_t cs, uint16
     uint8_t win[112];
     size_t wlen = sizeof(win), i;
     uint16_t cur = ip;
-    unsigned s;
+    unsigned s, steps = 0u, natives = 0u;
 
     c->n = 0u;
     c->nstubs = 0u;
@@ -1260,12 +1307,31 @@ static int md_tr_translate(MdTranslator *tr, MdTrBlock *blk, uint16_t cs, uint16
         p1 = md_x86_code_page(md_x86_linear(cs, (uint16_t)(in.next_ip - 1u)));
         if (!md_tr_add_page(c->page, &c->page_count, p0) ||
             !md_tr_add_page(c->page, &c->page_count, p1)) break;
-        if (!md_tr_parse(win + at, wlen - at, &in, op)) break;
+        if (!md_tr_parse(win + at, wlen - at, &in, op)) {
+            /* never reject: run it in place with the interpreter if it is
+               ordinary straight-line code */
+            const uint8_t o = in.opcode;
+            if (in.flow != MD_DECODE_FLOW_FALLTHROUGH || in.far_control || steps >= MD_TR_MAX_STEPS ||
+                o == 0xCCu || o == 0xCDu || o == 0xCEu || o == 0xCFu || o == 0xF4u || o == 0x0Fu ||
+                (o == 0x8Eu && in.has_modrm && ((in.modrm >> 3) & 7u) == 1u)) break;
+            memset(op, 0, sizeof(*op));
+            op->kind = K_STEP;
+            op->cls = CL_STEP;
+            op->ip = in.ip;
+            op->next_ip = in.next_ip;
+            ++steps;
+        } else {
+            ++natives;
+        }
         ++c->n;
         cur = in.next_ip;
         if (md_tr_is_terminator(op->kind)) break;
     }
     c->end_ip = cur;
+
+    /* a block of nothing but interpreter steps is slower than the interpreter */
+    if (natives == 0u) c->n = 0u;
+    tr->stats.step_ops += steps;
 
     if (c->n == 0u) {
         const unsigned page = md_x86_code_page(md_x86_linear(cs, ip));

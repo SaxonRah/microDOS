@@ -67,6 +67,7 @@ typedef struct MdTrStats {
     uint32_t live_pages;            /* pages tracked byte-exactly */
     uint32_t live_fallback_pages;   /* pool exhausted: page-granular */
     uint32_t deferred_latches;      /* self-loops with deferred flag writes */
+    uint32_t step_ops;              /* in-block interpreter steps translated */
     uint32_t backedge_exits;        /* interpreter returned at a loop head */
     uint32_t suppressed;            /* loop heads that cannot be translated */
 } MdTrStats;

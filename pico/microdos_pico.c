@@ -558,6 +558,8 @@ static void md_stats(uint64_t start_us)
                (unsigned long)t->exit_edge, (unsigned long)t->exit_dynamic, (unsigned long)t->exit_budget,
                (unsigned long)t->exit_invalid, (unsigned long)t->exit_store, (unsigned long)t->live_pages,
                (unsigned long)t->live_fallback_pages, (unsigned long)t->deferred_latches);
+        md_say("[m25] tiering backedge-exits=%lu suppressed=%lu in-block-steps=%lu\n",
+               (unsigned long)t->backedge_exits, (unsigned long)t->suppressed, (unsigned long)t->step_ops);
     }
 #endif
 #if MICRODOS_PICO_NATIVE_V2

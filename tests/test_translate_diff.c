@@ -42,6 +42,11 @@ static MdStopReason td_ref_run(MdRuntime *r, uint64_t budget)
 {
     const uint64_t start = r->instructions;
     MdStopReason st;
+#if MD_INTERP_BACKEDGE_EXIT
+    /* saturate the suppression filter: no back-edge exits at all */
+    r->native_v2_suppress_bloom[0] = 0xFFFFFFFFu;
+    r->native_v2_suppress_bloom[1] = 0xFFFFFFFFu;
+#endif
     for (;;) {
         st = md_interp_run(r, budget - (r->instructions - start));
         if (st != MD_STOP_NONE) return st;
