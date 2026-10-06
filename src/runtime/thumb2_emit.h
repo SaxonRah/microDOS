@@ -259,6 +259,13 @@ static inline void t2_patch_bcc(MdT2Buf *b, uint32_t at, unsigned cond, uint32_t
     t2_put32_at(b, at, h1, h2);
 }
 
+static inline void t2_bl_to(MdT2Buf *b, uint32_t target)
+{
+    uint32_t h1, h2;
+    t2_enc_b(b->at, target, 1, &h1, &h2);
+    t2_h32(b, h1, h2);
+}
+
 static inline void t2_blx(MdT2Buf *b, unsigned rm) { t2_h16(b, 0x4780u | (rm << 3)); }
 static inline void t2_bx(MdT2Buf *b, unsigned rm) { t2_h16(b, 0x4700u | (rm << 3)); }
 

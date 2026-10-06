@@ -324,8 +324,13 @@ static void md_perf_snapshot(PicoPerf *p)
     p->jit_native_instructions = g_sys.jit_native_instructions;
     p->jit_fallback_instructions = g_sys.jit_fallback_instructions;
 #if MICRODOS_PICO_M25
-    /* reported in the native-v2 column so existing log parsers keep working */
-    p->native_v2_instructions = g_tr.stats.native_instructions;
+    /* reported in the native-v2 column so existing log parsers keep working
+       (M25 translated + Native v2 loops when both are enabled) */
+    p->native_v2_instructions = g_tr.stats.native_instructions
+#if MICRODOS_PICO_NATIVE_V2
+        + g_sys.native_v2_instructions
+#endif
+        ;
 #elif MICRODOS_PICO_NATIVE_V2
     p->native_v2_instructions = g_sys.native_v2_instructions;
 #else
@@ -558,8 +563,38 @@ static void md_stats(uint64_t start_us)
                (unsigned long)t->exit_edge, (unsigned long)t->exit_dynamic, (unsigned long)t->exit_budget,
                (unsigned long)t->exit_invalid, (unsigned long)t->exit_store, (unsigned long)t->live_pages,
                (unsigned long)t->live_fallback_pages, (unsigned long)t->deferred_latches);
-        md_say("[m25] tiering backedge-exits=%lu suppressed=%lu in-block-steps=%lu\n",
-               (unsigned long)t->backedge_exits, (unsigned long)t->suppressed, (unsigned long)t->step_ops);
+        md_say("[m25] tiering backedge-exits=%lu suppressed=%lu in-block-steps=%lu  bytes/block=%lu  unguarded-chains=%lu\n",
+               (unsigned long)t->backedge_exits, (unsigned long)t->suppressed, (unsigned long)t->step_ops,
+               (unsigned long)(t->translations ? t->code_bytes / t->translations : 0u),
+               (unsigned long)t->chains_unguarded);
+        md_say("[m25] steps executed=%lu rep=%lu helper-calls=%lu   loop-hook runs=%lu instr=%llu\n",
+               (unsigned long)t->step_execs, (unsigned long)t->step_rep, (unsigned long)t->helper_calls,
+               (unsigned long)t->hook_runs, (unsigned long long)t->hook_instructions);
+        {
+            const double tot = t->cyc_total ? (double)t->cyc_total : 1.0;
+            md_say("[m25] cycles: total %.3f s  native %.1f%% (of which steps %.1f%%)  interp %.1f%%  translate %.1f%%  dispatch/other %.1f%%\n",
+                   (double)t->cyc_total / (double)clock_get_hz(clk_sys),
+                   100.0 * (double)t->cyc_native / tot, 100.0 * (double)t->cyc_step / tot,
+                   100.0 * (double)t->cyc_interp / tot, 100.0 * (double)t->cyc_translate / tot,
+                   100.0 * (double)(t->cyc_total - t->cyc_native - t->cyc_interp - t->cyc_translate) / tot);
+        }
+        {
+            /* top stepped opcodes by executions: the next lowering targets */
+            uint8_t taken[256];
+            unsigned k, i, best;
+            memset(taken, 0, sizeof(taken));
+            md_say("[m25] top steps:");
+            for (k = 0u; k < 10u; ++k) {
+                best = 256u;
+                for (i = 0u; i < 256u; ++i)
+                    if (!taken[i] && g_tr.step_hist[i] != 0u &&
+                        (best == 256u || g_tr.step_hist[i] > g_tr.step_hist[best])) best = i;
+                if (best == 256u) break;
+                taken[best] = 1u;
+                md_say(" %02X:%lu", best, (unsigned long)g_tr.step_hist[best]);
+            }
+            md_say("\n");
+        }
     }
 #endif
 #if MICRODOS_PICO_NATIVE_V2

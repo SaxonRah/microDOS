@@ -46,7 +46,7 @@ typedef struct MdBlockCache MdBlockCache;
 #endif
 /* M25 tiering also exits at every taken backward short Jcc and JMP (loops
    closed by JB/JL/JMP). Native v2 keeps its original JNZ/LOOP-only set. */
-#if defined(MICRODOS_ENABLE_BACKEDGE_EXIT) && !defined(MICRODOS_ENABLE_NATIVE_V2)
+#if defined(MICRODOS_ENABLE_BACKEDGE_EXIT)
 #define MD_INTERP_BACKEDGE_ALL 1
 #else
 #define MD_INTERP_BACKEDGE_ALL 0

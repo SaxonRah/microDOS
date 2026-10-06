@@ -184,12 +184,28 @@ static const MdAotProgram *md_aot_here(MdDos2System *sys)
 
 #endif
 
+#if MICRODOS_SYSTEM_ENABLE_TRANSLATOR && defined(MICRODOS_ENABLE_NATIVE_V2)
+/* M25 F: Native v2 gets each loop head first; M25 runs what it rejects. */
+static int md_dos2_nv2_loop_hook(void *user, MdRuntime *rt, uint64_t budget)
+{
+    MdDos2System *sys = (MdDos2System *)user;
+    MdNativeV2RunResult result;
+    if (!md_native_v2_runtime_try_execute(&sys->native_v2, rt, budget, &result)) return 0;
+    sys->native_v2_instructions += result.retired;
+    return 1;
+}
+#endif
+
 MdStopReason md_dos2_system_run(MdDos2System *sys, uint64_t budget)
 {
     MdRuntime *rt = &sys->runtime;
 
 #if MICRODOS_SYSTEM_ENABLE_TRANSLATOR
     if (sys->translator != NULL) {
+#ifdef MICRODOS_ENABLE_NATIVE_V2
+        sys->translator->loop_hook = md_dos2_nv2_loop_hook;
+        sys->translator->loop_user = sys;
+#endif
         /* Same contract as md_interp_run(): exact budget, same stop reasons. */
         const MdStopReason st = md_tr_run(sys->translator, budget);
         if (st == MD_STOP_BUDGET) {

@@ -34,7 +34,7 @@ extern "C" {
 #define MD_TR_HEAT_SLOTS 512u        /* hotness counters (power of 2) */
 #endif
 #ifndef MD_TR_HOT_THRESHOLD
-#define MD_TR_HOT_THRESHOLD 2u       /* back-edge / exit hits before translating */
+#define MD_TR_HOT_THRESHOLD 16u      /* heat before translating: back-edge +4, edge +1 */
 #endif
 #ifndef MD_TR_LIVE_PAGES
 #define MD_TR_LIVE_PAGES 16u        /* pages tracked byte-exactly (512 B each) */
@@ -69,6 +69,13 @@ typedef struct MdTrStats {
     uint32_t deferred_latches;      /* self-loops with deferred flag writes */
     uint32_t step_ops;              /* in-block interpreter steps translated */
     uint32_t backedge_exits;        /* interpreter returned at a loop head */
+    uint32_t step_execs;            /* A: in-block steps executed */
+    uint32_t step_rep;              /* A: ... of which REP/REPNE-prefixed */
+    uint32_t helper_calls;          /* C: ADC/SBB/NEG/shift helper calls */
+    uint32_t chains_unguarded;      /* E: chains that skip the page check */
+    uint32_t hook_runs;             /* F: loops run by the loop hook */
+    uint64_t hook_instructions;
+    uint64_t cyc_translate, cyc_native, cyc_interp, cyc_step, cyc_total;   /* A */
     uint32_t suppressed;            /* loop heads that cannot be translated */
 } MdTrStats;
 
@@ -87,6 +94,12 @@ typedef struct MdTranslator {
        a block is translated once its start is hot. 1 = translate every
        block on first sight (differential testing). */
     uint32_t eager;
+    uint32_t step_off;              /* B: shared in-block step thunk */
+    /* F: optional loop engine tried first at loop heads (Native v2). Returns
+       nonzero if it ran guest code (rt->instructions advanced). */
+    int (*loop_hook)(void *user, MdRuntime *rt, uint64_t budget);
+    void *loop_user;
+    uint32_t step_hist[256];        /* A: stepped opcodes, executions */
     uint8_t heat[MD_TR_HEAT_SLOTS];
     MdTrBlock blocks[MD_TR_SLOTS];
     /* M25 byte-exact SMC tracking: rt->cpu.tr_live_bits points here. */

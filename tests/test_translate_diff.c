@@ -92,7 +92,49 @@ static void modrm_any(Prog *p, unsigned reg)
 
 static void gen_insn(Prog *p, unsigned code_len_hint)
 {
-    const unsigned t = rn(40u);
+    const unsigned t = rn(62u);
+    if (t >= 40u) {
+        switch (t) {
+            case 40: case 41: {                         /* string ops, DF both ways */
+                if (rn(3u) == 0u) put(p, 0xFCu + rn(2u));
+                if (rn(4u) == 0u) put(p, 0x26u + 8u * rn(4u));
+                if (rn(6u) == 0u) { put(p, 0xB9u); put(p, rn(6u)); put(p, 0x00); put(p, 0xF3u); }
+                { static const uint8_t so[6] = { 0xA4, 0xA5, 0xAA, 0xAB, 0xAC, 0xAD }; put(p, so[rn(6u)]); }
+                break;
+            }
+            case 42: put(p, 0x06u + 8u * rn(4u)); break;          /* PUSH sreg */
+            case 43: put(p, rn(2u) ? 0x07u : 0x1Fu); break;       /* POP ES/DS */
+            case 44: put(p, 0x8Cu); modrm_any(p, rn(4u)); break;   /* MOV r/m,sreg */
+            case 45: put(p, 0x8Eu); modrm_any(p, rn(2u) ? 0u : 3u); break;   /* MOV ES/DS,r/m */
+            case 46: put(p, 0x86u + rn(2u)); modrm_any(p, rn(8u)); break;    /* XCHG */
+            case 47: case 48: {                         /* F6/F7: TEST/NOT/NEG/MUL/IMUL/DIV/IDIV */
+                const unsigned w = rn(2u), ext = rn(8u);
+                put(p, 0xF6u + w); modrm_any(p, ext);
+                if (ext <= 1u) { put(p, rn(256)); if (w) put(p, rn(256)); }
+                break;
+            }
+            case 49: case 50: put(p, 0xD0u + rn(4u)); modrm_any(p, rn(8u)); break;   /* shifts */
+            case 51: put(p, 0xE0u + rn(2u)); put(p, (uint8_t)(-(int)rn(16u))); break; /* LOOPNZ/Z */
+            case 52: put(p, 0xCDu); put(p, rn(8u)); break;        /* INT n */
+            case 53: put(p, 0xCFu); break;                        /* IRET */
+            case 54: put(p, rn(2u) ? 0xCCu : 0xCEu); break;       /* INT3 / INTO */
+            case 55: put(p, 0xFFu); put(p, 0xC0u | ((rn(2u) ? 4u : 2u) << 3) | rn(8u)); break; /* JMP/CALL r16 */
+            case 56: put(p, 0xEAu); put(p, rn(code_len_hint)); put(p, 0x01); put(p, 0x00); put(p, 0x10); break; /* JMP far */
+            case 57: put(p, 0x9Au); put(p, rn(code_len_hint)); put(p, 0x01); put(p, 0x00); put(p, 0x10); break; /* CALL far */
+            case 58: put(p, rn(2u) ? 0xCBu : 0xCAu); if (p->b[p->n - 1u] == 0xCAu) { put(p, rn(8u)); put(p, 0); } break;
+            case 59: put(p, 0xFCu + rn(2u)); break;               /* CLD/STD */
+            case 60: put(p, 0x16u); break;                        /* PUSH SS */
+            default: put(p, 0xF5u); break;
+        }
+        return;
+    }
+    switch (t) {
+    case 999: break;
+    }
+    {
+    const unsigned t2 = t;
+    (void)t2;
+    }
     switch (t) {
         case 0: case 1: case 2: case 3:            /* ALU r/m,r both widths/dirs */
             put(p, (rn(8u) << 3) | rn(4u)); modrm_any(p, rn(8u)); break;
@@ -145,6 +187,12 @@ static void setup(MdRuntime *rt, const Prog *p, const uint16_t *regs, uint16_t f
 {
     unsigned i;
     md_runtime_load_com(rt, p->b, p->n, 0x1000u);
+    for (i = 0; i < 256u; ++i) {                 /* vectors land inside the program */
+        rt->cpu.memory[4u * i] = (uint8_t)(0x00u + (i * 7u) % 0x90u);
+        rt->cpu.memory[4u * i + 1u] = 0x01u;
+        rt->cpu.memory[4u * i + 2u] = 0x00u;
+        rt->cpu.memory[4u * i + 3u] = 0x10u;
+    }
     for (i = 0; i < 8; ++i) rt->cpu.r[i] = regs[i];
     md_x86_set_flags(&rt->cpu, flags);
     for (i = 0; i < 0x1000u; ++i) rt->cpu.memory[0x13000u + i] = data[i];
@@ -262,6 +310,11 @@ static unsigned md_translate_diff_run(unsigned cases, uint32_t seed, int unalign
             td_init(&T, &B, arena, arena_size);
             (void)td_ref_run(&A, hi); (void)md_tr_run(&T, hi);
             d = (unsigned)compare(&A, &B);
+            printf("  prog:");
+            for (i = 0; i < 24u && i < p.n; ++i) printf(" %02X", p.b[i]);
+            printf("\n  A: %04X:%04X es=%04X ds=%04X ss=%04X sp=%04X  B: %04X:%04X es=%04X ds=%04X ss=%04X sp=%04X\n",
+                   A.cpu.cs, A.cpu.ip, A.cpu.es, A.cpu.ds, A.cpu.ss, A.cpu.r[4],
+                   B.cpu.cs, B.cpu.ip, B.cpu.es, B.cpu.ds, B.cpu.ss, B.cpu.r[4]);
             {
                 unsigned s2;
                 printf("  B stats: native=%llu interp=%llu translations=%u invalid=%u store=%u chains=%u\n",

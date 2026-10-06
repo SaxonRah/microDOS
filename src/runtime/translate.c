@@ -53,6 +53,7 @@ static const uint8_t kG[8] = { 4u, 5u, 6u, 7u, 8u, 9u, 10u, 11u };
 #define OFF_R(i)   ((uint32_t)(offsetof(MdRuntime, cpu) + offsetof(MdX86, r) + 2u * (i)))
 #define OFF_IP     ((uint32_t)(offsetof(MdRuntime, cpu) + offsetof(MdX86, ip)))
 #define OFF_LOP    ((uint32_t)(offsetof(MdRuntime, cpu) + offsetof(MdX86, lazy_op)))
+#define OFF_FLAGS  ((uint32_t)(offsetof(MdRuntime, cpu) + offsetof(MdX86, flags_raw)))
 #define OFF_LCARRY ((uint32_t)(offsetof(MdRuntime, cpu) + offsetof(MdX86, lazy_carry)))
 #define OFF_LA     ((uint32_t)(offsetof(MdRuntime, cpu) + offsetof(MdX86, lazy_a)))
 #define OFF_LB     ((uint32_t)(offsetof(MdRuntime, cpu) + offsetof(MdX86, lazy_b)))
@@ -61,6 +62,20 @@ static const uint8_t kG[8] = { 4u, 5u, 6u, 7u, 8u, 9u, 10u, 11u };
 #define OFF_GEN    ((uint32_t)offsetof(MdRuntime, code_page_generation))
 #define OFF_EXEC   ((uint32_t)offsetof(MdRuntime, code_page_executable))
 #endif
+
+/* A: cycle accounting. Cortex-M (RP2350): DWT CYCCNT. Elsewhere: zero. */
+#if defined(__ARM_ARCH_PROFILE) && (__ARM_ARCH_PROFILE == 'M')
+#define MD_TR_CYC() (*(volatile uint32_t *)0xE0001004u)
+static void md_tr_cyc_enable(void)
+{
+    *(volatile uint32_t *)0xE000EDFCu |= (1u << 24);   /* DEMCR.TRCENA */
+    *(volatile uint32_t *)0xE0001000u |= 1u;           /* DWT_CTRL.CYCCNTENA */
+}
+#else
+#define MD_TR_CYC() 0u
+static void md_tr_cyc_enable(void) {}
+#endif
+static MdTranslator *g_md_tr_stats;   /* helpers account into this translator */
 
 static uint32_t md_tr_seg_off(unsigned seg)   /* 0 ES, 1 CS, 2 SS, 3 DS */
 {
@@ -92,7 +107,9 @@ typedef struct MdTrEa {
 
 enum {
     K_ALU = 1, K_INC, K_DEC, K_MOV, K_LEA, K_XCHG, K_CBW, K_CWD, K_NOP,
-    K_PUSH, K_POP, K_STEP, K_JCC, K_JMP, K_LOOP, K_JCXZ, K_CALL, K_RET
+    K_PUSH, K_POP, K_STEP, K_HALU, K_SHIFT, K_NOT, K_LODS, K_STOS, K_MOVS,
+    K_PUSHS, K_POPS, K_MOVFS, K_MOVTS, K_SETDF, K_XCHGRR,
+    K_JCC, K_JMP, K_LOOP, K_JCXZ, K_CALL, K_RET, K_LOOPZ, K_CSTEP
 };
 
 /* lazy classes */
@@ -109,6 +126,7 @@ typedef struct MdTrOp {
     uint16_t ip, next_ip, target, imm;
     uint8_t kind, width, alu, nowrite;
     uint8_t cls, emit_lazy, fused, carry_src, carry_width, emit_carry, cc, defer_lazy;
+    uint8_t sreg, neg, count_cl, srcseg;
     MdTrOperand dst, src;
     MdTrEa ea;
 } MdTrOp;
@@ -177,12 +195,46 @@ static uint32_t md_tr_h_cond(MdRuntime *rt, uint32_t cc)
    INT 0 from DIV), or a write that may have modified translated code. */
 static uint32_t md_tr_h_step(MdRuntime *rt, uint32_t next_ip)
 {
+    const uint32_t c0 = MD_TR_CYC();
     const uint16_t cs = rt->cpu.cs;
     const uint32_t e = MD_TR_WRITE_EPOCH(rt);
+    uint32_t stop;
+    if (g_md_tr_stats != NULL) {
+        /* A: dynamic histogram of what still runs through the interpreter */
+        uint16_t ip = rt->cpu.ip;
+        uint8_t o = md_x86_read8(&rt->cpu, cs, ip);
+        unsigned k;
+        int rep = 0;
+        for (k = 0u; k < 4u && ((o & 0xE7u) == 0x26u || o == 0xF0u || o == 0xF2u || o == 0xF3u); ++k) {
+            if (o == 0xF2u || o == 0xF3u) rep = 1;
+            o = md_x86_read8(&rt->cpu, cs, (uint16_t)(ip + k + 1u));
+        }
+        ++g_md_tr_stats->step_hist[o];
+        if (rep) ++g_md_tr_stats->stats.step_rep;
+        ++g_md_tr_stats->stats.step_execs;
+    }
     (void)md_interp_step(rt);
     rt->instructions -= 1u;
-    return (rt->stop_reason != MD_STOP_NONE || rt->cpu.cs != cs ||
-            rt->cpu.ip != (uint16_t)next_ip || MD_TR_WRITE_EPOCH(rt) != e) ? 1u : 0u;
+    stop = rt->stop_reason != MD_STOP_NONE || MD_TR_WRITE_EPOCH(rt) != e;
+    if (next_ip <= 0xFFFFu)               /* straight-line step: must fall through */
+        stop |= rt->cpu.cs != cs || rt->cpu.ip != (uint16_t)next_ip;
+    if (g_md_tr_stats != NULL) g_md_tr_stats->stats.cyc_step += (uint32_t)(MD_TR_CYC() - c0);
+    return stop ? 1u : 0u;
+}
+
+/* C: fast helpers with exact ops.h semantics (lazy flags in memory). */
+static uint32_t md_tr_h_alu(MdRuntime *rt, uint32_t opw, uint32_t a, uint32_t b)
+{
+    if (g_md_tr_stats != NULL) ++g_md_tr_stats->stats.helper_calls;
+    return (opw >> 8) == 16u ? md_x86_alu16(&rt->cpu, opw & 7u, (uint16_t)a, (uint16_t)b)
+                             : md_x86_alu8(&rt->cpu, opw & 7u, (uint8_t)a, (uint8_t)b);
+}
+
+static uint32_t md_tr_h_shift(MdRuntime *rt, uint32_t opw, uint32_t v, uint32_t count)
+{
+    if (g_md_tr_stats != NULL) ++g_md_tr_stats->stats.helper_calls;
+    return (opw >> 8) == 16u ? md_x86_shift16(&rt->cpu, opw & 7u, (uint16_t)v, count & 0xFFu)
+                             : md_x86_shift8(&rt->cpu, opw & 7u, (uint8_t)v, count & 0xFFu);
 }
 
 static void md_tr_h_capture_cf(MdRuntime *rt)
@@ -309,8 +361,21 @@ static void em_load(MdTrCtx *c, const MdTrEa *ea, unsigned width, unsigned rd)
 
 /* Store rv (not r2/r3/rtmp) to the EA. op_index identifies the guest
    instruction for the side-exit stub (exit ip = exit_ip). */
+static void em_string_delta(MdTrCtx *c, unsigned width, unsigned which);
+
+static void em_store_ex(MdTrCtx *c, const MdTrEa *ea, unsigned width, unsigned rv,
+                        unsigned rtmp, unsigned k, uint16_t exit_ip, unsigned after_w, unsigned after);
+
 static void em_store(MdTrCtx *c, const MdTrEa *ea, unsigned width, unsigned rv,
                      unsigned rtmp, unsigned k, uint16_t exit_ip)
+{
+    em_store_ex(c, ea, width, rv, rtmp, k, exit_ip, 0u, 0u);
+}
+
+/* after: 0 none, 1 DI += delta, 3 SI and DI += delta (string ops). Runs on
+   both paths before a possible side exit, so the exit state is complete. */
+static void em_store_ex(MdTrCtx *c, const MdTrEa *ea, unsigned width, unsigned rv,
+                        unsigned rtmp, unsigned k, uint16_t exit_ip, unsigned after_w, unsigned after)
 {
     MdT2Buf *b = &c->b;
     const unsigned bits = md_tr_bits();
@@ -345,6 +410,7 @@ static void em_store(MdTrCtx *c, const MdTrEa *ea, unsigned width, unsigned rv,
 #endif
     p = em_hostptr(c, T2_R3, rtmp);
     t2_ldst(b, width == 16u ? T2_STRH_I : T2_STRB_I, rv, p, 0u);
+    if (after) em_string_delta(c, after_w, after);
     j_done = t2_b_fwd(b);
     for (i = 0u; i < ns; ++i) {
         /* first two (16-bit wrap checks) are EQ; page checks are NE */
@@ -357,6 +423,7 @@ static void em_store(MdTrCtx *c, const MdTrEa *ea, unsigned width, unsigned rv,
     t2_mov(b, T2_R0, RCPU);
     t2_ldst(b, T2_LDRH_I, T2_R1, RCPU, md_tr_seg_off(ea->seg));
     em_call(c, width == 16u ? (const void *)md_tr_h_store16 : (const void *)md_tr_h_store8);
+    if (after) em_string_delta(c, after_w, after);
     t2_dp_imm(b, T2_SUB, 1u, T2_PC, T2_R0, 0u);
     em_stub(c, T2_NE, MD_TR_EXIT_STORE, exit_ip, c->n - k);
     t2_patch_b(b, j_done, t2_here(b));
@@ -621,7 +688,14 @@ static void em_deferred_lazy(MdTrCtx *c, const MdTrOp *p)
    generated code, exactly as md_tr_hash()/md_tr_lookup() would, and jump
    to the target's guard (which re-checks generations and the budget).
    On a miss, leave through the dynamic exit; C translates the target. */
+static void em_dispatch_cs(MdTrCtx *c, int dynamic_cs);
+
 static void em_dispatch(MdTrCtx *c)
+{
+    em_dispatch_cs(c, 0);
+}
+
+static void em_dispatch_cs(MdTrCtx *c, int dynamic_cs)
 {
     MdT2Buf *b = &c->b;
     MdTranslator *tr = c->tr;
@@ -630,7 +704,8 @@ static void em_dispatch(MdTrCtx *c)
     while ((1u << slot_bits) < MD_TR_SLOTS) ++slot_bits;
 
     if (tr->inline_dispatch) {
-        t2_movw(b, T2_R2, c->cs);                                       /* near RET: same CS */
+        if (dynamic_cs) t2_ldst(b, T2_LDRH_I, T2_R2, RCPU, md_tr_seg_off(1u));
+        else t2_movw(b, T2_R2, c->cs);                                  /* near RET: same CS */
         t2_dp_reg(b, T2_ADD, 0u, T2_R3, T2_R1, T2_R2, T2_LSL, 4u);       /* x = (cs<<4)+ip */
         t2_dp_reg(b, T2_EOR, 0u, T2_R3, T2_R3, T2_R3, T2_LSR, 9u);       /* x ^ (x>>9) */
         t2_ubfx(b, T2_R3, T2_R3, 0u, slot_bits);
@@ -653,6 +728,83 @@ static void em_dispatch(MdTrCtx *c)
     t2_mov32(b, T2_R0, (uint32_t)MD_TR_EXIT_DYNAMIC << 24);
     t2_b_to(b, tr->exit_off);
 }
+
+/* SI/DI += (DF ? -size : +size). Uses r3 only (r0 may hold a helper result). */
+static void em_string_delta(MdTrCtx *c, unsigned width, unsigned which)
+{
+    MdT2Buf *b = &c->b;
+    const unsigned size = width / 8u;
+    t2_ldst(b, T2_LDRH_I, T2_R3, RCPU, OFF_FLAGS);
+    t2_ubfx(b, T2_R3, T2_R3, 10u, 1u);                       /* DF */
+    t2_mov_sh(b, T2_R3, T2_R3, T2_LSL, size == 1u ? 1u : 2u);  /* DF * 2 * size */
+    t2_dp_imm(b, T2_RSB, 0u, T2_R3, T2_R3, size);              /* size - that */
+    if (which & 2u) t2_dp_reg(b, T2_ADD, 0u, kG[6], kG[6], T2_R3, T2_LSL, 0u);
+    if (which & 1u) t2_dp_reg(b, T2_ADD, 0u, kG[7], kG[7], T2_R3, T2_LSL, 0u);
+}
+
+/* B: in-block interpreter step through the shared thunk: r1 = ip,
+   r2 = next ip (0x10000 = control transfer, any CS:IP allowed),
+   r3 = budget add-back if translated execution has to stop here. */
+static void em_step_call(MdTrCtx *c, const MdTrOp *op, unsigned k, int control)
+{
+    MdT2Buf *b = &c->b;
+    t2_movw(b, T2_R1, op->ip);
+    if (control) t2_movi(b, T2_R2, 0x10000u);
+    else t2_movw(b, T2_R2, op->next_ip);
+    t2_movi(b, T2_R3, c->n - k);
+    t2_bl_to(b, c->tr->step_off);
+}
+
+/* Result write-back for helper ops: r0 holds the value. */
+static void em_writeback(MdTrCtx *c, const MdTrOp *op, unsigned k)
+{
+    MdT2Buf *b = &c->b;
+    if (op->dst.kind == OPK_R16) t2_mov(b, kG[op->dst.reg], T2_R0);
+    else if (op->dst.kind == OPK_R8) t2_bfi(b, kG[op->dst.reg & 3u], T2_R0, r8_lsb(op->dst.reg), 8u);
+    else em_store(c, &op->ea, op->width, T2_R0, T2_R1, k, op->next_ip);
+}
+
+/* C: ADC/SBB/NEG through md_x86_alu8/16 (exact lazy flags, CF in). */
+static void em_halu(MdTrCtx *c, const MdTrOp *op, unsigned k)
+{
+    MdT2Buf *b = &c->b;
+    const unsigned w = op->width;
+    unsigned ra, rb;
+    if (op->dst.kind == OPK_MEM) { em_load(c, &op->ea, w, T2_R0); ra = T2_R0; }
+    else ra = em_operand(c, &op->dst, w, T2_R0);
+    if (op->neg) {
+        t2_mov(b, T2_R3, ra);                 /* NEG x = 0 - x */
+        t2_movi(b, T2_R2, 0u);
+    } else {
+        if (op->src.kind == OPK_MEM) { em_load(c, &op->ea, w, T2_R1); rb = T2_R1; }
+        else rb = em_operand(c, &op->src, w, T2_R1);
+        t2_mov(b, T2_R3, rb);
+        t2_mov(b, T2_R2, ra);
+    }
+    t2_movw(b, T2_R1, (w << 8) | op->alu);
+    t2_mov(b, T2_R0, RCPU);
+    em_call(c, (const void *)md_tr_h_alu);
+    em_writeback(c, op, k);
+}
+
+static void em_shift(MdTrCtx *c, const MdTrOp *op, unsigned k)
+{
+    MdT2Buf *b = &c->b;
+    const unsigned w = op->width;
+    unsigned rv;
+    if (op->dst.kind == OPK_MEM) { em_load(c, &op->ea, w, T2_R0); rv = T2_R0; }
+    else rv = em_operand(c, &op->dst, w, T2_R0);
+    t2_mov(b, T2_R2, rv);
+    if (op->count_cl) t2_uxtb(b, T2_R3, kG[1]);
+    else t2_movi(b, T2_R3, 1u);
+    t2_movw(b, T2_R1, (w << 8) | op->alu);
+    t2_mov(b, T2_R0, RCPU);
+    em_call(c, (const void *)md_tr_h_shift);
+    em_writeback(c, op, k);
+}
+
+/* D: indirect transfer with CS from memory (after a control step). */
+static void em_dispatch_cs(MdTrCtx *c, int dynamic_cs);
 
 static void em_ea_sp(MdTrEa *ea)
 {
@@ -700,30 +852,102 @@ static void em_op(MdTrCtx *c, unsigned i)
             t2_dp_imm(b, T2_ADD, 0u, kG[MD_X86_SP], kG[MD_X86_SP], 2u);
             t2_mov(b, kG[op->dst.reg], T2_R0);
             break;
-        case K_STEP: {
-            uint32_t j_ok;
+        case K_STEP:
+            em_step_call(c, op, k, 0);
+            break;
+        case K_HALU: em_halu(c, op, k); break;
+        case K_SHIFT: em_shift(c, op, k); break;
+        case K_NOT: {
+            const unsigned w = op->width;
             unsigned r;
-            for (r = 0u; r < 8u; ++r) t2_ldst(b, T2_STRH_I, kG[r], RCPU, OFF_R(r));
-            t2_movw(b, T2_R1, op->ip);
-            t2_ldst(b, T2_STRH_I, T2_R1, RCPU, OFF_IP);
-            t2_mov(b, T2_R0, RCPU);
-            t2_movw(b, T2_R1, op->next_ip);
-            em_call(c, (const void *)md_tr_h_step);
-            for (r = 0u; r < 8u; ++r) t2_ldst(b, T2_LDRH_I, kG[r], RCPU, OFF_R(r));
-            t2_dp_imm(b, T2_SUB, 1u, T2_PC, T2_R0, 0u);
-            j_ok = t2_b_fwd(b);
-            /* leave at whatever CS:IP the interpreter produced */
-            t2_ldst(b, T2_LDRH_I, T2_R1, RCPU, OFF_IP);
-            if (c->n - k != 0u) {
-                t2_ldst(b, T2_LDR_I, T2_R2, T2_SP, 0u);
-                t2_addw(b, T2_R2, T2_R2, c->n - k);
-                t2_ldst(b, T2_STR_I, T2_R2, T2_SP, 0u);
+            if (op->dst.kind == OPK_R16) {
+                t2_dp_reg(b, T2_ORN, 0u, kG[op->dst.reg], T2_PC, kG[op->dst.reg], T2_LSL, 0u);
+                break;
             }
-            t2_mov32(b, T2_R0, (uint32_t)MD_TR_EXIT_STORE << 24);
-            t2_b_to(b, c->tr->exit_off);
-            t2_patch_bcc(b, j_ok, T2_EQ, t2_here(b));
+            if (op->dst.kind == OPK_MEM) { em_load(c, &op->ea, w, T2_R0); r = T2_R0; }
+            else r = em_operand(c, &op->dst, w, T2_R0);
+            t2_dp_reg(b, T2_ORN, 0u, T2_R0, T2_PC, r, T2_LSL, 0u);
+            em_writeback(c, op, k);
             break;
         }
+        case K_LODS: {
+            MdTrEa ea = { 6u, NOREG, op->srcseg, 0u, 0u };
+            if (op->width == 16u) em_load(c, &ea, 16u, kG[0]);
+            else { em_load(c, &ea, 8u, T2_R0); t2_bfi(b, kG[0], T2_R0, 0u, 8u); }
+            em_string_delta(c, op->width, 2u);
+            break;
+        }
+        case K_STOS: {
+            MdTrEa ea = { 7u, NOREG, 0u, 0u, 0u };
+            unsigned v = kG[0];
+            if (op->width == 8u) { t2_ubfx(b, T2_R0, kG[0], 0u, 8u); v = T2_R0; }
+            em_store_ex(c, &ea, op->width, v, v == T2_R0 ? T2_R1 : T2_R0, k, op->next_ip, op->width, 1u);
+            break;
+        }
+        case K_MOVS: {
+            MdTrEa src = { 6u, NOREG, op->srcseg, 0u, 0u };
+            MdTrEa dst = { 7u, NOREG, 0u, 0u, 0u };
+            em_load(c, &src, op->width, T2_R0);
+            em_store_ex(c, &dst, op->width, T2_R0, T2_R1, k, op->next_ip, op->width, 3u);
+            break;
+        }
+        case K_PUSHS:
+            t2_ldst(b, T2_LDRH_I, T2_R1, RCPU, md_tr_seg_off(op->sreg));
+            t2_dp_imm(b, T2_SUB, 0u, kG[MD_X86_SP], kG[MD_X86_SP], 2u);
+            em_store(c, &sp, 16u, T2_R1, T2_R0, k, op->next_ip);
+            break;
+        case K_POPS:
+            em_load(c, &sp, 16u, T2_R0);
+            t2_dp_imm(b, T2_ADD, 0u, kG[MD_X86_SP], kG[MD_X86_SP], 2u);
+            t2_ldst(b, T2_STRH_I, T2_R0, RCPU, md_tr_seg_off(op->sreg));
+            break;
+        case K_MOVFS:
+            t2_ldst(b, T2_LDRH_I, T2_R0, RCPU, md_tr_seg_off(op->sreg));
+            em_writeback(c, op, k);
+            break;
+        case K_MOVTS:
+            if (op->src.kind == OPK_R16) {
+                t2_ldst(b, T2_STRH_I, kG[op->src.reg], RCPU, md_tr_seg_off(op->sreg));
+            } else {
+                em_load(c, &op->ea, 16u, T2_R0);
+                t2_ldst(b, T2_STRH_I, T2_R0, RCPU, md_tr_seg_off(op->sreg));
+            }
+            break;
+        case K_SETDF:
+            t2_ldst(b, T2_LDRH_I, T2_R0, RCPU, OFF_FLAGS);
+            t2_dp_imm(b, op->alu ? T2_ORR : T2_BIC, 0u, T2_R0, T2_R0, 0x400u);
+            t2_ldst(b, T2_STRH_I, T2_R0, RCPU, OFF_FLAGS);
+            break;
+        case K_XCHGRR:
+            if (op->width == 16u) {
+                t2_mov(b, T2_R0, kG[op->dst.reg]);
+                t2_mov(b, kG[op->dst.reg], kG[op->src.reg]);
+                t2_mov(b, kG[op->src.reg], T2_R0);
+            } else {
+                t2_ubfx(b, T2_R0, kG[op->dst.reg & 3u], r8_lsb(op->dst.reg), 8u);
+                t2_ubfx(b, T2_R1, kG[op->src.reg & 3u], r8_lsb(op->src.reg), 8u);
+                t2_bfi(b, kG[op->dst.reg & 3u], T2_R1, r8_lsb(op->dst.reg), 8u);
+                t2_bfi(b, kG[op->src.reg & 3u], T2_R0, r8_lsb(op->src.reg), 8u);
+            }
+            break;
+        case K_LOOPZ:
+            t2_dp_imm(b, T2_SUB, 0u, kG[1], kG[1], 1u);
+            t2_mov(b, T2_R0, RCPU);
+            t2_movi(b, T2_R1, op->cc);
+            em_call(c, (const void *)md_tr_h_cond);
+            t2_dp_reg(b, T2_ORR, 1u, T2_R1, T2_PC, kG[1], T2_LSL, 16u);   /* Z: CX == 0 */
+            em_stub(c, T2_EQ, MD_TR_EXIT_EDGE, op->next_ip, 0u);
+            t2_dp_imm(b, T2_SUB, 1u, T2_PC, T2_R0, 0u);
+            em_stub(c, T2_NE, MD_TR_EXIT_EDGE, op->target, 0u);
+            em_stub(c, T2_AL, MD_TR_EXIT_EDGE, op->next_ip, 0u);
+            break;
+        case K_CSTEP:
+            /* D: INT/IRET/far or indirect control via the interpreter, then
+               continue at the new CS:IP through the inline block probe */
+            em_step_call(c, op, k, 1);
+            t2_ldst(b, T2_LDRH_I, T2_R1, RCPU, OFF_IP);
+            em_dispatch_cs(c, 1);
+            break;
         case K_JCC: {
             int cond = -1;
             if (op->fused) cond = fuse_cond(c->ops[i - 1u].cls, op->cc);
@@ -841,6 +1065,12 @@ static unsigned alu_class(unsigned alu)
     }
 }
 
+/* ADC/SBB: carried-in CF, so they go through md_x86_alu8/16. */
+static void md_tr_fix_alu(MdTrOp *op)
+{
+    if (op->cls == CL_NONE) { op->kind = K_HALU; op->cls = CL_STEP; }
+}
+
 /* Fills *op from one decoded instruction; returns 0 if not lowered. */
 static int md_tr_parse(const uint8_t *p, size_t avail, const MdDecodedInstruction *in, MdTrOp *op)
 {
@@ -866,7 +1096,7 @@ static int md_tr_parse(const uint8_t *p, size_t avail, const MdDecodedInstructio
     if (opc <= 0x3Bu && (opc & 4u) == 0u) {
         const unsigned alu = (opc >> 3) & 7u, dir = (opc >> 1) & 1u;
         MdTrOperand rmo, rego;
-        if (alu_class(alu) == CL_NONE || left < 1u) return 0;
+        if (left < 1u) return 0;
         w = (opc & 1u) ? 16u : 8u;
         if (!parse_modrm(q, left, seg, &rmo, &op->ea, w, &used)) return 0;
         rego.kind = w == 16u ? OPK_R16 : OPK_R8;
@@ -877,12 +1107,12 @@ static int md_tr_parse(const uint8_t *p, size_t avail, const MdDecodedInstructio
         op->src = dir ? rmo : rego;
         op->nowrite = alu == 7u;
         op->cls = (uint8_t)alu_class(alu);
+        md_tr_fix_alu(op);
         return 1;
     }
     /* ALU acc,imm */
     if (opc <= 0x3Du && (opc & 6u) == 4u) {
         const unsigned alu = (opc >> 3) & 7u;
-        if (alu_class(alu) == CL_NONE) return 0;
         w = (opc & 1u) ? 16u : 8u;
         op->kind = K_ALU; op->width = (uint8_t)w; op->alu = (uint8_t)alu;
         op->dst.kind = w == 16u ? OPK_R16 : OPK_R8; op->dst.reg = 0u;
@@ -890,13 +1120,13 @@ static int md_tr_parse(const uint8_t *p, size_t avail, const MdDecodedInstructio
         op->src.imm = (uint16_t)(w == 16u ? (q[0] | (q[1] << 8)) : q[0]);
         op->nowrite = alu == 7u;
         op->cls = (uint8_t)alu_class(alu);
+        md_tr_fix_alu(op);
         return 1;
     }
     switch (opc) {
         case 0x80: case 0x81: case 0x82: case 0x83: {
             const unsigned alu = (q[0] >> 3) & 7u;
             const uint8_t *imm;
-            if (alu_class(alu) == CL_NONE) return 0;
             w = (opc == 0x81u || opc == 0x83u) ? 16u : 8u;
             if (!parse_modrm(q, left, seg, &op->dst, &op->ea, w, &used)) return 0;
             imm = q + used;
@@ -907,6 +1137,7 @@ static int md_tr_parse(const uint8_t *p, size_t avail, const MdDecodedInstructio
             else op->src.imm = imm[0];
             op->nowrite = alu == 7u;
             op->cls = (uint8_t)alu_class(alu);
+            md_tr_fix_alu(op);
             return 1;
         }
         case 0x84: case 0x85:
@@ -960,6 +1191,69 @@ static int md_tr_parse(const uint8_t *p, size_t avail, const MdDecodedInstructio
             op->cls = ext == 0u ? CL_INC : CL_DEC;
             return 1;
         }
+        case 0xF6: case 0xF7: {
+            const unsigned ext = (q[0] >> 3) & 7u;
+            w = (opc & 1u) ? 16u : 8u;
+            /* MUL/IMUL/DIV/IDIV: step. /1 is the undocumented TEST alias: the
+               interpreter gives it an immediate the structural decoder does
+               not, so it must go through a (length-checked) step. */
+            if (ext >= 4u || ext == 1u) return 0;
+            if (!parse_modrm(q, left, seg, &op->dst, &op->ea, w, &used)) return 0;
+            op->width = (uint8_t)w;
+            if (ext == 0u) {                          /* TEST r/m,imm */
+                op->kind = K_ALU; op->alu = 4u; op->nowrite = 1u; op->cls = CL_LOGIC;
+                op->src.kind = OPK_IMM;
+                op->src.imm = (uint16_t)(w == 16u ? (q[used] | (q[used + 1u] << 8)) : q[used]);
+            } else if (ext == 2u) {
+                op->kind = K_NOT;
+            } else {                                  /* NEG = 0 - x */
+                op->kind = K_HALU; op->alu = 5u; op->neg = 1u; op->cls = CL_STEP;
+            }
+            return 1;
+        }
+        case 0xD0: case 0xD1: case 0xD2: case 0xD3:
+            w = (opc & 1u) ? 16u : 8u;
+            if (!parse_modrm(q, left, seg, &op->dst, &op->ea, w, &used)) return 0;
+            op->kind = K_SHIFT; op->width = (uint8_t)w; op->cls = CL_STEP;
+            op->alu = (uint8_t)((q[0] >> 3) & 7u);
+            op->count_cl = (uint8_t)((opc & 2u) != 0u);
+            return 1;
+        case 0xA4: case 0xA5: case 0xAA: case 0xAB: case 0xAC: case 0xAD:
+            op->width = (opc & 1u) ? 16u : 8u;
+            op->kind = opc <= 0xA5u ? K_MOVS : (opc <= 0xABu ? K_STOS : K_LODS);
+            op->srcseg = (uint8_t)(seg ? ((seg >> 3) & 3u) : 3u);
+            return 1;
+        case 0x06: case 0x0E: case 0x16: case 0x1E:
+            op->kind = K_PUSHS; op->sreg = (uint8_t)((opc >> 3) & 3u);
+            return 1;
+        case 0x07: case 0x1F:
+            op->kind = K_POPS; op->sreg = (uint8_t)((opc >> 3) & 3u);
+            return 1;
+        case 0x8C: {
+            const unsigned r = (q[0] >> 3) & 7u;
+            if (r > 3u) return 0;
+            if (!parse_modrm(q, left, seg, &op->dst, &op->ea, 16u, &used)) return 0;
+            op->kind = K_MOVFS; op->width = 16u; op->sreg = (uint8_t)r;
+            return 1;
+        }
+        case 0x8E: {
+            const unsigned r = (q[0] >> 3) & 7u;
+            if (r != 0u && r != 3u) return 0;         /* SS: step; CS: control */
+            if (!parse_modrm(q, left, seg, &op->src, &op->ea, 16u, &used)) return 0;
+            op->kind = K_MOVTS; op->width = 16u; op->sreg = (uint8_t)r;
+            return 1;
+        }
+        case 0xFC: case 0xFD: op->kind = K_SETDF; op->alu = (uint8_t)(opc & 1u); return 1;
+        case 0x86: case 0x87:
+            if ((q[0] >> 6) != 3u) return 0;
+            w = (opc & 1u) ? 16u : 8u;
+            op->kind = K_XCHGRR; op->width = (uint8_t)w;
+            op->dst.kind = w == 16u ? OPK_R16 : OPK_R8; op->dst.reg = (uint8_t)((q[0] >> 3) & 7u);
+            op->src.kind = op->dst.kind; op->src.reg = (uint8_t)(q[0] & 7u);
+            return 1;
+        case 0xE0: case 0xE1:
+            op->kind = K_LOOPZ; op->cc = opc == 0xE1u ? 4u : 5u;
+            return 1;
         case 0x90: op->kind = K_NOP; return 1;
         case 0x98: op->kind = K_CBW; return 1;
         case 0x99: op->kind = K_CWD; return 1;
@@ -1018,7 +1312,8 @@ static int md_tr_writes_memory(const MdTrOp *op)
     switch (op->kind) {
         case K_ALU: return op->dst.kind == OPK_MEM && !op->nowrite;
         case K_INC: case K_DEC: case K_MOV: return op->dst.kind == OPK_MEM;
-        case K_PUSH: case K_CALL: return 1;
+        case K_PUSH: case K_CALL: case K_PUSHS: case K_STOS: case K_MOVS: return 1;
+        case K_HALU: case K_SHIFT: case K_NOT: case K_MOVFS: return op->dst.kind == OPK_MEM;
         default: return 0;
     }
 }
@@ -1035,7 +1330,7 @@ static void md_tr_analyze(MdTrCtx *c)
     for (i = 0u; i < c->n; ++i) {
         MdTrOp *op = &c->ops[i];
         /* an in-block step may read any flag: pending lazy state goes first */
-        if (op->kind == K_STEP && p >= 0) c->ops[p].emit_lazy = 1u;
+        if (op->cls == CL_STEP && p >= 0) c->ops[p].emit_lazy = 1u;
         if (op->cls != CL_NONE) p = (int)i;
         if (c->track && md_tr_writes_memory(op) && p >= 0) c->ops[p].emit_lazy = 1u;
         if (op->kind == K_JCC) {
@@ -1098,7 +1393,7 @@ static void md_tr_analyze_defer(MdTrCtx *c)
     if ((p->kind == K_INC || p->kind == K_DEC) && p->dst.kind != OPK_R16) return;
     for (i = 0u; i + 1u < c->n; ++i) {
         const MdTrOp *op = &c->ops[i];
-        if (op->kind == K_STEP) return;              /* reads incoming flags */
+        if (op->cls == CL_STEP) return;              /* reads incoming flags */
         if (op->cls != CL_NONE) {
             if (op != p && (op->kind == K_INC || op->kind == K_DEC) &&
                 op->emit_lazy && op->carry_src == CS_INCOMING) return;
@@ -1186,6 +1481,36 @@ static void md_tr_emit_trampolines(MdTranslator *tr)
     t2_pop(&b, 0x8FF0u);                        /* r4-r11, pc */
     while (b.at & 3u) t2_h16(&b, 0xBF00u);
 
+    /* B: shared in-block step thunk (r1 ip, r2 next ip or 0x10000,
+       r3 add-back). Spills guest registers, runs md_tr_h_step, reloads. */
+    {
+        uint32_t j_exit;
+        tr->step_off = t2_here(&b);
+        t2_push(&b, (1u << 3) | (1u << 14));           /* r3, lr (8-byte aligned) */
+        for (i = 0u; i < 8u; ++i) t2_ldst(&b, T2_STRH_I, kG[i], RCPU, OFF_R(i));
+        t2_ldst(&b, T2_STRH_I, T2_R1, RCPU, OFF_IP);
+        t2_mov(&b, T2_R0, RCPU);
+        t2_mov(&b, T2_R1, T2_R2);
+        t2_mov32(&b, RCPU, md_tr_addr((const void *)md_tr_h_step));
+        t2_blx(&b, RCPU);
+        t2_mov32(&b, RCPU, md_tr_addr(rt));
+        for (i = 0u; i < 8u; ++i) t2_ldst(&b, T2_LDRH_I, kG[i], RCPU, OFF_R(i));
+        t2_pop(&b, (1u << 3) | (1u << 14));
+        t2_dp_imm(&b, T2_SUB, 1u, T2_PC, T2_R0, 0u);
+        j_exit = t2_b_fwd(&b);
+        t2_mov(&b, T2_R2, T2_LR);
+        t2_mov32(&b, RMEM, md_tr_addr(rt->cpu.memory));
+        t2_bx(&b, T2_R2);
+        t2_patch_bcc(&b, j_exit, T2_NE, t2_here(&b));
+        t2_ldst(&b, T2_LDRH_I, T2_R1, RCPU, OFF_IP);
+        t2_ldst(&b, T2_LDR_I, T2_R2, T2_SP, 0u);
+        t2_dp_reg(&b, T2_ADD, 0u, T2_R2, T2_R2, T2_R3, T2_LSL, 0u);
+        t2_ldst(&b, T2_STR_I, T2_R2, T2_SP, 0u);
+        t2_mov32(&b, T2_R0, (uint32_t)MD_TR_EXIT_STORE << 24);
+        t2_b_to(&b, tr->exit_off);
+        while (b.at & 3u) t2_h16(&b, 0xBF00u);
+    }
+
     tr->arena_used = b.at;
     md_tr_sync(tr, 0u, b.at);
 }
@@ -1229,6 +1554,8 @@ int md_tr_init(MdTranslator *tr, MdRuntime *rt, uint8_t *arena, uint32_t arena_s
                           offsetof(MdTrBlock, ip) == offsetof(MdTrBlock, cs) + 2u &&
                           (MD_TR_SLOTS & (MD_TR_SLOTS - 1u)) == 0u;
     rt->cpu.tr_live_bits = tr->live_table;
+    md_tr_cyc_enable();
+    g_md_tr_stats = tr;
     md_tr_flush(tr);
     tr->stats.flushes = 0u;
     return 1;
@@ -1311,11 +1638,12 @@ static int md_tr_translate(MdTranslator *tr, MdTrBlock *blk, uint16_t cs, uint16
             /* never reject: run it in place with the interpreter if it is
                ordinary straight-line code */
             const uint8_t o = in.opcode;
-            if (in.flow != MD_DECODE_FLOW_FALLTHROUGH || in.far_control || steps >= MD_TR_MAX_STEPS ||
-                o == 0xCCu || o == 0xCDu || o == 0xCEu || o == 0xCFu || o == 0xF4u || o == 0x0Fu ||
-                (o == 0x8Eu && in.has_modrm && ((in.modrm >> 3) & 7u) == 1u)) break;
+            const int control = in.flow != MD_DECODE_FLOW_FALLTHROUGH || in.far_control ||
+                o == 0xCCu || o == 0xCDu || o == 0xCEu || o == 0xCFu || o == 0x0Fu ||
+                (o == 0x8Eu && in.has_modrm && ((in.modrm >> 3) & 3u) == 1u);
+            if (o == 0xF4u || steps >= MD_TR_MAX_STEPS) break;
             memset(op, 0, sizeof(*op));
-            op->kind = K_STEP;
+            op->kind = control ? K_CSTEP : K_STEP;   /* D: control continues via dispatch */
             op->cls = CL_STEP;
             op->ip = in.ip;
             op->next_ip = in.next_ip;
@@ -1330,7 +1658,7 @@ static int md_tr_translate(MdTranslator *tr, MdTrBlock *blk, uint16_t cs, uint16
     c->end_ip = cur;
 
     /* a block of nothing but interpreter steps is slower than the interpreter */
-    if (natives == 0u) c->n = 0u;
+    if (natives == 0u || natives < steps) c->n = 0u;   /* B: mostly-native blocks only */
     tr->stats.step_ops += steps;
 
     if (c->n == 0u) {
@@ -1421,10 +1749,33 @@ static uint8_t *md_tr_heat(MdTranslator *tr, uint16_t cs, uint16_t ip)
     return &tr->heat[(x ^ (x >> 7) ^ (x >> 13)) & (MD_TR_HEAT_SLOTS - 1u)];
 }
 
-static void md_tr_heat_bump(MdTranslator *tr, uint16_t cs, uint16_t ip)
+/* B: loop heads (back-edges) heat 4x faster than plain edge targets. */
+static void md_tr_heat_bump(MdTranslator *tr, uint16_t cs, uint16_t ip, unsigned w)
 {
     uint8_t *h = md_tr_heat(tr, cs, ip);
-    if (*h != 0xFFu) ++*h;
+    *h = (uint8_t)(*h + w > 0xFFu ? 0xFFu : *h + w);
+}
+
+/* E: the block whose code contains arena offset `off` (chain source). */
+static const MdTrBlock *md_tr_block_at(const MdTranslator *tr, uint32_t off)
+{
+    unsigned i;
+    for (i = 0u; i < MD_TR_SLOTS; ++i) {
+        const MdTrBlock *b = &tr->blocks[i];
+        if (b->state == 1u && off >= b->entry && off < b->end) return b;
+    }
+    return NULL;
+}
+
+static int md_tr_pages_subset(const MdTrBlock *to, const MdTrBlock *from)
+{
+    unsigned i, j;
+    for (i = 0u; i < to->page_count; ++i) {
+        int found = 0;
+        for (j = 0u; j < from->page_count; ++j) if (from->page[j] == to->page[i]) found = 1;
+        if (!found) return 0;
+    }
+    return 1;
 }
 
 static MdTrBlock *md_tr_lookup(MdTranslator *tr, uint16_t cs, uint16_t ip)
@@ -1447,6 +1798,9 @@ MdStopReason md_tr_run(MdTranslator *tr, uint64_t budget)
     (void)md_tr_lookup;              /* compiled everywhere, executed on Thumb-2 */
     (void)md_tr_match;
     (void)md_tr_heat_bump;
+    (void)md_tr_block_at;
+    (void)md_tr_pages_subset;
+    (void)md_tr_cyc_enable;
 #endif
     return md_interp_run(rt, budget);
 #else
@@ -1457,9 +1811,10 @@ MdStopReason md_tr_run(MdTranslator *tr, uint64_t budget)
     rt->native_v2_suppress_bloom[1] = 0u;
 #endif
 
+    const uint32_t run_c0 = MD_TR_CYC();
     while (rt->stop_reason == MD_STOP_NONE) {
         MdTrBlock *blk;
-        uint32_t chunk, info, kind, retired;
+        uint32_t chunk, info, kind, retired, cyc;
         MdTrEnter enter;
         const uint16_t cs = rt->cpu.cs, ip = rt->cpu.ip;
 
@@ -1468,8 +1823,11 @@ MdStopReason md_tr_run(MdTranslator *tr, uint64_t budget)
 
         blk = &tr->blocks[md_tr_hash(cs, ip)];
         if (!md_tr_match(tr, blk, cs, ip)) {
-            if (tr->eager || *md_tr_heat(tr, cs, ip) >= MD_TR_HOT_THRESHOLD)
+            if (tr->eager || *md_tr_heat(tr, cs, ip) >= MD_TR_HOT_THRESHOLD) {
+                cyc = MD_TR_CYC();
                 (void)md_tr_translate(tr, blk, cs, ip, 1);
+                tr->stats.cyc_translate += (uint32_t)(MD_TR_CYC() - cyc);
+            }
             else
                 blk = NULL;                          /* cold: interpret */
         }
@@ -1481,7 +1839,9 @@ MdStopReason md_tr_run(MdTranslator *tr, uint64_t budget)
                    back-edge), then let that loop head heat up. */
                 const uint64_t before = rt->instructions;
                 rt->native_v2_backedge_hit = 0u;
+                cyc = MD_TR_CYC();
                 (void)md_interp_run(rt, budget);
+                tr->stats.cyc_interp += (uint32_t)(MD_TR_CYC() - cyc);
                 retired = (uint32_t)(rt->instructions - before);
                 budget -= retired;
                 tr->stats.interp_instructions += retired;
@@ -1490,12 +1850,24 @@ MdStopReason md_tr_run(MdTranslator *tr, uint64_t budget)
                     MdTrBlock *t = &tr->blocks[md_tr_hash(bcs, bip)];
                     rt->native_v2_backedge_hit = 0u;
                     ++tr->stats.backedge_exits;
+                    if (tr->loop_hook != NULL) {
+                        /* F: a specialised loop engine (Native v2) gets the
+                           loop head first; M25 takes whatever it rejects */
+                        const uint64_t h0 = rt->instructions;
+                        if (tr->loop_hook(tr->loop_user, rt, budget)) {
+                            const uint64_t r = rt->instructions - h0;
+                            budget = budget > r ? budget - r : 0u;
+                            tr->stats.hook_instructions += r;
+                            ++tr->stats.hook_runs;
+                            continue;
+                        }
+                    }
                     if (md_tr_match(tr, t, bcs, bip) && t->state == 2u) {
                         const unsigned bit = ((unsigned)bcs ^ (unsigned)bip) & 63u;
                         rt->native_v2_suppress_bloom[bit >> 5] |= (uint32_t)1u << (bit & 31u);
                         ++tr->stats.suppressed;
                     } else {
-                        md_tr_heat_bump(tr, bcs, bip);
+                        md_tr_heat_bump(tr, bcs, bip, 4u);
                     }
                 }
                 continue;
@@ -1509,7 +1881,9 @@ MdStopReason md_tr_run(MdTranslator *tr, uint64_t budget)
 
         chunk = budget > 0x3FFFFFFFu ? 0x3FFFFFFFu : (uint32_t)budget;
         enter = (MdTrEnter)(uintptr_t)(md_tr_addr(tr->arena + tr->enter_off) | 1u);
+        cyc = MD_TR_CYC();
         info = enter(md_tr_addr(tr->arena + blk->entry) | 1u, chunk);
+        tr->stats.cyc_native += (uint32_t)(MD_TR_CYC() - cyc);
         retired = chunk - tr->remaining;
         rt->instructions += retired;
         budget -= retired;
@@ -1529,7 +1903,7 @@ MdStopReason md_tr_run(MdTranslator *tr, uint64_t budget)
                     /* tiered: chain only to a target that is already hot */
                     to = &tr->blocks[md_tr_hash(rt->cpu.cs, rt->cpu.ip)];
                     if (!md_tr_match(tr, to, rt->cpu.cs, rt->cpu.ip)) {
-                        md_tr_heat_bump(tr, rt->cpu.cs, rt->cpu.ip);
+                        md_tr_heat_bump(tr, rt->cpu.cs, rt->cpu.ip, 1u);
                         if (*md_tr_heat(tr, rt->cpu.cs, rt->cpu.ip) >= MD_TR_HOT_THRESHOLD)
                             (void)md_tr_translate(tr, to, rt->cpu.cs, rt->cpu.ip, 1);
                     }
@@ -1540,8 +1914,10 @@ MdStopReason md_tr_run(MdTranslator *tr, uint64_t budget)
                     /* A block chained to itself skips its page-generation
                        check: within one native episode its code can only
                        change through a slow store, which exits at once. */
-                    const int self = stub >= to->entry && stub < to->end;
-                    t2_patch_b(&b, stub, self ? to->body : to->entry);
+                    const MdTrBlock *from = md_tr_block_at(tr, stub);
+                    const int skip = from != NULL && md_tr_pages_subset(to, from);
+                    t2_patch_b(&b, stub, skip ? to->body : to->entry);
+                    if (skip) ++tr->stats.chains_unguarded;
                     md_tr_sync(tr, stub, stub + 4u);
                     ++tr->stats.chains;
                 }
@@ -1549,7 +1925,7 @@ MdStopReason md_tr_run(MdTranslator *tr, uint64_t budget)
             }
             case MD_TR_EXIT_DYNAMIC:
                 ++tr->stats.exit_dynamic;
-                md_tr_heat_bump(tr, rt->cpu.cs, rt->cpu.ip);
+                md_tr_heat_bump(tr, rt->cpu.cs, rt->cpu.ip, 1u);
                 break;
             case MD_TR_EXIT_BUDGET:  ++tr->stats.exit_budget; break;
             case MD_TR_EXIT_INVALID: ++tr->stats.exit_invalid; break;
@@ -1557,6 +1933,7 @@ MdStopReason md_tr_run(MdTranslator *tr, uint64_t budget)
             default: break;
         }
     }
+    tr->stats.cyc_total += (uint32_t)(MD_TR_CYC() - run_c0);
     return rt->stop_reason;
 #endif
 }
