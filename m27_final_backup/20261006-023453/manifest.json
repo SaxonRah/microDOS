@@ -1,0 +1,32 @@
+{
+  "version": "M27-finalize-v1",
+  "m27a_source_backup": "C:\\microDOS\\m27b_backup\\20261006-014634",
+  "files": [
+    {
+      "path": "src/runtime/x86_interp.c",
+      "before": "512bff6aeccc7aba035efdfed781c4b7bf9c4aa4f840f900be67334d14959c2d"
+    },
+    {
+      "path": "include/microdos/runtime.h",
+      "before": "c8563e83d3cd6b7c7a5af731d72fb55e004e349d8aea3e78f03424ebbf5ac22c"
+    },
+    {
+      "path": "pico/microdos_pico.c",
+      "before": "c302fcfa7e767bffeacaba6c33577be79adf8f6083be4749826564ec03ab4a36"
+    },
+    {
+      "path": "pico/CMakeLists.txt",
+      "before": "975d7be69bcae9b2eae2385163ad586ccfac7a0b6aefe58039c6e0bd7b102643"
+    },
+    {
+      "path": "scripts/md_m27b_rep_profile.ps1",
+      "before": "dc1cdb3fedfb18260d5fc2fc57bc844f4af88937528228767a86aaca58476697",
+      "runner": true
+    },
+    {
+      "path": "scripts/md_m27c_rep_generic.ps1",
+      "before": "83cef2165f4d02f61c33870dc6ae1e10335d326bb0453a554c1001e7e613a002",
+      "runner": true
+    }
+  ]
+}

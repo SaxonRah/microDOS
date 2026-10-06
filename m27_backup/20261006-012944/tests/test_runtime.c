@@ -1196,117 +1196,6 @@ static void test_repne_scas(uint8_t *memory)
     CHECK((md_x86_flags(&runtime.cpu) & MD_X86_FLAG_ZF) != 0u);
 }
 
-/* M27.1 REP bulk semantic coverage.
- * Large counts cross the fast-path threshold; overlap, offset wrap and
- * executable destinations prove that unsafe cases still take scalar semantics.
- */
-static void test_m27_rep_bulk_semantics(uint8_t *memory)
-{
-    MdRuntime rt;
-    MdHooks hooks = {0};
-    unsigned i;
-
-    /* Large, disjoint REP MOVSW. */
-    memset(memory, 0, MD_X86_ADDRESS_SPACE);
-    md_runtime_init(&rt, memory, &hooks);
-    rt.cpu.ds = 0x2000u; rt.cpu.es = 0x3000u;
-    rt.cpu.r[MD_X86_SI] = 0x0100u; rt.cpu.r[MD_X86_DI] = 0x0200u;
-    rt.cpu.r[MD_X86_CX] = 64u;
-    for (i = 0u; i < 64u; ++i)
-        md_x86_write16(&rt.cpu, 0x2000u, (uint16_t)(0x0100u + i * 2u),
-                       (uint16_t)(0x4000u + i));
-    md_interp_string_op(&rt, 0xA5u, 0u, 0xF3u);
-    CHECK(rt.cpu.r[MD_X86_CX] == 0u);
-    CHECK(rt.cpu.r[MD_X86_SI] == 0x0180u);
-    CHECK(rt.cpu.r[MD_X86_DI] == 0x0280u);
-    for (i = 0u; i < 64u; ++i)
-        CHECK(md_x86_read16(&rt.cpu, 0x3000u, (uint16_t)(0x0200u + i * 2u)) ==
-              (uint16_t)(0x4000u + i));
-    CHECK(rt.rep_instructions == 1u && rt.rep_elements == 64u);
-
-    /* Large REP STOSW. */
-    memset(memory, 0, MD_X86_ADDRESS_SPACE);
-    md_runtime_init(&rt, memory, &hooks);
-    rt.cpu.es = 0x3100u; rt.cpu.r[MD_X86_DI] = 0x0400u;
-    rt.cpu.r[MD_X86_CX] = 64u; rt.cpu.r[MD_X86_AX] = 0xBEEFu;
-    md_interp_string_op(&rt, 0xABu, 0u, 0xF3u);
-    CHECK(rt.cpu.r[MD_X86_CX] == 0u && rt.cpu.r[MD_X86_DI] == 0x0480u);
-    for (i = 0u; i < 64u; ++i)
-        CHECK(md_x86_read16(&rt.cpu, 0x3100u, (uint16_t)(0x0400u + i * 2u)) == 0xBEEFu);
-
-    /* REPE CMPSW stops on the first mismatch and leaves flags from it. */
-    memset(memory, 0, MD_X86_ADDRESS_SPACE);
-    md_runtime_init(&rt, memory, &hooks);
-    rt.cpu.ds = 0x2200u; rt.cpu.es = 0x3200u;
-    rt.cpu.r[MD_X86_SI] = 0x0100u; rt.cpu.r[MD_X86_DI] = 0x0300u;
-    rt.cpu.r[MD_X86_CX] = 64u;
-    for (i = 0u; i < 64u; ++i) {
-        md_x86_write16(&rt.cpu, 0x2200u, (uint16_t)(0x0100u + i * 2u), 0x1234u);
-        md_x86_write16(&rt.cpu, 0x3200u, (uint16_t)(0x0300u + i * 2u), 0x1234u);
-    }
-    md_x86_write16(&rt.cpu, 0x3200u, (uint16_t)(0x0300u + 41u * 2u), 0x1334u);
-    md_interp_string_op(&rt, 0xA7u, 0u, 0xF3u);
-    CHECK(rt.cpu.r[MD_X86_CX] == 22u);
-    CHECK(rt.cpu.r[MD_X86_SI] == (uint16_t)(0x0100u + 42u * 2u));
-    CHECK(rt.cpu.r[MD_X86_DI] == (uint16_t)(0x0300u + 42u * 2u));
-    CHECK((md_x86_flags(&rt.cpu) & MD_X86_FLAG_ZF) == 0u);
-    CHECK((md_x86_flags(&rt.cpu) & MD_X86_FLAG_CF) != 0u);
-    CHECK((md_x86_flags(&rt.cpu) & MD_X86_FLAG_SF) != 0u);
-
-    /* REPNE SCASW stops on the first equal element. */
-    memset(memory, 0, MD_X86_ADDRESS_SPACE);
-    md_runtime_init(&rt, memory, &hooks);
-    rt.cpu.es = 0x3300u; rt.cpu.r[MD_X86_DI] = 0x0500u;
-    rt.cpu.r[MD_X86_CX] = 64u; rt.cpu.r[MD_X86_AX] = 0xCAFEu;
-    for (i = 0u; i < 64u; ++i)
-        md_x86_write16(&rt.cpu, 0x3300u, (uint16_t)(0x0500u + i * 2u), 0x1111u);
-    md_x86_write16(&rt.cpu, 0x3300u, (uint16_t)(0x0500u + 37u * 2u), 0xCAFEu);
-    md_interp_string_op(&rt, 0xAFu, 0u, 0xF2u);
-    CHECK(rt.cpu.r[MD_X86_CX] == 26u);
-    CHECK(rt.cpu.r[MD_X86_DI] == (uint16_t)(0x0500u + 38u * 2u));
-    CHECK((md_x86_flags(&rt.cpu) & MD_X86_FLAG_ZF) != 0u);
-
-    /* Overlapping forward MOVSB must propagate like real REP MOVSB, not memmove. */
-    memset(memory, 0, MD_X86_ADDRESS_SPACE);
-    md_runtime_init(&rt, memory, &hooks);
-    rt.cpu.ds = rt.cpu.es = 0x2400u;
-    rt.cpu.r[MD_X86_SI] = 0x0100u; rt.cpu.r[MD_X86_DI] = 0x0101u;
-    rt.cpu.r[MD_X86_CX] = 32u;
-    for (i = 0u; i <= 32u; ++i)
-        md_x86_write8(&rt.cpu, 0x2400u, (uint16_t)(0x0100u + i), (uint8_t)(0x80u + i));
-    md_interp_string_op(&rt, 0xA4u, 0u, 0xF3u);
-    CHECK(rt.cpu.r[MD_X86_CX] == 0u);
-    for (i = 0u; i < 32u; ++i)
-        CHECK(md_x86_read8(&rt.cpu, 0x2400u, (uint16_t)(0x0101u + i)) == 0x80u);
-
-    /* 16-bit offset wrap must retain segmented wrap semantics. */
-    memset(memory, 0, MD_X86_ADDRESS_SPACE);
-    md_runtime_init(&rt, memory, &hooks);
-    rt.cpu.ds = 0x2500u; rt.cpu.es = 0x3500u;
-    rt.cpu.r[MD_X86_SI] = 0xFFF0u; rt.cpu.r[MD_X86_DI] = 0xFFF0u;
-    rt.cpu.r[MD_X86_CX] = 32u;
-    for (i = 0u; i < 32u; ++i)
-        md_x86_write8(&rt.cpu, 0x2500u, (uint16_t)(0xFFF0u + i), (uint8_t)(i ^ 0x5Au));
-    md_interp_string_op(&rt, 0xA4u, 0u, 0xF3u);
-    CHECK(rt.cpu.r[MD_X86_SI] == 0x0010u && rt.cpu.r[MD_X86_DI] == 0x0010u);
-    for (i = 0u; i < 32u; ++i)
-        CHECK(md_x86_read8(&rt.cpu, 0x3500u, (uint16_t)(0xFFF0u + i)) == (uint8_t)(i ^ 0x5Au));
-
-#if MICRODOS_TRANSLATION_SUPPORT
-    /* A destination page containing executable code must use tracked stores. */
-    memset(memory, 0, MD_X86_ADDRESS_SPACE);
-    md_runtime_init(&rt, memory, &hooks);
-    rt.cpu.es = 0x3600u; rt.cpu.r[MD_X86_DI] = 0x0200u;
-    rt.cpu.r[MD_X86_CX] = 64u; rt.cpu.r[MD_X86_AX] = 0x7A7Au;
-    md_runtime_mark_code_range(&rt, 0x3600u, 0x0200u, 64u);
-    {
-        const uint32_t epoch = rt.code_write_epoch;
-        md_interp_string_op(&rt, 0xAAu, 0u, 0xF3u);
-        CHECK(rt.code_write_epoch != epoch);
-    }
-#endif
-}
-
 static void test_loop_family(uint8_t *memory)
 {
     MdRuntime runtime;
@@ -2221,7 +2110,6 @@ int main(void)
     test_group1_mov_imm_xor_and_jcc(memory);
     test_prefix_string_and_direction_ops(memory);
     test_repne_scas(memory);
-    test_m27_rep_bulk_semantics(memory);
     test_loop_family(memory);
     test_m7_control_and_flags(memory);
     test_m7_addressing_and_far_loads(memory);

@@ -1,0 +1,23 @@
+{
+  "milestone": "M27.1 REP bulk fast path",
+  "created": "20261006-012944",
+  "repo": "C:\\microDOS",
+  "files": [
+    {
+      "path": "src/runtime/x86_interp.c",
+      "existed": true,
+      "sha256": "13f11129257aea4e24ae069ca33a1725e86ce7ecd2bb7669cabc5217cd607f4d",
+      "backup": "src/runtime/x86_interp.c"
+    },
+    {
+      "path": "tests/test_runtime.c",
+      "existed": true,
+      "sha256": "b591adbc13ea06e4a890da85f239c087f22e37fa962d1058f18f3c5bcbadf1fe",
+      "backup": "tests/test_runtime.c"
+    },
+    {
+      "path": "scripts/md_m27_rep.ps1",
+      "existed": false
+    }
+  ]
+}

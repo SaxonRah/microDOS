@@ -6,6 +6,26 @@
 #include <stddef.h>
 #include <string.h>
 
+/* M27.2 REP cycle/eligibility profile. */
+static MdRepProfile g_md_rep_profile;
+
+void md_interp_rep_profile_snapshot(MdRepProfile *out)
+{
+    if (out != NULL) *out = g_md_rep_profile;
+}
+
+void md_interp_rep_profile_reset(void)
+{
+    memset(&g_md_rep_profile, 0, sizeof(g_md_rep_profile));
+}
+
+#if defined(__ARM_ARCH_PROFILE) && (__ARM_ARCH_PROFILE == 'M')
+#define MD_REP_PROFILE_CYC() (*(volatile uint32_t *)0xE0001004u)
+#else
+#define MD_REP_PROFILE_CYC() 0u
+#endif
+
+
 #if MD_INTERP_OPCODE_PROFILE
 static uint32_t g_md_opcode_profile[256];
 static uint32_t g_md_unpref_modrm_profile[6u * 256u];
@@ -503,27 +523,11 @@ MD_INTERP_INLINE void md_op_string_once(MdRuntime *runtime, uint8_t opcode,
     }
 }
 
-/* M27.1 REP bulk fast path.
+/* M27.2 REP cycle/eligibility profile.
+ * M27.1 REP bulk fast path + M27.2 eligibility profiling.
  *
- * The old REP loop re-entered md_op_string_once() for every element.  That
- * preserved exact 8086 semantics but repeatedly paid segmented-address,
- * tracked-store, CX/index and lazy-flag overhead around every byte/word.
- *
- * This path only takes cases that can be represented as contiguous forward
- * host accesses without changing architectural behaviour:
- *   - DF == 0
- *   - sufficiently large CX
- *   - no 16-bit segment-offset wrap
- *   - no 20-bit physical-address wrap
- *   - MOVS source/destination do not overlap
- *   - MOVS/STOS destination touches no executable/tracked page
- *
- * Everything else falls back to the canonical scalar loop below.  CMPS/SCAS
- * scan raw guest bytes but execute the canonical subtract helper once for the
- * final compared element, so all final 8086 flags are identical to scalar
- * execution.  The fast path deliberately does not use libc memcpy/memset:
- * its loops stay in the interpreter hot working set rather than risking an
- * XIP libc call while guest RAM is in PSRAM.
+ * M27.2 deliberately keeps M27.1's exact fast-path semantics. The only
+ * additions are reject counters and cycle/route accounting in md_op_string().
  */
 #ifndef MD_REP_BULK_FAST
 #define MD_REP_BULK_FAST 1
@@ -532,9 +536,6 @@ MD_INTERP_INLINE void md_op_string_once(MdRuntime *runtime, uint8_t opcode,
 #define MD_REP_BULK_MIN_ELEMENTS 16u
 #endif
 
-/* These helpers must remain part of the same hot interpreter working set as
- * md_op_string().  Always-inline avoids accidentally creating new XIP helper
- * calls in an M26d combo build while remaining portable to the MSVC host. */
 #if defined(_MSC_VER)
 #define MD_REP_ALWAYS_INLINE static __forceinline
 #elif defined(__GNUC__) || defined(__clang__)
@@ -545,18 +546,80 @@ MD_INTERP_INLINE void md_op_string_once(MdRuntime *runtime, uint8_t opcode,
 
 MD_REP_ALWAYS_INLINE uint16_t md_rep_raw16(const uint8_t *p)
 {
-    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+    MdX86 *cpu = &runtime->cpu;
+    const uint8_t repeat = prefix != NULL ? prefix->repeat : 0u;
+    const unsigned width = (opcode & 1u) != 0u ? 2u : 1u;
+    const int compares = opcode == 0xA6u || opcode == 0xA7u ||
+                         opcode == 0xAEu || opcode == 0xAFu;
+
+    if (repeat == 0u) {
+        md_op_string_once(runtime, opcode, prefix);
+        return;
+    }
+
+    {
+        const uint16_t start_cx = cpu->r[MD_X86_CX];
+        const unsigned idx = opcode <= 0xA7u ? (unsigned)(opcode - 0xA4u)
+                                             : 4u + (unsigned)(opcode - 0xAAu);
+        const uint32_t cyc0 = MD_REP_PROFILE_CYC();
+        uint16_t done = 0u;
+        int fast = 0;
+        uint64_t elements;
+        unsigned streams;
+
+        if (start_cx != 0u)
+            fast = md_rep_bulk_try(runtime, opcode, prefix, start_cx, &done);
+
+        if (!fast) {
+            while (cpu->r[MD_X86_CX] != 0u) {
+                md_op_string_once(runtime, opcode, prefix);
+                cpu->r[MD_X86_CX] = (uint16_t)(cpu->r[MD_X86_CX] - 1u);
+                if (compares) {
+                    const int zf = md_x86_zf(cpu);
+                    if ((repeat == 0xF3u && !zf) ||
+                        (repeat == 0xF2u && zf)) break;
+                }
+            }
+            done = (uint16_t)(start_cx - cpu->r[MD_X86_CX]);
+        }
+
+        elements = (uint64_t)done;
+        streams = (opcode >= 0xA4u && opcode <= 0xA7u) ? 2u : 1u;
+        ++runtime->rep_instructions;
+        runtime->rep_elements += elements;
+        runtime->rep_payload_bytes += elements * width;
+        runtime->rep_memory_bytes += elements * width * streams;
+        if (idx < 10u) {
+            ++runtime->rep_op_instructions[idx];
+            runtime->rep_op_elements[idx] += elements;
+        }
+
+        if (fast) {
+            ++g_md_rep_profile.fast_instructions;
+            g_md_rep_profile.fast_elements += elements;
+            g_md_rep_profile.fast_cycles += (uint32_t)(MD_REP_PROFILE_CYC() - cyc0);
+            if (idx < 10u) {
+                ++g_md_rep_profile.fast_op_instructions[idx];
+                g_md_rep_profile.fast_op_elements[idx] += elements;
+            }
+        } else {
+            ++g_md_rep_profile.scalar_instructions;
+            g_md_rep_profile.scalar_elements += elements;
+            g_md_rep_profile.scalar_cycles += (uint32_t)(MD_REP_PROFILE_CYC() - cyc0);
+        }
+    }
 }
 
+
 MD_REP_ALWAYS_INLINE int md_rep_linear_range_ok(uint16_t offset, uint32_t bytes,
-                                         uint32_t linear)
+                                                 uint32_t linear)
 {
     return (uint32_t)offset + bytes <= 0x10000u &&
            linear + bytes <= MD_X86_ADDRESS_SPACE;
 }
 
 MD_REP_ALWAYS_INLINE int md_rep_write_range_clear(const MdX86 *cpu,
-                                            uint32_t linear, uint32_t bytes)
+                                                    uint32_t linear, uint32_t bytes)
 {
 #if MD_X86_TRACK_WRITES
     uint32_t page;
@@ -566,9 +629,7 @@ MD_REP_ALWAYS_INLINE int md_rep_write_range_clear(const MdX86 *cpu,
         if (md_x86_page_executable(cpu, page << MD_X86_CODE_PAGE_SHIFT)) return 0;
     }
 #else
-    (void)cpu;
-    (void)linear;
-    (void)bytes;
+    (void)cpu; (void)linear; (void)bytes;
 #endif
     return 1;
 }
@@ -579,11 +640,9 @@ MD_REP_ALWAYS_INLINE int md_rep_ranges_overlap(uint32_t a, uint32_t b, uint32_t 
 }
 
 MD_REP_ALWAYS_INLINE void md_rep_copy_forward(uint8_t *dst, const uint8_t *src,
-                                       uint32_t bytes)
+                                               uint32_t bytes)
 {
     uint32_t i = 0u;
-    /* Explicit unrolling keeps this as hot interpreter code rather than a
-       compiler-recognised dynamic memcpy call on embedded targets. */
     while (i + 8u <= bytes) {
         const uint8_t s0 = src[i + 0u], s1 = src[i + 1u];
         const uint8_t s2 = src[i + 2u], s3 = src[i + 3u];
@@ -595,50 +654,39 @@ MD_REP_ALWAYS_INLINE void md_rep_copy_forward(uint8_t *dst, const uint8_t *src,
         dst[i + 6u] = s6; dst[i + 7u] = s7;
         i += 8u;
     }
-    while (i < bytes) {
-        dst[i] = src[i];
-        ++i;
-    }
+    while (i < bytes) { dst[i] = src[i]; ++i; }
 }
 
 MD_REP_ALWAYS_INLINE void md_rep_stos8_forward(uint8_t *dst, uint32_t count,
-                                        uint8_t value)
+                                                uint8_t value)
 {
     uint32_t i = 0u;
     while (i + 8u <= count) {
-        dst[i + 0u] = value; dst[i + 1u] = value;
-        dst[i + 2u] = value; dst[i + 3u] = value;
-        dst[i + 4u] = value; dst[i + 5u] = value;
-        dst[i + 6u] = value; dst[i + 7u] = value;
+        dst[i+0u]=value; dst[i+1u]=value; dst[i+2u]=value; dst[i+3u]=value;
+        dst[i+4u]=value; dst[i+5u]=value; dst[i+6u]=value; dst[i+7u]=value;
         i += 8u;
     }
     while (i < count) dst[i++] = value;
 }
 
 MD_REP_ALWAYS_INLINE void md_rep_stos16_forward(uint8_t *dst, uint32_t count,
-                                         uint16_t value)
+                                                 uint16_t value)
 {
-    const uint8_t lo = (uint8_t)value;
-    const uint8_t hi = (uint8_t)(value >> 8);
-    uint32_t i = 0u;
+    const uint8_t lo=(uint8_t)value, hi=(uint8_t)(value>>8);
+    uint32_t i=0u;
     while (i + 4u <= count) {
-        dst[0] = lo; dst[1] = hi; dst[2] = lo; dst[3] = hi;
-        dst[4] = lo; dst[5] = hi; dst[6] = lo; dst[7] = hi;
-        dst += 8;
-        i += 4u;
+        dst[0]=lo; dst[1]=hi; dst[2]=lo; dst[3]=hi;
+        dst[4]=lo; dst[5]=hi; dst[6]=lo; dst[7]=hi;
+        dst += 8; i += 4u;
     }
-    while (i < count) {
-        dst[0] = lo;
-        dst[1] = hi;
-        dst += 2;
-        ++i;
-    }
+    while (i < count) { dst[0]=lo; dst[1]=hi; dst += 2; ++i; }
 }
 
-/* Return nonzero when the complete REP instruction was handled here. */
+#define MD_REP_REJECT(field_) do { ++g_md_rep_profile.field_; return 0; } while (0)
+
 MD_REP_ALWAYS_INLINE int md_rep_bulk_try(MdRuntime *runtime, uint8_t opcode,
-                                  const MdPrefixState *prefix,
-                                  uint16_t count, uint16_t *done_out)
+                                          const MdPrefixState *prefix,
+                                          uint16_t count, uint16_t *done_out)
 {
 #if MD_REP_BULK_FAST
     MdX86 *cpu = &runtime->cpu;
@@ -657,113 +705,96 @@ MD_REP_ALWAYS_INLINE int md_rep_bulk_try(MdRuntime *runtime, uint8_t opcode,
     uint32_t src_linear = 0u, dst_linear = 0u;
     uint16_t done = 0u;
 
-    if (count < MD_REP_BULK_MIN_ELEMENTS) return 0;
-    if ((cpu->flags_raw & MD_X86_FLAG_DF) != 0u) return 0;
-    if (opcode == 0xACu || opcode == 0xADu) return 0; /* REP LODS: scalar for now. */
+    if (count < MD_REP_BULK_MIN_ELEMENTS) MD_REP_REJECT(reject_small);
+    if ((cpu->flags_raw & MD_X86_FLAG_DF) != 0u) MD_REP_REJECT(reject_df);
+    if (opcode == 0xACu || opcode == 0xADu) MD_REP_REJECT(reject_lods);
 
     if (uses_source) {
         src_linear = md_x86_linear(source_segment, si);
-        if (!md_rep_linear_range_ok(si, bytes, src_linear)) return 0;
+        if (!md_rep_linear_range_ok(si, bytes, src_linear)) MD_REP_REJECT(reject_src_wrap);
     }
     if (uses_dest) {
         dst_linear = md_x86_linear(cpu->es, di);
-        if (!md_rep_linear_range_ok(di, bytes, dst_linear)) return 0;
+        if (!md_rep_linear_range_ok(di, bytes, dst_linear)) MD_REP_REJECT(reject_dst_wrap);
     }
-    if (writes_dest && !md_rep_write_range_clear(cpu, dst_linear, bytes)) return 0;
+    if (writes_dest && !md_rep_write_range_clear(cpu, dst_linear, bytes))
+        MD_REP_REJECT(reject_exec_dest);
 
     switch (opcode) {
-        case 0xA4u: /* REP MOVSB */
-        case 0xA5u: /* REP MOVSW */
-            /* Forward x86 MOVS has propagation semantics for overlapping
-               ranges.  Only disjoint ranges may use a bulk copy. */
-            if (md_rep_ranges_overlap(src_linear, dst_linear, bytes)) return 0;
-            md_rep_copy_forward(cpu->memory + dst_linear,
-                                cpu->memory + src_linear, bytes);
+        case 0xA4u: case 0xA5u:
+            if (md_rep_ranges_overlap(src_linear, dst_linear, bytes))
+                MD_REP_REJECT(reject_overlap);
+            md_rep_copy_forward(cpu->memory + dst_linear, cpu->memory + src_linear, bytes);
             done = count;
             cpu->r[MD_X86_SI] = (uint16_t)(si + bytes);
             cpu->r[MD_X86_DI] = (uint16_t)(di + bytes);
             cpu->r[MD_X86_CX] = 0u;
             break;
 
-        case 0xAAu: /* REP STOSB */
-            md_rep_stos8_forward(cpu->memory + dst_linear, count,
-                                 md_x86_get_reg8(cpu, 0u));
+        case 0xAAu:
+            md_rep_stos8_forward(cpu->memory + dst_linear, count, md_x86_get_reg8(cpu, 0u));
             done = count;
             cpu->r[MD_X86_DI] = (uint16_t)(di + bytes);
             cpu->r[MD_X86_CX] = 0u;
             break;
 
-        case 0xABu: /* REP STOSW */
-            md_rep_stos16_forward(cpu->memory + dst_linear, count,
-                                  cpu->r[MD_X86_AX]);
+        case 0xABu:
+            md_rep_stos16_forward(cpu->memory + dst_linear, count, cpu->r[MD_X86_AX]);
             done = count;
             cpu->r[MD_X86_DI] = (uint16_t)(di + bytes);
             cpu->r[MD_X86_CX] = 0u;
             break;
 
-        case 0xA6u: /* REPE/REPNE CMPSB */
-        case 0xA7u: { /* REPE/REPNE CMPSW */
+        case 0xA6u: case 0xA7u: {
             const uint8_t *src = cpu->memory + src_linear;
             const uint8_t *dst = cpu->memory + dst_linear;
-            uint16_t lhs = 0u, rhs = 0u;
+            uint16_t lhs=0u, rhs=0u;
             while (done < count) {
-                const uint32_t off = (uint32_t)done * width;
-                if (width == 1u) {
-                    lhs = src[off];
-                    rhs = dst[off];
-                } else {
-                    lhs = md_rep_raw16(src + off);
-                    rhs = md_rep_raw16(dst + off);
-                }
+                const uint32_t off=(uint32_t)done*width;
+                if (width==1u) { lhs=src[off]; rhs=dst[off]; }
+                else { lhs=md_rep_raw16(src+off); rhs=md_rep_raw16(dst+off); }
                 ++done;
-                if ((repeat == 0xF3u && lhs != rhs) ||
-                    (repeat == 0xF2u && lhs == rhs)) break;
+                if ((repeat==0xF3u && lhs!=rhs) || (repeat==0xF2u && lhs==rhs)) break;
             }
-            if (width == 1u) (void)md_x86_sub8(cpu, (uint8_t)lhs, (uint8_t)rhs);
-            else (void)md_x86_sub16(cpu, lhs, rhs);
-            cpu->r[MD_X86_SI] = (uint16_t)(si + (uint32_t)done * width);
-            cpu->r[MD_X86_DI] = (uint16_t)(di + (uint32_t)done * width);
-            cpu->r[MD_X86_CX] = (uint16_t)(count - done);
+            if (width==1u) (void)md_x86_sub8(cpu,(uint8_t)lhs,(uint8_t)rhs);
+            else (void)md_x86_sub16(cpu,lhs,rhs);
+            cpu->r[MD_X86_SI]=(uint16_t)(si+(uint32_t)done*width);
+            cpu->r[MD_X86_DI]=(uint16_t)(di+(uint32_t)done*width);
+            cpu->r[MD_X86_CX]=(uint16_t)(count-done);
             break;
         }
 
-        case 0xAEu: /* REPNE/REPE SCASB */
-        case 0xAFu: { /* REPNE/REPE SCASW */
-            const uint8_t *dst = cpu->memory + dst_linear;
-            const uint16_t lhs = width == 1u ? md_x86_get_reg8(cpu, 0u)
-                                             : cpu->r[MD_X86_AX];
-            uint16_t rhs = 0u;
-            while (done < count) {
-                const uint32_t off = (uint32_t)done * width;
-                rhs = width == 1u ? dst[off] : md_rep_raw16(dst + off);
+        case 0xAEu: case 0xAFu: {
+            const uint8_t *dst=cpu->memory+dst_linear;
+            const uint16_t lhs=width==1u ? md_x86_get_reg8(cpu,0u) : cpu->r[MD_X86_AX];
+            uint16_t rhs=0u;
+            while (done<count) {
+                const uint32_t off=(uint32_t)done*width;
+                rhs=width==1u ? dst[off] : md_rep_raw16(dst+off);
                 ++done;
-                if ((repeat == 0xF3u && lhs != rhs) ||
-                    (repeat == 0xF2u && lhs == rhs)) break;
+                if ((repeat==0xF3u && lhs!=rhs) || (repeat==0xF2u && lhs==rhs)) break;
             }
-            if (width == 1u) (void)md_x86_sub8(cpu, (uint8_t)lhs, (uint8_t)rhs);
-            else (void)md_x86_sub16(cpu, lhs, rhs);
-            cpu->r[MD_X86_DI] = (uint16_t)(di + (uint32_t)done * width);
-            cpu->r[MD_X86_CX] = (uint16_t)(count - done);
+            if (width==1u) (void)md_x86_sub8(cpu,(uint8_t)lhs,(uint8_t)rhs);
+            else (void)md_x86_sub16(cpu,lhs,rhs);
+            cpu->r[MD_X86_DI]=(uint16_t)(di+(uint32_t)done*width);
+            cpu->r[MD_X86_CX]=(uint16_t)(count-done);
             break;
         }
-
         default:
-            return 0;
+            MD_REP_REJECT(reject_opcode);
     }
 
-    *done_out = done;
+    *done_out=done;
     return 1;
 #else
-    (void)runtime;
-    (void)opcode;
-    (void)prefix;
-    (void)count;
-    (void)done_out;
+    (void)runtime; (void)opcode; (void)prefix; (void)count; (void)done_out;
     return 0;
 #endif
 }
 
+#undef MD_REP_REJECT
 #undef MD_REP_ALWAYS_INLINE
+
 
 MD_INTERP_INLINE void md_op_string(MdRuntime *runtime, uint8_t opcode,
                                 const MdPrefixState *prefix)
