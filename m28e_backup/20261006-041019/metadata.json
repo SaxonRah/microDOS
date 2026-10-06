@@ -1,0 +1,9 @@
+{
+  "base_head": "a47b0d56d892b9ed57cb62b1f9b92fc653030fc3",
+  "created": "20261006-041019",
+  "files": [
+    "src/runtime/translate.c",
+    "tests/test_translate_diff.c"
+  ],
+  "overlay": "M28e A0-A3 moffs native lowering on M28a+b+c+d"
+}

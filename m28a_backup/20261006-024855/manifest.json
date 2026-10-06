@@ -1,0 +1,11 @@
+{
+  "base_head": "a47b0d56d892b9ed57cb62b1f9b92fc653030fc3",
+  "files": [
+    "include/microdos/translate.h",
+    "src/runtime/translate.c",
+    "pico/microdos_pico.c",
+    "pico/CMakeLists.txt"
+  ],
+  "runner_existed": false,
+  "runner": "scripts/md_m28a_profile.ps1"
+}

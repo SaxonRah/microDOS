@@ -455,40 +455,13 @@ static const uint8_t kMoffs[] = {
     0xF4                                      /* hlt */
 };
 
-/*
- * M28f hot-step directed case:
- * - CMC/CLC/STC and PUSHF/POPF flag preservation
- * - POP r/m16 memory destination
- * - FF /6 PUSH r/m16
- * - FF /7 original-8086 PUSH alias
- * - PUSH SP original-8086 post-decrement value
- */
-static const uint8_t kHotSteps[] = {
-    0xB8, 0x34, 0x12,                         /* mov ax,1234h */
-    0xF9,                                     /* stc */
-    0xF8,                                     /* clc */
-    0xF5,                                     /* cmc -> CF=1 */
-    0x9C,                                     /* pushf */
-    0xF8,                                     /* clc */
-    0x9D,                                     /* popf -> restore CF=1 */
-    0x50,                                     /* push ax */
-    0x8F, 0x06, 0x40, 0x02,                   /* pop word [0240h] */
-    0xFF, 0x36, 0x40, 0x02,                   /* push word [0240h] */
-    0x5B,                                     /* pop bx */
-    0xFF, 0xF8,                               /* /7 alias: push ax */
-    0x5A,                                     /* pop dx */
-    0xFF, 0xF4,                               /* push sp (post-decrement value) */
-    0x59,                                     /* pop cx */
-    0xF4                                      /* hlt */
-};
-
 static unsigned md_translate_directed(uint8_t *mem_a, uint8_t *b_region, int unaligned,
                                       uint8_t *arena, uint32_t arena_size)
 {
     static MdRuntime A, B;
     static MdTranslator T;
     static uint8_t smc[sizeof(kSmcLoop)];
-    DirectedProg progs[11];
+    DirectedProg progs[10];
     uint8_t *mem_b = b_region + (unaligned ? 16u : 0u);
     MdHooks hooks;
     unsigned k, fails = 0u, runs = 0u;
@@ -512,10 +485,9 @@ static unsigned md_translate_directed(uint8_t *mem_a, uint8_t *b_region, int una
     progs[7] = (DirectedProg){ "les-lds-self-ea", kLesLds, sizeof(kLesLds) };
     progs[8] = (DirectedProg){ "control-step-only", kControlOnly, sizeof(kControlOnly) };
     progs[9] = (DirectedProg){ "moffs-a0-a3", kMoffs, sizeof(kMoffs) };
-    progs[10] = (DirectedProg){ "hot-step-native", kHotSteps, sizeof(kHotSteps) };
 
     memset(&hooks, 0, sizeof(hooks));
-    for (k = 0u; k < 11u; ++k) {
+    for (k = 0u; k < 10u; ++k) {
         for (budget = 1u; budget <= 400u; budget += (budget < 64u ? 1u : 7u)) {
             unsigned d;
             memset(mem_a, 0, MD_X86_ADDRESS_SPACE);

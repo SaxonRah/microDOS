@@ -111,7 +111,6 @@ enum {
     K_ALU = 1, K_INC, K_DEC, K_MOV, K_LEA, K_XCHG, K_CBW, K_CWD, K_NOP,
     K_PUSH, K_POP, K_STEP, K_HALU, K_SHIFT, K_NOT, K_LODS, K_STOS, K_MOVS,
     K_PUSHS, K_POPS, K_MOVFS, K_MOVTS, K_SETDF, K_XCHGRR, K_LDSLES,
-    K_CFOP, K_PUSHF, K_POPF,
     K_JCC, K_JMP, K_LOOP, K_JCXZ, K_CALL, K_RET, K_LOOPZ, K_CSTEP
 };
 
@@ -187,28 +186,6 @@ static uint32_t MD_HOT_FUNC(md_tr_h_load_farptr)(MdRuntime *rt,
         md_x86_read16(&rt->cpu, s, (uint16_t)(o + 2u));
 
     return (uint32_t)value | ((uint32_t)segment << 16);
-}
-
-/* M28f: exact CF-only flag operations without a full interpreter step. */
-static void MD_HOT_FUNC(md_tr_h_cfop)(MdRuntime *rt, uint32_t op)
-{
-    MdX86 *cpu = &rt->cpu;
-    if (g_md_tr_stats != NULL) ++g_md_tr_stats->stats.helper_calls;
-    if (op == 0u) {
-        md_x86_update_flags(cpu, MD_X86_FLAG_CF, 0u);           /* CLC */
-    } else if (op == 1u) {
-        md_x86_update_flags(cpu, 0u, MD_X86_FLAG_CF);           /* STC */
-    } else {
-        const uint16_t set = md_x86_cf(cpu) ? 0u : MD_X86_FLAG_CF;
-        md_x86_update_flags(cpu, MD_X86_FLAG_CF, set);          /* CMC */
-    }
-}
-
-/* PUSHF must materialize lazy OSZAPC before forming the architectural word. */
-static uint32_t MD_HOT_FUNC(md_tr_h_flags_word)(MdRuntime *rt)
-{
-    if (g_md_tr_stats != NULL) ++g_md_tr_stats->stats.helper_calls;
-    return (uint32_t)(md_x86_flags(&rt->cpu) | MD_X86_FLAG_ALWAYS1);
 }
 
 #if MICRODOS_TRANSLATION_SUPPORT
@@ -894,44 +871,13 @@ static void MD_COMPILER_HOT_FUNC(em_op)(MdTrCtx *c, unsigned i)
             t2_sbfx(b, kG[2], kG[0], 15u, 1u);
             break;
         case K_PUSH:
-            if (op->src.kind == OPK_MEM) {
-                /* 8086 PUSH r/m reads the operand before decrementing SP. */
-                em_load(c, &op->ea, 16u, T2_R1);
-                t2_dp_imm(b, T2_SUB, 0u, kG[MD_X86_SP], kG[MD_X86_SP], 2u);
-                em_store(c, &sp, 16u, T2_R1, T2_R0, k, op->next_ip);
-            } else {
-                /* Register PUSH intentionally decrements first: PUSH SP on
-                   original 8086 stores the post-decrement SP value. */
-                t2_dp_imm(b, T2_SUB, 0u, kG[MD_X86_SP], kG[MD_X86_SP], 2u);
-                em_store(c, &sp, 16u, kG[op->src.reg], T2_R0, k, op->next_ip);
-            }
+            t2_dp_imm(b, T2_SUB, 0u, kG[MD_X86_SP], kG[MD_X86_SP], 2u);
+            em_store(c, &sp, 16u, kG[op->src.reg], T2_R0, k, op->next_ip);
             break;
         case K_POP:
             em_load(c, &sp, 16u, T2_R0);
             t2_dp_imm(b, T2_ADD, 0u, kG[MD_X86_SP], kG[MD_X86_SP], 2u);
-            if (op->dst.kind == OPK_MEM)
-                em_store(c, &op->ea, 16u, T2_R0, T2_R1, k, op->next_ip);
-            else
-                t2_mov(b, kG[op->dst.reg], T2_R0);
-            break;
-        case K_CFOP:
-            t2_mov(b, T2_R0, RCPU);
-            t2_movi(b, T2_R1, op->alu);
-            em_call(c, (const void *)md_tr_h_cfop);
-            break;
-        case K_PUSHF:
-            t2_mov(b, T2_R0, RCPU);
-            em_call(c, (const void *)md_tr_h_flags_word);
-            t2_dp_imm(b, T2_SUB, 0u, kG[MD_X86_SP], kG[MD_X86_SP], 2u);
-            em_store(c, &sp, 16u, T2_R0, T2_R1, k, op->next_ip);
-            break;
-        case K_POPF:
-            em_load(c, &sp, 16u, T2_R0);
-            t2_dp_imm(b, T2_ADD, 0u, kG[MD_X86_SP], kG[MD_X86_SP], 2u);
-            t2_dp_imm(b, T2_ORR, 0u, T2_R0, T2_R0, MD_X86_FLAG_ALWAYS1);
-            t2_ldst(b, T2_STRH_I, T2_R0, RCPU, OFF_FLAGS);
-            t2_movi(b, T2_R1, MD_LAZY_NONE);
-            t2_ldst(b, T2_STRB_I, T2_R1, RCPU, OFF_LOP);
+            t2_mov(b, kG[op->dst.reg], T2_R0);
             break;
         case K_STEP:
             em_step_call(c, op, k, 0);
@@ -1318,11 +1264,6 @@ static int MD_COMPILER_HOT_FUNC(md_tr_parse)(const uint8_t *p, size_t avail, con
             op->src.kind = OPK_IMM;
             op->src.imm = (uint16_t)(w == 16u ? (q[used] | (q[used + 1u] << 8)) : q[used]);
             return 1;
-        case 0x8F:
-            if (left < 1u || ((q[0] >> 3) & 7u) != 0u) return 0;
-            if (!parse_modrm(q, left, seg, &op->dst, &op->ea, 16u, &used)) return 0;
-            op->kind = K_POP; op->width = 16u;
-            return 1;
         case 0x8D:
             if ((q[0] >> 6) == 3u) return 0;
             if (!parse_modrm(q, left, seg, &op->src, &op->ea, 16u, &used)) return 0;
@@ -1330,23 +1271,13 @@ static int MD_COMPILER_HOT_FUNC(md_tr_parse)(const uint8_t *p, size_t avail, con
             op->dst.kind = OPK_R16; op->dst.reg = (uint8_t)((q[0] >> 3) & 7u);
             return 1;
         case 0xFE: case 0xFF: {
-            unsigned ext;
-            if (left < 1u) return 0;
-            ext = (q[0] >> 3) & 7u;
+            const unsigned ext = (q[0] >> 3) & 7u;
+            if (ext > 1u) return 0;
             w = opc == 0xFFu ? 16u : 8u;
-            if (ext <= 1u) {
-                if (!parse_modrm(q, left, seg, &op->dst, &op->ea, w, &used)) return 0;
-                op->kind = ext == 0u ? K_INC : K_DEC; op->width = (uint8_t)w;
-                op->cls = ext == 0u ? CL_INC : CL_DEC;
-                return 1;
-            }
-            if (opc == 0xFFu && (ext == 6u || ext == 7u)) {
-                /* /7 is an original-8086 alias of PUSH r/m16. */
-                if (!parse_modrm(q, left, seg, &op->src, &op->ea, 16u, &used)) return 0;
-                op->kind = K_PUSH; op->width = 16u;
-                return 1;
-            }
-            return 0;   /* CALL/JMP forms remain canonical K_CSTEP */
+            if (!parse_modrm(q, left, seg, &op->dst, &op->ea, w, &used)) return 0;
+            op->kind = ext == 0u ? K_INC : K_DEC; op->width = (uint8_t)w;
+            op->cls = ext == 0u ? CL_INC : CL_DEC;
+            return 1;
         }
         case 0xF6: case 0xF7: {
             const unsigned ext = (q[0] >> 3) & 7u;
@@ -1400,16 +1331,6 @@ static int MD_COMPILER_HOT_FUNC(md_tr_parse)(const uint8_t *p, size_t avail, con
             op->kind = K_MOVTS; op->width = 16u; op->sreg = (uint8_t)r;
             return 1;
         }
-        case 0xF5:
-            op->kind = K_CFOP; op->alu = 2u; op->cls = CL_STEP; return 1; /* CMC */
-        case 0xF8:
-            op->kind = K_CFOP; op->alu = 0u; op->cls = CL_STEP; return 1; /* CLC */
-        case 0xF9:
-            op->kind = K_CFOP; op->alu = 1u; op->cls = CL_STEP; return 1; /* STC */
-        case 0x9C:
-            op->kind = K_PUSHF; return 1;
-        case 0x9D:
-            op->kind = K_POPF; op->cls = CL_STEP; return 1;
         case 0xFC: case 0xFD: op->kind = K_SETDF; op->alu = (uint8_t)(opc & 1u); return 1;
         case 0x86: case 0x87:
             if ((q[0] >> 6) != 3u) return 0;
@@ -1479,8 +1400,7 @@ static int MD_COMPILER_HOT_FUNC(md_tr_writes_memory)(const MdTrOp *op)
     switch (op->kind) {
         case K_ALU: return op->dst.kind == OPK_MEM && !op->nowrite;
         case K_INC: case K_DEC: case K_MOV: return op->dst.kind == OPK_MEM;
-        case K_PUSH: case K_PUSHF: case K_CALL: case K_PUSHS: case K_STOS: case K_MOVS: return 1;
-        case K_POP: return op->dst.kind == OPK_MEM;
+        case K_PUSH: case K_CALL: case K_PUSHS: case K_STOS: case K_MOVS: return 1;
         case K_HALU: case K_SHIFT: case K_NOT: case K_MOVFS: return op->dst.kind == OPK_MEM;
         default: return 0;
     }
@@ -1497,9 +1417,7 @@ static void MD_COMPILER_HOT_FUNC(md_tr_analyze)(MdTrCtx *c)
     unsigned i;
     for (i = 0u; i < c->n; ++i) {
         MdTrOp *op = &c->ops[i];
-        /* PUSHF reads all flags but is not itself a flag producer. */
-        if (op->kind == K_PUSHF && p >= 0) c->ops[p].emit_lazy = 1u;
-        /* an in-block canonical/helper flag op may read any pending flag. */
+        /* an in-block step may read any flag: pending lazy state goes first */
         if (op->cls == CL_STEP && p >= 0) c->ops[p].emit_lazy = 1u;
         if (op->cls != CL_NONE) p = (int)i;
         if (c->track && md_tr_writes_memory(op) && p >= 0) c->ops[p].emit_lazy = 1u;

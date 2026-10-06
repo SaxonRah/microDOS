@@ -397,98 +397,13 @@ static const uint8_t kRecurse[] = {
    with a NUL 37 bytes in */
 static const uint8_t kScan8[] = { 0xBE, 0x00, 0x02, 0x8A, 0x04, 0x46, 0x3C, 0x00, 0x75, 0xF9, 0xF4 };
 
-/*
- * M28b far-pointer directed case.
- *
- * Prepare two m16:16 pointers, then deliberately use the destination register
- * as part of the effective address:
- *
- *     LES DI,[DI]
- *     LDS BX,[BX]
- *
- * A lowering that writes DI/BX before fetching the segment word will fail.
- */
-static const uint8_t kLesLds[] = {
-    0xBB, 0x00, 0x02,                         /* mov bx,0200h */
-    0xBF, 0x10, 0x02,                         /* mov di,0210h */
-    0xC7, 0x06, 0x00, 0x02, 0x56, 0x34,       /* word [0200]=3456h */
-    0xC7, 0x06, 0x02, 0x02, 0x9A, 0x78,       /* word [0202]=789Ah */
-    0xC7, 0x06, 0x10, 0x02, 0x11, 0x11,       /* word [0210]=1111h */
-    0xC7, 0x06, 0x12, 0x02, 0x22, 0x22,       /* word [0212]=2222h */
-    0xC4, 0x3D,                               /* les di,[di] */
-    0xC5, 0x1F,                               /* lds bx,[bx] */
-    0xF4                                      /* hlt */
-};
-
-/*
- * M28c control-step-only directed case.
- *
- * EA is an unlowered far JMP, therefore a K_CSTEP and a terminator. In eager
- * mode this program begins with a one-op control-only translated block. The
- * canonical interpreter performs the far transfer; M25 must then redispatch
- * at 1000:0108 and remain bit-exact with the reference interpreter.
- */
-static const uint8_t kControlOnly[] = {
-    0xEA, 0x08, 0x01, 0x00, 0x10,             /* jmp far 1000:0108h */
-    0x90, 0x90, 0x90,                         /* unreachable padding */
-    0xB8, 0x34, 0x12,                         /* mov ax,1234h */
-    0xF4                                      /* hlt */
-};
-
-/*
- * M28e moffs directed case.
- *
- * A3/A1 exercise the hot 16-bit DS form seen in DOS. A2/A0 use an ES
- * override so prefix routing is checked too. MOV must not alter FLAGS.
- */
-static const uint8_t kMoffs[] = {
-    0xB8, 0x34, 0x12,                         /* mov ax,1234h */
-    0xA3, 0x40, 0x02,                         /* mov [0240h],ax */
-    0xB8, 0x00, 0x00,                         /* mov ax,0000h */
-    0xA1, 0x40, 0x02,                         /* mov ax,[0240h] */
-    0xB8, 0x00, 0x03,                         /* mov ax,0300h */
-    0x8E, 0xC0,                               /* mov es,ax */
-    0xB0, 0x5A,                               /* mov al,5Ah */
-    0x26, 0xA2, 0x02, 0x02,                   /* mov es:[0202h],al */
-    0xB0, 0x00,                               /* mov al,00h */
-    0x26, 0xA0, 0x02, 0x02,                   /* mov al,es:[0202h] */
-    0xF4                                      /* hlt */
-};
-
-/*
- * M28f hot-step directed case:
- * - CMC/CLC/STC and PUSHF/POPF flag preservation
- * - POP r/m16 memory destination
- * - FF /6 PUSH r/m16
- * - FF /7 original-8086 PUSH alias
- * - PUSH SP original-8086 post-decrement value
- */
-static const uint8_t kHotSteps[] = {
-    0xB8, 0x34, 0x12,                         /* mov ax,1234h */
-    0xF9,                                     /* stc */
-    0xF8,                                     /* clc */
-    0xF5,                                     /* cmc -> CF=1 */
-    0x9C,                                     /* pushf */
-    0xF8,                                     /* clc */
-    0x9D,                                     /* popf -> restore CF=1 */
-    0x50,                                     /* push ax */
-    0x8F, 0x06, 0x40, 0x02,                   /* pop word [0240h] */
-    0xFF, 0x36, 0x40, 0x02,                   /* push word [0240h] */
-    0x5B,                                     /* pop bx */
-    0xFF, 0xF8,                               /* /7 alias: push ax */
-    0x5A,                                     /* pop dx */
-    0xFF, 0xF4,                               /* push sp (post-decrement value) */
-    0x59,                                     /* pop cx */
-    0xF4                                      /* hlt */
-};
-
 static unsigned md_translate_directed(uint8_t *mem_a, uint8_t *b_region, int unaligned,
                                       uint8_t *arena, uint32_t arena_size)
 {
     static MdRuntime A, B;
     static MdTranslator T;
     static uint8_t smc[sizeof(kSmcLoop)];
-    DirectedProg progs[11];
+    DirectedProg progs[7];
     uint8_t *mem_b = b_region + (unaligned ? 16u : 0u);
     MdHooks hooks;
     unsigned k, fails = 0u, runs = 0u;
@@ -509,13 +424,9 @@ static unsigned md_translate_directed(uint8_t *mem_a, uint8_t *b_region, int una
     progs[4] = (DirectedProg){ "smc-loop", smc, sizeof(smc) };
     progs[5] = (DirectedProg){ "recurse", kRecurse, sizeof(kRecurse) };
     progs[6] = (DirectedProg){ "scan8", kScan8, sizeof(kScan8) };
-    progs[7] = (DirectedProg){ "les-lds-self-ea", kLesLds, sizeof(kLesLds) };
-    progs[8] = (DirectedProg){ "control-step-only", kControlOnly, sizeof(kControlOnly) };
-    progs[9] = (DirectedProg){ "moffs-a0-a3", kMoffs, sizeof(kMoffs) };
-    progs[10] = (DirectedProg){ "hot-step-native", kHotSteps, sizeof(kHotSteps) };
 
     memset(&hooks, 0, sizeof(hooks));
-    for (k = 0u; k < 11u; ++k) {
+    for (k = 0u; k < 7u; ++k) {
         for (budget = 1u; budget <= 400u; budget += (budget < 64u ? 1u : 7u)) {
             unsigned d;
             memset(mem_a, 0, MD_X86_ADDRESS_SPACE);

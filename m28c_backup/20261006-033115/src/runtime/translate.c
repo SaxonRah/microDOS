@@ -111,7 +111,6 @@ enum {
     K_ALU = 1, K_INC, K_DEC, K_MOV, K_LEA, K_XCHG, K_CBW, K_CWD, K_NOP,
     K_PUSH, K_POP, K_STEP, K_HALU, K_SHIFT, K_NOT, K_LODS, K_STOS, K_MOVS,
     K_PUSHS, K_POPS, K_MOVFS, K_MOVTS, K_SETDF, K_XCHGRR, K_LDSLES,
-    K_CFOP, K_PUSHF, K_POPF,
     K_JCC, K_JMP, K_LOOP, K_JCXZ, K_CALL, K_RET, K_LOOPZ, K_CSTEP
 };
 
@@ -187,28 +186,6 @@ static uint32_t MD_HOT_FUNC(md_tr_h_load_farptr)(MdRuntime *rt,
         md_x86_read16(&rt->cpu, s, (uint16_t)(o + 2u));
 
     return (uint32_t)value | ((uint32_t)segment << 16);
-}
-
-/* M28f: exact CF-only flag operations without a full interpreter step. */
-static void MD_HOT_FUNC(md_tr_h_cfop)(MdRuntime *rt, uint32_t op)
-{
-    MdX86 *cpu = &rt->cpu;
-    if (g_md_tr_stats != NULL) ++g_md_tr_stats->stats.helper_calls;
-    if (op == 0u) {
-        md_x86_update_flags(cpu, MD_X86_FLAG_CF, 0u);           /* CLC */
-    } else if (op == 1u) {
-        md_x86_update_flags(cpu, 0u, MD_X86_FLAG_CF);           /* STC */
-    } else {
-        const uint16_t set = md_x86_cf(cpu) ? 0u : MD_X86_FLAG_CF;
-        md_x86_update_flags(cpu, MD_X86_FLAG_CF, set);          /* CMC */
-    }
-}
-
-/* PUSHF must materialize lazy OSZAPC before forming the architectural word. */
-static uint32_t MD_HOT_FUNC(md_tr_h_flags_word)(MdRuntime *rt)
-{
-    if (g_md_tr_stats != NULL) ++g_md_tr_stats->stats.helper_calls;
-    return (uint32_t)(md_x86_flags(&rt->cpu) | MD_X86_FLAG_ALWAYS1);
 }
 
 #if MICRODOS_TRANSLATION_SUPPORT
@@ -894,44 +871,13 @@ static void MD_COMPILER_HOT_FUNC(em_op)(MdTrCtx *c, unsigned i)
             t2_sbfx(b, kG[2], kG[0], 15u, 1u);
             break;
         case K_PUSH:
-            if (op->src.kind == OPK_MEM) {
-                /* 8086 PUSH r/m reads the operand before decrementing SP. */
-                em_load(c, &op->ea, 16u, T2_R1);
-                t2_dp_imm(b, T2_SUB, 0u, kG[MD_X86_SP], kG[MD_X86_SP], 2u);
-                em_store(c, &sp, 16u, T2_R1, T2_R0, k, op->next_ip);
-            } else {
-                /* Register PUSH intentionally decrements first: PUSH SP on
-                   original 8086 stores the post-decrement SP value. */
-                t2_dp_imm(b, T2_SUB, 0u, kG[MD_X86_SP], kG[MD_X86_SP], 2u);
-                em_store(c, &sp, 16u, kG[op->src.reg], T2_R0, k, op->next_ip);
-            }
+            t2_dp_imm(b, T2_SUB, 0u, kG[MD_X86_SP], kG[MD_X86_SP], 2u);
+            em_store(c, &sp, 16u, kG[op->src.reg], T2_R0, k, op->next_ip);
             break;
         case K_POP:
             em_load(c, &sp, 16u, T2_R0);
             t2_dp_imm(b, T2_ADD, 0u, kG[MD_X86_SP], kG[MD_X86_SP], 2u);
-            if (op->dst.kind == OPK_MEM)
-                em_store(c, &op->ea, 16u, T2_R0, T2_R1, k, op->next_ip);
-            else
-                t2_mov(b, kG[op->dst.reg], T2_R0);
-            break;
-        case K_CFOP:
-            t2_mov(b, T2_R0, RCPU);
-            t2_movi(b, T2_R1, op->alu);
-            em_call(c, (const void *)md_tr_h_cfop);
-            break;
-        case K_PUSHF:
-            t2_mov(b, T2_R0, RCPU);
-            em_call(c, (const void *)md_tr_h_flags_word);
-            t2_dp_imm(b, T2_SUB, 0u, kG[MD_X86_SP], kG[MD_X86_SP], 2u);
-            em_store(c, &sp, 16u, T2_R0, T2_R1, k, op->next_ip);
-            break;
-        case K_POPF:
-            em_load(c, &sp, 16u, T2_R0);
-            t2_dp_imm(b, T2_ADD, 0u, kG[MD_X86_SP], kG[MD_X86_SP], 2u);
-            t2_dp_imm(b, T2_ORR, 0u, T2_R0, T2_R0, MD_X86_FLAG_ALWAYS1);
-            t2_ldst(b, T2_STRH_I, T2_R0, RCPU, OFF_FLAGS);
-            t2_movi(b, T2_R1, MD_LAZY_NONE);
-            t2_ldst(b, T2_STRB_I, T2_R1, RCPU, OFF_LOP);
+            t2_mov(b, kG[op->dst.reg], T2_R0);
             break;
         case K_STEP:
             em_step_call(c, op, k, 0);
@@ -1252,42 +1198,6 @@ static int MD_COMPILER_HOT_FUNC(md_tr_parse)(const uint8_t *p, size_t avail, con
             op->src.imm = (uint16_t)(w == 16u ? (q[0] | (q[1] << 8)) : q[0]);
             op->cls = CL_LOGIC;
             return 1;
-
-        /*
-         * M28e: MOV accumulator <-> moffs8/moffs16 (A0-A3).
-         *
-         * These are direct 16-bit offsets, DS by default, with the ordinary
-         * 8086 segment-override prefixes. Reuse K_MOV so em_load/em_store keep
-         * the existing 16-bit offset-wrap and translated-code store guards.
-         */
-        case 0xA0: case 0xA1: case 0xA2: case 0xA3: {
-            MdTrOperand acc, mem;
-            if (left < 2u) return 0;
-            w = (opc & 1u) ? 16u : 8u;
-            acc.kind = w == 16u ? OPK_R16 : OPK_R8;
-            acc.reg = 0u;
-            acc.imm = 0u;
-            mem.kind = OPK_MEM;
-            mem.reg = 0u;
-            mem.imm = 0u;
-
-            op->kind = K_MOV;
-            op->width = (uint8_t)w;
-            op->ea.base = NOREG;
-            op->ea.index = NOREG;
-            op->ea.seg = (uint8_t)(seg ? ((seg >> 3) & 3u) : 3u);
-            op->ea.disp = (uint16_t)(q[0] | (q[1] << 8));
-
-            if ((opc & 2u) == 0u) {
-                op->dst = acc;
-                op->src = mem;
-            } else {
-                op->dst = mem;
-                op->src = acc;
-            }
-            return 1;
-        }
-
         case 0x88: case 0x89: case 0x8A: case 0x8B: {
             MdTrOperand rmo, rego;
             w = (opc & 1u) ? 16u : 8u;
@@ -1318,11 +1228,6 @@ static int MD_COMPILER_HOT_FUNC(md_tr_parse)(const uint8_t *p, size_t avail, con
             op->src.kind = OPK_IMM;
             op->src.imm = (uint16_t)(w == 16u ? (q[used] | (q[used + 1u] << 8)) : q[used]);
             return 1;
-        case 0x8F:
-            if (left < 1u || ((q[0] >> 3) & 7u) != 0u) return 0;
-            if (!parse_modrm(q, left, seg, &op->dst, &op->ea, 16u, &used)) return 0;
-            op->kind = K_POP; op->width = 16u;
-            return 1;
         case 0x8D:
             if ((q[0] >> 6) == 3u) return 0;
             if (!parse_modrm(q, left, seg, &op->src, &op->ea, 16u, &used)) return 0;
@@ -1330,23 +1235,13 @@ static int MD_COMPILER_HOT_FUNC(md_tr_parse)(const uint8_t *p, size_t avail, con
             op->dst.kind = OPK_R16; op->dst.reg = (uint8_t)((q[0] >> 3) & 7u);
             return 1;
         case 0xFE: case 0xFF: {
-            unsigned ext;
-            if (left < 1u) return 0;
-            ext = (q[0] >> 3) & 7u;
+            const unsigned ext = (q[0] >> 3) & 7u;
+            if (ext > 1u) return 0;
             w = opc == 0xFFu ? 16u : 8u;
-            if (ext <= 1u) {
-                if (!parse_modrm(q, left, seg, &op->dst, &op->ea, w, &used)) return 0;
-                op->kind = ext == 0u ? K_INC : K_DEC; op->width = (uint8_t)w;
-                op->cls = ext == 0u ? CL_INC : CL_DEC;
-                return 1;
-            }
-            if (opc == 0xFFu && (ext == 6u || ext == 7u)) {
-                /* /7 is an original-8086 alias of PUSH r/m16. */
-                if (!parse_modrm(q, left, seg, &op->src, &op->ea, 16u, &used)) return 0;
-                op->kind = K_PUSH; op->width = 16u;
-                return 1;
-            }
-            return 0;   /* CALL/JMP forms remain canonical K_CSTEP */
+            if (!parse_modrm(q, left, seg, &op->dst, &op->ea, w, &used)) return 0;
+            op->kind = ext == 0u ? K_INC : K_DEC; op->width = (uint8_t)w;
+            op->cls = ext == 0u ? CL_INC : CL_DEC;
+            return 1;
         }
         case 0xF6: case 0xF7: {
             const unsigned ext = (q[0] >> 3) & 7u;
@@ -1400,16 +1295,6 @@ static int MD_COMPILER_HOT_FUNC(md_tr_parse)(const uint8_t *p, size_t avail, con
             op->kind = K_MOVTS; op->width = 16u; op->sreg = (uint8_t)r;
             return 1;
         }
-        case 0xF5:
-            op->kind = K_CFOP; op->alu = 2u; op->cls = CL_STEP; return 1; /* CMC */
-        case 0xF8:
-            op->kind = K_CFOP; op->alu = 0u; op->cls = CL_STEP; return 1; /* CLC */
-        case 0xF9:
-            op->kind = K_CFOP; op->alu = 1u; op->cls = CL_STEP; return 1; /* STC */
-        case 0x9C:
-            op->kind = K_PUSHF; return 1;
-        case 0x9D:
-            op->kind = K_POPF; op->cls = CL_STEP; return 1;
         case 0xFC: case 0xFD: op->kind = K_SETDF; op->alu = (uint8_t)(opc & 1u); return 1;
         case 0x86: case 0x87:
             if ((q[0] >> 6) != 3u) return 0;
@@ -1479,8 +1364,7 @@ static int MD_COMPILER_HOT_FUNC(md_tr_writes_memory)(const MdTrOp *op)
     switch (op->kind) {
         case K_ALU: return op->dst.kind == OPK_MEM && !op->nowrite;
         case K_INC: case K_DEC: case K_MOV: return op->dst.kind == OPK_MEM;
-        case K_PUSH: case K_PUSHF: case K_CALL: case K_PUSHS: case K_STOS: case K_MOVS: return 1;
-        case K_POP: return op->dst.kind == OPK_MEM;
+        case K_PUSH: case K_CALL: case K_PUSHS: case K_STOS: case K_MOVS: return 1;
         case K_HALU: case K_SHIFT: case K_NOT: case K_MOVFS: return op->dst.kind == OPK_MEM;
         default: return 0;
     }
@@ -1497,9 +1381,7 @@ static void MD_COMPILER_HOT_FUNC(md_tr_analyze)(MdTrCtx *c)
     unsigned i;
     for (i = 0u; i < c->n; ++i) {
         MdTrOp *op = &c->ops[i];
-        /* PUSHF reads all flags but is not itself a flag producer. */
-        if (op->kind == K_PUSHF && p >= 0) c->ops[p].emit_lazy = 1u;
-        /* an in-block canonical/helper flag op may read any pending flag. */
+        /* an in-block step may read any flag: pending lazy state goes first */
         if (op->cls == CL_STEP && p >= 0) c->ops[p].emit_lazy = 1u;
         if (op->cls != CL_NONE) p = (int)i;
         if (c->track && md_tr_writes_memory(op) && p >= 0) c->ops[p].emit_lazy = 1u;
@@ -1805,6 +1687,9 @@ static int MD_COMPILER_HOT_FUNC(md_tr_translate)(MdTranslator *tr, MdTrBlock *bl
         if (!md_tr_add_page(c->page, &c->page_count, p0) ||
             !md_tr_add_page(c->page, &c->page_count, p1)) break;
         if (!md_tr_parse(win + at, wlen - at, &in, op)) {
+#if defined(MICRODOS_M28_PROFILE) && MICRODOS_M28_PROFILE
+            ++tr->m28.parse_miss_hist[in.opcode];
+#endif
             /* never reject: run it in place with the interpreter if it is
                ordinary straight-line code */
             const uint8_t o = in.opcode;
@@ -1827,23 +1712,21 @@ static int MD_COMPILER_HOT_FUNC(md_tr_translate)(MdTranslator *tr, MdTrBlock *bl
     }
     c->end_ip = cur;
 
-    /*
-     * Mostly-native blocks remain the rule. M28c makes one deliberately narrow
-     * exception: a block containing exactly one control step. K_CSTEP already
-     * executes the instruction through the canonical interpreter and then
-     * redispatches from the resulting CS:IP. Keeping this one-op block avoids
-     * turning a hot INT/IRET/far/indirect-control head into a long threaded-
-     * interpreter episode that runs until the next taken back-edge.
-     */
-    {
-        const int control_only = c->n == 1u && natives == 0u && steps == 1u &&
-                                 c->ops[0].kind == K_CSTEP;
-        if (!control_only && (natives == 0u || natives < steps))
-            c->n = 0u;
-    }
+    /* a block of nothing but interpreter steps is slower than the interpreter */
+    if (natives == 0u || natives < steps) c->n = 0u;   /* B: mostly-native blocks only */
     tr->stats.step_ops += steps;
 
     if (c->n == 0u) {
+#if defined(MICRODOS_M28_PROFILE) && MICRODOS_M28_PROFILE
+        {
+            MdDecodedInstruction head;
+            if (natives == 0u && steps != 0u) ++tr->m28.untrans_only_steps;
+            else if (natives < steps) ++tr->m28.untrans_step_heavy;
+            else ++tr->m28.untrans_empty;
+            if (md_decode_8086(win, wlen, ip, ip, &head) && head.valid_8086)
+                ++tr->m28.untrans_head_hist[head.opcode];
+        }
+#endif
         const unsigned page = md_x86_code_page(md_x86_linear(cs, ip));
         blk->state = 2u;
         blk->page[0] = (uint8_t)page;
@@ -1972,6 +1855,87 @@ static MdTrBlock *MD_EXEC_HOT_FUNC(md_tr_lookup)(MdTranslator *tr, uint16_t cs, 
 }
 #endif
 
+
+#if defined(MICRODOS_M28_PROFILE) && MICRODOS_M28_PROFILE
+static uint8_t md_m28_opcode_at(const MdX86 *cpu, uint16_t cs, uint16_t ip)
+{
+    uint8_t o = cpu->memory[md_x86_linear(cs, ip) & MD_X86_ADDRESS_MASK];
+    unsigned k;
+    for (k = 0u; k < 4u &&
+         (((o & 0xE7u) == 0x26u) || o == 0xF0u || o == 0xF2u || o == 0xF3u);
+         ++k) {
+        o = cpu->memory[md_x86_linear(cs, (uint16_t)(ip + k + 1u)) & MD_X86_ADDRESS_MASK];
+    }
+    return o;
+}
+
+static unsigned md_m28_episode_bin(uint32_t retired)
+{
+    if (retired <= 1u) return 0u;
+    if (retired <= 3u) return 1u;
+    if (retired <= 7u) return 2u;
+    if (retired <= 15u) return 3u;
+    if (retired <= 31u) return 4u;
+    if (retired <= 63u) return 5u;
+    if (retired <= 127u) return 6u;
+    if (retired <= 255u) return 7u;
+    return 8u;
+}
+
+static void md_m28_record_interp(MdTranslator *tr, unsigned reason,
+                                  uint16_t cs, uint16_t ip, uint8_t opcode,
+                                  uint32_t retired, uint32_t cycles)
+{
+    MdM28Profile *p = &tr->m28;
+    MdM28InterpSite *empty = NULL;
+    unsigned i, bin;
+
+    if (reason >= MD_M28_INTERP_REASON_COUNT) return;
+    ++p->runs[reason];
+    p->instructions[reason] += retired;
+    p->cycles[reason] += cycles;
+    bin = md_m28_episode_bin(retired);
+    ++p->episode_runs[bin];
+    p->episode_instructions[bin] += retired;
+
+    for (i = 0u; i < MD_M28_INTERP_SITE_SLOTS; ++i) {
+        MdM28InterpSite *s = &p->sites[i];
+        if (s->runs == 0u) {
+            if (empty == NULL) empty = s;
+            continue;
+        }
+        if (s->cs == cs && s->ip == ip && s->reason == reason) {
+            ++s->runs;
+            s->instructions += retired;
+            s->cycles += cycles;
+            if (retired > s->max_retired) s->max_retired = retired;
+            return;
+        }
+    }
+
+    if (empty != NULL) {
+        empty->cs = cs;
+        empty->ip = ip;
+        empty->opcode = opcode;
+        empty->reason = (uint8_t)reason;
+        empty->runs = 1u;
+        empty->max_retired = retired;
+        empty->instructions = retired;
+        empty->cycles = cycles;
+    } else {
+        ++p->site_overflow_runs;
+        p->site_overflow_instructions += retired;
+    }
+}
+
+void md_tr_m28_profile_reset(MdTranslator *tr)
+{
+    if (tr == NULL) return;
+    memset(&tr->m28, 0, sizeof(tr->m28));
+    memset(tr->step_hist, 0, sizeof(tr->step_hist));
+}
+#endif
+
 /* ---- run loop ------------------------------------------------------------------ */
 
 MdStopReason MD_HOT_FUNC(md_tr_run)(MdTranslator *tr, uint64_t budget)
@@ -2024,13 +1988,30 @@ MdStopReason MD_HOT_FUNC(md_tr_run)(MdTranslator *tr, uint64_t budget)
                    at full speed until it reaches a loop head (taken JNZ/LOOP
                    back-edge), then let that loop head heat up. */
                 const uint64_t before = rt->instructions;
+#if defined(MICRODOS_M28_PROFILE) && MICRODOS_M28_PROFILE
+                const uint16_t m28_cs = rt->cpu.cs;
+                const uint16_t m28_ip = rt->cpu.ip;
+                const uint8_t m28_op = md_m28_opcode_at(&rt->cpu, m28_cs, m28_ip);
+                const unsigned m28_reason = blk == NULL ? MD_M28_INTERP_COLD :
+                    (blk->state != 1u ? MD_M28_INTERP_UNTRANS : MD_M28_INTERP_BUDGET);
+                uint32_t m28_cyc;
+#endif
                 rt->native_v2_backedge_hit = 0u;
                 cyc = MD_TR_CYC();
                 (void)md_interp_run(rt, budget);
+#if defined(MICRODOS_M28_PROFILE) && MICRODOS_M28_PROFILE
+                m28_cyc = (uint32_t)(MD_TR_CYC() - cyc);
+                tr->stats.cyc_interp += m28_cyc;
+#else
                 tr->stats.cyc_interp += (uint32_t)(MD_TR_CYC() - cyc);
+#endif
                 retired = (uint32_t)(rt->instructions - before);
                 budget -= retired;
                 tr->stats.interp_instructions += retired;
+#if defined(MICRODOS_M28_PROFILE) && MICRODOS_M28_PROFILE
+                md_m28_record_interp(tr, m28_reason, m28_cs, m28_ip, m28_op,
+                                     retired, m28_cyc);
+#endif
                 if (rt->native_v2_backedge_hit) {
                     const uint16_t bcs = rt->native_v2_backedge_cs, bip = rt->native_v2_backedge_ip;
                     MdTrBlock *t = &tr->blocks[md_tr_hash(bcs, bip)];

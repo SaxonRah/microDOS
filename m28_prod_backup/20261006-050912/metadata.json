@@ -1,0 +1,29 @@
+{
+  "base_head": "a47b0d56d892b9ed57cb62b1f9b92fc653030fc3",
+  "source_base": "git HEAD verified frozen M27 blobs",
+  "created": "20261006-050912",
+  "files": [
+    "include/microdos/translate.h",
+    "src/runtime/translate.c",
+    "pico/microdos_pico.c",
+    "pico/CMakeLists.txt",
+    "tests/test_translate_diff.c",
+    "scripts/md_m28a_profile.ps1",
+    "scripts/md_m28b_ldsles.ps1",
+    "scripts/md_m28c_control_step.ps1",
+    "scripts/md_m28d_block_poison.ps1",
+    "scripts/md_m28e_moffs.ps1"
+  ],
+  "existed": {
+    "include/microdos/translate.h": true,
+    "src/runtime/translate.c": true,
+    "pico/microdos_pico.c": true,
+    "pico/CMakeLists.txt": true,
+    "tests/test_translate_diff.c": true,
+    "scripts/md_m28a_profile.ps1": true,
+    "scripts/md_m28b_ldsles.ps1": true,
+    "scripts/md_m28c_control_step.ps1": true,
+    "scripts/md_m28d_block_poison.ps1": true,
+    "scripts/md_m28e_moffs.ps1": true
+  }
+}
