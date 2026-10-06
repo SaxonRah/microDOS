@@ -403,42 +403,6 @@ target_compile_definitions(microdos_pico_m25_nv2_exec_combo_qmi PRIVATE
     MICRODOS_PICO_DOS_HOT_CODE=1)
 pico_set_program_name(microdos_pico_m25_nv2_exec_combo_qmi "microDOS M26d EXEC+COMBO")
 
-# M28h: M28f + native Group-3/control lowering at the M28g-selected 224 KiB arena.
-md_m26_m25_nv2(microdos_pico_m28h_combo224_qmi 0 1 224)
-target_compile_definitions(microdos_pico_m28h_combo224_qmi PRIVATE
-    MICRODOS_PICO_EXEC_HOT_CODE=1 MICRODOS_PICO_QMI_PROFILE=1
-    MICRODOS_PICO_COMPILER_HOT_CODE=1
-    MICRODOS_PICO_INTERP_HELPERS_HOT=1
-    MICRODOS_PICO_DOS_HOT_CODE=1)
-pico_set_program_name(microdos_pico_m28h_combo224_qmi "microDOS M28h COMBO 224K")
-
-# === M28g arena residency matrix BEGIN ===
-# Same M28f translator and M26d COMBO placement. Only M25 arena size differs.
-md_m26_m25_nv2(microdos_pico_m28f_combo192_qmi 0 1 192)
-target_compile_definitions(microdos_pico_m28f_combo192_qmi PRIVATE
-    MICRODOS_PICO_EXEC_HOT_CODE=1 MICRODOS_PICO_QMI_PROFILE=1
-    MICRODOS_PICO_COMPILER_HOT_CODE=1
-    MICRODOS_PICO_INTERP_HELPERS_HOT=1
-    MICRODOS_PICO_DOS_HOT_CODE=1)
-pico_set_program_name(microdos_pico_m28f_combo192_qmi "microDOS M28f COMBO 192K")
-
-md_m26_m25_nv2(microdos_pico_m28f_combo224_qmi 0 1 224)
-target_compile_definitions(microdos_pico_m28f_combo224_qmi PRIVATE
-    MICRODOS_PICO_EXEC_HOT_CODE=1 MICRODOS_PICO_QMI_PROFILE=1
-    MICRODOS_PICO_COMPILER_HOT_CODE=1
-    MICRODOS_PICO_INTERP_HELPERS_HOT=1
-    MICRODOS_PICO_DOS_HOT_CODE=1)
-pico_set_program_name(microdos_pico_m28f_combo224_qmi "microDOS M28f COMBO 224K")
-
-md_m26_m25_nv2(microdos_pico_m28f_combo256_qmi 0 1 256)
-target_compile_definitions(microdos_pico_m28f_combo256_qmi PRIVATE
-    MICRODOS_PICO_EXEC_HOT_CODE=1 MICRODOS_PICO_QMI_PROFILE=1
-    MICRODOS_PICO_COMPILER_HOT_CODE=1
-    MICRODOS_PICO_INTERP_HELPERS_HOT=1
-    MICRODOS_PICO_DOS_HOT_CODE=1)
-pico_set_program_name(microdos_pico_m28f_combo256_qmi "microDOS M28f COMBO 256K")
-# === M28g arena residency matrix END ===
-
 # M25 translator on-device check: differential test (interpreter vs
 # translated Thumb-2, guest RAM in PSRAM) plus interpreter-vs-translator
 # loop benchmarks. Run with scripts/md_translate_diff_pico.ps1.
@@ -459,19 +423,3 @@ pico_set_program_name(microdos_pico_translate_diff "microDOS M25 translate diff"
 
 md_pico_bench(microdos_bench     1 300000)
 md_pico_bench(microdos_bench_150 1 0)
-
-# M28h targeted random-failure bisector. Diagnostic-only.
-add_executable(microdos_pico_m28h_failure_diag
-    "${CMAKE_CURRENT_LIST_DIR}/microdos_m28h_failure_diag.c"
-    "${MD_ROOT}/src/runtime/runtime.c"
-    "${MD_ROOT}/src/runtime/x86_interp.c"
-    "${MD_ROOT}/src/runtime/x86_block_cache.c"
-    "${MD_ROOT}/src/runtime/region.c"
-    "${MD_ROOT}/src/runtime/translate.c"
-    "${MD_ROOT}/src/decode/x86_decode.c")
-md_pico_common(microdos_pico_m28h_failure_diag 1)
-target_include_directories(microdos_pico_m28h_failure_diag PRIVATE "${MD_ROOT}/tests")
-target_compile_definitions(microdos_pico_m28h_failure_diag PRIVATE
-    MICRODOS_PICO_SYS_KHZ=300000
-    MICRODOS_ENABLE_BACKEDGE_EXIT=1)
-pico_set_program_name(microdos_pico_m28h_failure_diag "microDOS M28h failure diag")

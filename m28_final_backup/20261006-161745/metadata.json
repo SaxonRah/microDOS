@@ -1,0 +1,14 @@
+{
+  "base_head": "773c6ac9102bfe4b6f42cb81b6f1fca602aee793",
+  "created": "20261006-161745",
+  "cmake": "pico/CMakeLists.txt",
+  "temp_files": [
+    "pico/microdos_m28h_failure_diag.c",
+    "scripts/md_m28h_failure_diag.ps1",
+    "scripts/md_m28h_v2.ps1",
+    "scripts/md_m28h_group3_control.ps1",
+    "scripts/md_m28g_arena_matrix.ps1",
+    "scripts/md_m28f_hot_steps.ps1",
+    "scripts/md_m28_prod.ps1"
+  ]
+}

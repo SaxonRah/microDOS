@@ -1049,22 +1049,9 @@ static void MD_COMPILER_HOT_FUNC(em_op)(MdTrCtx *c, unsigned i)
             t2_ldst(b, T2_LDRH_I, kG[MD_X86_DX], RCPU, OFF_R(MD_X86_DX));
             t2_ldst(b, T2_LDRH_I, kG[MD_X86_SP], RCPU, OFF_R(MD_X86_SP));
 
-            /*
-             * Success falls through. Type-0/stop leaves translated execution.
-             *
-             * The block guard prepaid c->n instructions. If MUL/DIV exits at
-             * guest op k, refund the unexecuted tail exactly like K_STEP's
-             * shared thunk does. Without this, a mid-block divide fault makes
-             * md_tr_run() consume too much budget and later stop at the wrong
-             * CS:IP even though the fault itself was architecturally correct.
-             */
+            /* Success falls through. Type-0/stop leaves translated execution. */
             t2_dp_imm(b, T2_SUB, 1u, T2_PC, T2_R0, 0u);
             j_ok = t2_b_fwd(b);
-            if (c->n > k) {
-                t2_ldst(b, T2_LDR_I, T2_R2, T2_SP, 0u);
-                t2_addw(b, T2_R2, T2_R2, c->n - k);
-                t2_ldst(b, T2_STR_I, T2_R2, T2_SP, 0u);
-            }
             t2_ldst(b, T2_LDRH_I, T2_R1, RCPU, OFF_IP);
             t2_mov32(b, T2_R0, (uint32_t)MD_TR_EXIT_DYNAMIC << 24);
             t2_b_to(b, c->tr->exit_off);

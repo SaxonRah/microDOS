@@ -111,9 +111,8 @@ enum {
     K_ALU = 1, K_INC, K_DEC, K_MOV, K_LEA, K_XCHG, K_CBW, K_CWD, K_NOP,
     K_PUSH, K_POP, K_STEP, K_HALU, K_SHIFT, K_NOT, K_LODS, K_STOS, K_MOVS,
     K_PUSHS, K_POPS, K_MOVFS, K_MOVTS, K_SETDF, K_XCHGRR, K_LDSLES,
-    K_CFOP, K_PUSHF, K_POPF, K_MULDIV,
-    K_JCC, K_JMP, K_LOOP, K_JCXZ, K_CALL, K_RET, K_LOOPZ, K_CSTEP,
-    K_CALLRM, K_JMPRM, K_CALLFAR, K_JMPFAR, K_RETF, K_IRET
+    K_CFOP, K_PUSHF, K_POPF,
+    K_JCC, K_JMP, K_LOOP, K_JCXZ, K_CALL, K_RET, K_LOOPZ, K_CSTEP
 };
 
 /* lazy classes */
@@ -210,95 +209,6 @@ static uint32_t MD_HOT_FUNC(md_tr_h_flags_word)(MdRuntime *rt)
 {
     if (g_md_tr_stats != NULL) ++g_md_tr_stats->stats.helper_calls;
     return (uint32_t)(md_x86_flags(&rt->cpu) | MD_X86_FLAG_ALWAYS1);
-}
-
-/*
- * M28h Group-3 helper.
- *
- * AX/DX/SP are synchronized by generated code before entry. The helper sets
- * architectural IP to next_ip so a Type-0 divide fault pushes the same return
- * IP as the canonical interpreter. REP/REPNE never reach this helper: the M25
- * parser still rejects those prefixes, preserving the original-8086 IDIV sign
- * latch behavior in the canonical interpreter.
- *
- * Return nonzero if execution redirected (divide fault) or stopped.
- */
-static uint32_t MD_HOT_FUNC(md_tr_h_muldiv)(MdRuntime *rt,
-                                             uint32_t opw,
-                                             uint32_t operand,
-                                             uint32_t ips)
-{
-    MdX86 *cpu = &rt->cpu;
-    const uint16_t old_cs = cpu->cs;
-    const uint16_t old_sp = cpu->r[MD_X86_SP];
-    const uint16_t next_ip = (uint16_t)ips;
-    const uint16_t ip_before = (uint16_t)(ips >> 16);
-
-    if (g_md_tr_stats != NULL) ++g_md_tr_stats->stats.helper_calls;
-
-    cpu->ip = next_ip;
-    md_interp_muldiv(rt,
-                     (uint8_t)(opw & 0xFFu),
-                     (unsigned)((opw >> 8) & 7u),
-                     (uint16_t)operand,
-                     ip_before);
-
-    return rt->stop_reason != MD_STOP_NONE ||
-           cpu->cs != old_cs ||
-           cpu->ip != next_ip ||
-           cpu->r[MD_X86_SP] != old_sp;
-}
-
-/* Targeted control helpers: no decode, only architectural stack/control work. */
-static uint32_t MD_HOT_FUNC(md_tr_h_call_near)(MdRuntime *rt,
-                                                uint32_t target,
-                                                uint32_t return_ip)
-{
-    if (g_md_tr_stats != NULL) ++g_md_tr_stats->stats.helper_calls;
-    md_x86_push(&rt->cpu, (uint16_t)return_ip);
-    rt->cpu.ip = (uint16_t)target;
-    return (uint16_t)target;
-}
-
-static uint32_t MD_HOT_FUNC(md_tr_h_call_far)(MdRuntime *rt,
-                                               uint32_t farptr,
-                                               uint32_t return_ip)
-{
-    MdX86 *cpu = &rt->cpu;
-    const uint16_t target_ip = (uint16_t)farptr;
-    const uint16_t target_cs = (uint16_t)(farptr >> 16);
-
-    if (g_md_tr_stats != NULL) ++g_md_tr_stats->stats.helper_calls;
-
-    /* 8086 far CALL pushes CS first, then return IP. */
-    md_x86_push(cpu, cpu->cs);
-    md_x86_push(cpu, (uint16_t)return_ip);
-    cpu->cs = target_cs;
-    cpu->ip = target_ip;
-    return farptr;
-}
-
-/* kind 0 = RETF, kind 1 = IRET. Returns target IP | target CS << 16. */
-static uint32_t MD_HOT_FUNC(md_tr_h_retctl)(MdRuntime *rt,
-                                             uint32_t kind,
-                                             uint32_t adjust)
-{
-    MdX86 *cpu = &rt->cpu;
-    const uint16_t target_ip = md_x86_pop(cpu);
-    const uint16_t target_cs = md_x86_pop(cpu);
-
-    if (g_md_tr_stats != NULL) ++g_md_tr_stats->stats.helper_calls;
-
-    cpu->ip = target_ip;
-    cpu->cs = target_cs;
-
-    if (kind == 0u) {
-        cpu->r[MD_X86_SP] = (uint16_t)(cpu->r[MD_X86_SP] + (uint16_t)adjust);
-    } else {
-        md_x86_set_flags(cpu, (uint16_t)(md_x86_pop(cpu) | MD_X86_FLAG_ALWAYS1));
-    }
-
-    return (uint32_t)target_ip | ((uint32_t)target_cs << 16);
 }
 
 #if MICRODOS_TRANSLATION_SUPPORT
@@ -1023,138 +933,6 @@ static void MD_COMPILER_HOT_FUNC(em_op)(MdTrCtx *c, unsigned i)
             t2_movi(b, T2_R1, MD_LAZY_NONE);
             t2_ldst(b, T2_STRB_I, T2_R1, RCPU, OFF_LOP);
             break;
-        case K_MULDIV: {
-            unsigned rv;
-            uint32_t j_ok;
-
-            if (op->src.kind == OPK_MEM) {
-                em_load(c, &op->ea, op->width, T2_R0);
-                rv = T2_R0;
-            } else {
-                rv = em_operand(c, &op->src, op->width, T2_R0);
-            }
-            if (rv != T2_R2) t2_mov(b, T2_R2, rv);
-
-            /* Canonical helper reads AX/DX and may need SP for Type-0. */
-            t2_ldst(b, T2_STRH_I, kG[MD_X86_AX], RCPU, OFF_R(MD_X86_AX));
-            t2_ldst(b, T2_STRH_I, kG[MD_X86_DX], RCPU, OFF_R(MD_X86_DX));
-            t2_ldst(b, T2_STRH_I, kG[MD_X86_SP], RCPU, OFF_R(MD_X86_SP));
-
-            t2_movw(b, T2_R1, ((uint32_t)op->alu << 8) | (op->imm & 0xFFu));
-            t2_mov32(b, T2_R3, ((uint32_t)op->ip << 16) | op->next_ip);
-            t2_mov(b, T2_R0, RCPU);
-            em_call(c, (const void *)md_tr_h_muldiv);
-
-            t2_ldst(b, T2_LDRH_I, kG[MD_X86_AX], RCPU, OFF_R(MD_X86_AX));
-            t2_ldst(b, T2_LDRH_I, kG[MD_X86_DX], RCPU, OFF_R(MD_X86_DX));
-            t2_ldst(b, T2_LDRH_I, kG[MD_X86_SP], RCPU, OFF_R(MD_X86_SP));
-
-            /*
-             * Success falls through. Type-0/stop leaves translated execution.
-             *
-             * The block guard prepaid c->n instructions. If MUL/DIV exits at
-             * guest op k, refund the unexecuted tail exactly like K_STEP's
-             * shared thunk does. Without this, a mid-block divide fault makes
-             * md_tr_run() consume too much budget and later stop at the wrong
-             * CS:IP even though the fault itself was architecturally correct.
-             */
-            t2_dp_imm(b, T2_SUB, 1u, T2_PC, T2_R0, 0u);
-            j_ok = t2_b_fwd(b);
-            if (c->n > k) {
-                t2_ldst(b, T2_LDR_I, T2_R2, T2_SP, 0u);
-                t2_addw(b, T2_R2, T2_R2, c->n - k);
-                t2_ldst(b, T2_STR_I, T2_R2, T2_SP, 0u);
-            }
-            t2_ldst(b, T2_LDRH_I, T2_R1, RCPU, OFF_IP);
-            t2_mov32(b, T2_R0, (uint32_t)MD_TR_EXIT_DYNAMIC << 24);
-            t2_b_to(b, c->tr->exit_off);
-            t2_patch_bcc(b, j_ok, T2_EQ, t2_here(b));
-            break;
-        }
-
-        case K_CALLRM: {
-            unsigned rv;
-            if (op->src.kind == OPK_MEM) {
-                em_load(c, &op->ea, 16u, T2_R0);
-                rv = T2_R0;
-            } else {
-                rv = em_operand(c, &op->src, 16u, T2_R0);
-            }
-            t2_uxth(b, T2_R1, rv);  /* capture target before PUSH (CALL SP) */
-            t2_ldst(b, T2_STRH_I, kG[MD_X86_SP], RCPU, OFF_R(MD_X86_SP));
-            t2_mov(b, T2_R0, RCPU);
-            t2_movw(b, T2_R2, op->next_ip);
-            em_call(c, (const void *)md_tr_h_call_near);
-            t2_ldst(b, T2_LDRH_I, kG[MD_X86_SP], RCPU, OFF_R(MD_X86_SP));
-            t2_uxth(b, T2_R1, T2_R0);
-            em_dispatch(c);
-            break;
-        }
-
-        case K_JMPRM: {
-            unsigned rv;
-            if (op->src.kind == OPK_MEM) {
-                em_load(c, &op->ea, 16u, T2_R1);
-                rv = T2_R1;
-            } else {
-                rv = em_operand(c, &op->src, 16u, T2_R0);
-                t2_uxth(b, T2_R1, rv);
-            }
-            if (rv == T2_R1) t2_uxth(b, T2_R1, T2_R1);
-            t2_ldst(b, T2_STRH_I, T2_R1, RCPU, OFF_IP);
-            em_dispatch(c);
-            break;
-        }
-
-        case K_CALLFAR:
-            em_ea(c, &op->ea, T2_R2, T2_R3);
-            t2_mov(b, T2_R0, RCPU);
-            t2_ldst(b, T2_LDRH_I, T2_R1, RCPU, md_tr_seg_off(op->ea.seg));
-            em_call(c, (const void *)md_tr_h_load_farptr);
-            t2_mov(b, T2_R1, T2_R0);
-            t2_ldst(b, T2_STRH_I, kG[MD_X86_SP], RCPU, OFF_R(MD_X86_SP));
-            t2_mov(b, T2_R0, RCPU);
-            t2_movw(b, T2_R2, op->next_ip);
-            em_call(c, (const void *)md_tr_h_call_far);
-            t2_ldst(b, T2_LDRH_I, kG[MD_X86_SP], RCPU, OFF_R(MD_X86_SP));
-            t2_ubfx(b, T2_R1, T2_R0, 0u, 16u);
-            em_dispatch_cs(c, 1);
-            break;
-
-        case K_JMPFAR:
-            em_ea(c, &op->ea, T2_R2, T2_R3);
-            t2_mov(b, T2_R0, RCPU);
-            t2_ldst(b, T2_LDRH_I, T2_R1, RCPU, md_tr_seg_off(op->ea.seg));
-            em_call(c, (const void *)md_tr_h_load_farptr);
-            t2_ubfx(b, T2_R1, T2_R0, 0u, 16u);
-            t2_ubfx(b, T2_R2, T2_R0, 16u, 16u);
-            t2_ldst(b, T2_STRH_I, T2_R1, RCPU, OFF_IP);
-            t2_ldst(b, T2_STRH_I, T2_R2, RCPU, md_tr_seg_off(1u));
-            em_dispatch_cs(c, 1);
-            break;
-
-        case K_RETF:
-            t2_ldst(b, T2_STRH_I, kG[MD_X86_SP], RCPU, OFF_R(MD_X86_SP));
-            t2_mov(b, T2_R0, RCPU);
-            t2_movi(b, T2_R1, 0u);
-            t2_movw(b, T2_R2, op->imm);
-            em_call(c, (const void *)md_tr_h_retctl);
-            t2_ldst(b, T2_LDRH_I, kG[MD_X86_SP], RCPU, OFF_R(MD_X86_SP));
-            t2_ubfx(b, T2_R1, T2_R0, 0u, 16u);
-            em_dispatch_cs(c, 1);
-            break;
-
-        case K_IRET:
-            t2_ldst(b, T2_STRH_I, kG[MD_X86_SP], RCPU, OFF_R(MD_X86_SP));
-            t2_mov(b, T2_R0, RCPU);
-            t2_movi(b, T2_R1, 1u);
-            t2_movi(b, T2_R2, 0u);
-            em_call(c, (const void *)md_tr_h_retctl);
-            t2_ldst(b, T2_LDRH_I, kG[MD_X86_SP], RCPU, OFF_R(MD_X86_SP));
-            t2_ubfx(b, T2_R1, T2_R0, 0u, 16u);
-            em_dispatch_cs(c, 1);
-            break;
-
         case K_STEP:
             em_step_call(c, op, k, 0);
             break;
@@ -1562,51 +1340,30 @@ static int MD_COMPILER_HOT_FUNC(md_tr_parse)(const uint8_t *p, size_t avail, con
                 op->cls = ext == 0u ? CL_INC : CL_DEC;
                 return 1;
             }
-            if (opc == 0xFFu && ext >= 2u && ext <= 5u) {
-                if (!parse_modrm(q, left, seg, &op->src, &op->ea, 16u, &used)) return 0;
-                if ((ext == 3u || ext == 5u) && op->src.kind != OPK_MEM)
-                    return 0;
-                op->width = 16u;
-                if (ext == 2u) op->kind = K_CALLRM;
-                else if (ext == 3u) op->kind = K_CALLFAR;
-                else if (ext == 4u) op->kind = K_JMPRM;
-                else op->kind = K_JMPFAR;
-                return 1;
-            }
             if (opc == 0xFFu && (ext == 6u || ext == 7u)) {
                 /* /7 is an original-8086 alias of PUSH r/m16. */
                 if (!parse_modrm(q, left, seg, &op->src, &op->ea, 16u, &used)) return 0;
                 op->kind = K_PUSH; op->width = 16u;
                 return 1;
             }
-            return 0;
+            return 0;   /* CALL/JMP forms remain canonical K_CSTEP */
         }
         case 0xF6: case 0xF7: {
             const unsigned ext = (q[0] >> 3) & 7u;
             w = (opc & 1u) ? 16u : 8u;
-
-            /* /1 stays canonical; REP/REPNE/LOCK were rejected above. */
-            if (ext == 1u) return 0;
-
-            if (ext >= 4u) {
-                if (!parse_modrm(q, left, seg, &op->src, &op->ea, w, &used)) return 0;
-                op->kind = K_MULDIV;
-                op->width = (uint8_t)w;
-                op->alu = (uint8_t)ext;
-                op->imm = opc;
-                op->cls = CL_STEP;
-                return 1;
-            }
-
+            /* MUL/IMUL/DIV/IDIV: step. /1 is the undocumented TEST alias: the
+               interpreter gives it an immediate the structural decoder does
+               not, so it must go through a (length-checked) step. */
+            if (ext >= 4u || ext == 1u) return 0;
             if (!parse_modrm(q, left, seg, &op->dst, &op->ea, w, &used)) return 0;
             op->width = (uint8_t)w;
-            if (ext == 0u) {
+            if (ext == 0u) {                          /* TEST r/m,imm */
                 op->kind = K_ALU; op->alu = 4u; op->nowrite = 1u; op->cls = CL_LOGIC;
                 op->src.kind = OPK_IMM;
                 op->src.imm = (uint16_t)(w == 16u ? (q[used] | (q[used + 1u] << 8)) : q[used]);
             } else if (ext == 2u) {
                 op->kind = K_NOT;
-            } else {
+            } else {                                  /* NEG = 0 - x */
                 op->kind = K_HALU; op->alu = 5u; op->neg = 1u; op->cls = CL_STEP;
             }
             return 1;
@@ -1673,12 +1430,6 @@ static int MD_COMPILER_HOT_FUNC(md_tr_parse)(const uint8_t *p, size_t avail, con
         case 0xE8: op->kind = K_CALL; return 1;
         case 0xC3: case 0xC1: op->kind = K_RET; return 1;
         case 0xC2: case 0xC0: op->kind = K_RET; op->imm = (uint16_t)(q[0] | (q[1] << 8)); return 1;
-        case 0xC9: case 0xCB: op->kind = K_RETF; return 1;
-        case 0xC8: case 0xCA:
-            op->kind = K_RETF;
-            op->imm = (uint16_t)(q[0] | (q[1] << 8));
-            return 1;
-        case 0xCF: op->kind = K_IRET; return 1;
         default: break;
     }
     if (opc >= 0xB0u && opc <= 0xB7u) {
@@ -1728,8 +1479,7 @@ static int MD_COMPILER_HOT_FUNC(md_tr_writes_memory)(const MdTrOp *op)
     switch (op->kind) {
         case K_ALU: return op->dst.kind == OPK_MEM && !op->nowrite;
         case K_INC: case K_DEC: case K_MOV: return op->dst.kind == OPK_MEM;
-        case K_PUSH: case K_PUSHF: case K_CALL: case K_CALLRM: case K_CALLFAR:
-        case K_PUSHS: case K_STOS: case K_MOVS: return 1;
+        case K_PUSH: case K_PUSHF: case K_CALL: case K_PUSHS: case K_STOS: case K_MOVS: return 1;
         case K_POP: return op->dst.kind == OPK_MEM;
         case K_HALU: case K_SHIFT: case K_NOT: case K_MOVFS: return op->dst.kind == OPK_MEM;
         default: return 0;
