@@ -16,10 +16,6 @@ extern "C" {
 #define MD_NATIVE_V2_EXEC_FALLBACK 0xFFFFFFFFu
 #define MD_NATIVE_V2_EXEC_SIDE_EXIT 0xFFFFFFFEu
 
-#ifndef MD_NATIVE_V2_G_META_BYTES
-#define MD_NATIVE_V2_G_META_BYTES 96u
-#endif
-
 typedef enum MdNativeV2Status {
     MD_NATIVE_V2_OK = 0,
     MD_NATIVE_V2_BAD_ARGUMENT,
@@ -174,11 +170,6 @@ typedef struct MdNativeV2Code {
     uint16_t rep_src_off;
     uint16_t rep_dst_off;
     uint16_t rep_words;
-
-#if defined(MICRODOS_ENABLE_NATIVE_V2G)
-    /* NV2-G private compile/exit metadata. Baseline NV2 ABI is unchanged. */
-    uint8_t g_meta[MD_NATIVE_V2_G_META_BYTES];
-#endif
 } MdNativeV2Code;
 
 MdNativeV2Status md_native_v2_compile_8086(const uint8_t *image,

@@ -239,23 +239,6 @@ target_compile_definitions(microdos_pico_nativev2_profile PRIVATE
     MICRODOS_NATIVE_V2_BACKEDGE_PROFILE=1
     MD_X86_TRACK_WRITES=0
     MICRODOS_TRANSLATION_SUPPORT=0)
-# NV2-G G-1A: general natural-loop fallback after the proven Native-v2
-# counted/CALL/REP compilers.  Keep the production Native-v2 image unchanged
-# for an apples-to-apples performance gate.
-md_pico_dos(microdos_pico_nativev2g 1 0 300000 0 0 0 0 0 0)
-target_sources(microdos_pico_nativev2g PRIVATE
-    "${MD_ROOT}/src/runtime/native_v2.c"
-    "${MD_ROOT}/src/runtime/native_v2_runtime.c"
-    "${MD_ROOT}/src/runtime/native_v2g.c"
-    "${MD_ROOT}/src/decode/x86_decode.c")
-target_compile_definitions(microdos_pico_nativev2g PRIVATE
-    MICRODOS_ENABLE_NATIVE_V2=1
-    MICRODOS_PICO_NATIVE_V2=1
-    MICRODOS_ENABLE_NATIVE_V2G=1
-    MD_X86_TRACK_WRITES=0
-    MICRODOS_TRANSLATION_SUPPORT=0)
-pico_set_program_name(microdos_pico_nativev2g "microDOS Native-v2G G-1A")
-
 md_pico_dos(microdos_pico_region   1 1 300000 0 0 0 0 0     0)
 target_compile_definitions(microdos_pico_region PRIVATE MD_CACHE_PROFILE=0)
 

@@ -197,20 +197,6 @@ if(MD_BUILD_TESTS)
         "${CMAKE_CURRENT_LIST_DIR}/include")
     add_test(NAME native_v2_phase1 COMMAND microdos_native_v2_tests)
 
-    # NV2-G G-1A: additive general natural-loop compiler. The existing
-    # Native-v2 tests remain unchanged; this target checks G region/code shape.
-    add_executable(microdos_native_v2g_tests
-        tests/test_native_v2g.c
-        src/runtime/native_v2.c
-        src/runtime/native_v2g.c)
-    target_link_libraries(microdos_native_v2g_tests PRIVATE
-        microdos::runtime microdos::decode)
-    target_include_directories(microdos_native_v2g_tests PRIVATE
-        "${CMAKE_CURRENT_LIST_DIR}/include")
-    target_compile_definitions(microdos_native_v2g_tests PRIVATE
-        MICRODOS_ENABLE_NATIVE_V2G=1)
-    add_test(NAME native_v2g_g1a COMMAND microdos_native_v2g_tests)
-
     # Generated AOT must produce the same checksum result/count/flags.
     add_executable(microdos_region_aot_tests tests/test_region_aot.c
         "${MD_RECOMP_checksum_C}" "${MD_RECOMP_checksum_H}")

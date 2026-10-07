@@ -33,9 +33,6 @@
 #ifndef MICRODOS_NATIVE_V2_BACKEDGE_PROFILE
 #define MICRODOS_NATIVE_V2_BACKEDGE_PROFILE 0
 #endif
-#if defined(MICRODOS_ENABLE_NATIVE_V2G)
-#include "microdos/native_v2g.h"
-#endif
 #if MICRODOS_PICO_JIT
 #include "microdos/jit.h"
 #endif
@@ -849,28 +846,6 @@ static void md_stats(uint64_t start_us)
         md_say("[native-v2] chunks entries=%llu iterations=%llu\n",
                (unsigned long long)nv->chunked_entries,
                (unsigned long long)nv->chunked_iterations);
-
-#if defined(MICRODOS_ENABLE_NATIVE_V2G)
-        {
-            const MdNativeV2GStats *gs = md_native_v2g_stats();
-            md_say("[native-v2g] attempts=%llu compiles=%llu "
-                   "badarg=%llu region=%llu decode=%llu control=%llu "
-                   "opcode=%llu cfg=%llu flags=%llu memory=%llu "
-                   "exits=%llu emit=%llu\n",
-                   (unsigned long long)gs->attempts,
-                   (unsigned long long)gs->compiles,
-                   (unsigned long long)gs->reject_bad_argument,
-                   (unsigned long long)gs->reject_region,
-                   (unsigned long long)gs->reject_decode,
-                   (unsigned long long)gs->reject_control,
-                   (unsigned long long)gs->reject_opcode,
-                   (unsigned long long)gs->reject_cfg,
-                   (unsigned long long)gs->reject_flags,
-                   (unsigned long long)gs->reject_memory,
-                   (unsigned long long)gs->reject_exits,
-                   (unsigned long long)gs->reject_emit);
-        }
-#endif
 
         for (i = 0u; i < MD_NATIVE_V2_RT_SLOTS; ++i) {
             const MdNativeV2RuntimeSlot *s = &nv->slot[i];

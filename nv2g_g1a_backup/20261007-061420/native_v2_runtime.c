@@ -1,8 +1,5 @@
 #include "microdos/native_v2_runtime.h"
 #include "microdos/hot_code.h"
-#if defined(MICRODOS_ENABLE_NATIVE_V2G)
-#include "microdos/native_v2g.h"
-#endif
 
 #include <string.h>
 
@@ -367,16 +364,6 @@ bool MD_HOT_FUNC(md_native_v2_runtime_try_execute)(MdNativeV2Runtime *runtime,
                 guest_size = 46u;
         }
 
-#if defined(MICRODOS_ENABLE_NATIVE_V2G)
-        if (st != MD_NATIVE_V2_OK) {
-            st = md_native_v2g_compile_loop(
-                guest, window, candidate_ip,
-                &code, &guest_size);
-            if (st == MD_NATIVE_V2_OK)
-                counter_reg = 0xFFu;
-        }
-#endif
-
         if (st != MD_NATIVE_V2_OK ||
             guest_size == 0u ||
             guest_size > MD_NATIVE_V2_RT_MAX_GUEST_BYTES ||
@@ -425,63 +412,6 @@ bool MD_HOT_FUNC(md_native_v2_runtime_try_execute)(MdNativeV2Runtime *runtime,
     }
 
 execute:
-#if defined(MICRODOS_ENABLE_NATIVE_V2G)
-    /*
-     * NV2-G G-1A: general natural loops do not require a guest counter.
-     * r11 carries an exact guest-instruction budget and generated code returns
-     * the unconsumed low 24 bits.  The runtime enters only when one complete
-     * worst-case iteration fits, so the first header can never budget-exit
-     * before executing anything.
-     */
-    if (slot->code.dynamic_retire == 3u) {
-        uint32_t g_budget;
-        uint32_t g_remaining;
-
-        if (budget < MD_NATIVE_V2_RT_MIN_RETIRE ||
-            budget < (uint64_t)slot->code.op_count) {
-            ++runtime->short_rejects;
-            return false;
-        }
-
-        g_budget = budget > 0x00FFFFFFu
-            ? 0x00FFFFFFu : (uint32_t)budget;
-
-        if (g_budget < (uint32_t)slot->code.op_count) {
-            ++runtime->budget_rejects;
-            return false;
-        }
-
-        g_remaining = md_native_v2g_execute(cpu, &slot->code, g_budget);
-        if (g_remaining == MD_NATIVE_V2_EXEC_FALLBACK) {
-            ++runtime->runtime_fallbacks;
-            return false;
-        }
-
-        retired = (uint64_t)g_budget - (uint64_t)g_remaining;
-        if (retired == 0u || retired > (uint64_t)g_budget) {
-            ++runtime->runtime_fallbacks;
-            return false;
-        }
-
-        machine->instructions += retired;
-        ++runtime->entries;
-        runtime->retired += retired;
-        ++slot->entries;
-        slot->retired += retired;
-
-        if (result != NULL) {
-            result->retired = retired;
-            result->iterations = 0u;
-            result->cs = slot->cs;
-            result->ip = slot->ip;
-            result->rep_words = 0u;
-            result->entered = 1u;
-            result->rep_string_loop = 0u;
-        }
-        return true;
-    }
-#endif
-
     /*
      * The redirected Phase-4 entry has architecturally executed XOR CX,CX
      * before reaching the cached CALL graph. Do not mutate the machine yet:
