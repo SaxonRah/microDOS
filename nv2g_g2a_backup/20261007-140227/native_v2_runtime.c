@@ -393,13 +393,7 @@ bool MD_HOT_FUNC(md_native_v2_runtime_try_execute)(MdNativeV2Runtime *runtime,
             return false;
         }
 
-        /*
-         * NV2-G dynamic-retire=3 stores carry their own exact inline guards:
-         * offset wrap, current-code overlap, and tracked-page rejection.
-         * Legacy Native-v2 store classes keep their existing runtime proofs.
-         */
         if (code.has_store &&
-            code.dynamic_retire != 3u &&
             !code.safe_store_bx_si_loop &&
             !code.safe_stosb_loop &&
             !code.safe_stack_pushpop &&

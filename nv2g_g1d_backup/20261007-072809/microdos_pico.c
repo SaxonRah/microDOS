@@ -853,7 +853,6 @@ static void md_stats(uint64_t start_us)
 #if defined(MICRODOS_ENABLE_NATIVE_V2G)
         {
             const MdNativeV2GStats *gs = md_native_v2g_stats();
-            unsigned j;
             md_say("[native-v2g] attempts=%llu compiles=%llu "
                    "badarg=%llu region=%llu decode=%llu control=%llu "
                    "opcode=%llu cfg=%llu flags=%llu memory=%llu "
@@ -870,34 +869,6 @@ static void md_stats(uint64_t start_us)
                    (unsigned long long)gs->reject_memory,
                    (unsigned long long)gs->reject_exits,
                    (unsigned long long)gs->reject_emit);
-
-            md_say("[native-v2g-control] prefix=%lu far=%lu call=%lu "
-                   "icall=%lu ijmp=%lu ret=%lu stop=%lu\n",
-                   (unsigned long)gs->reject_control_prefix,
-                   (unsigned long)gs->reject_control_far,
-                   (unsigned long)gs->reject_control_call,
-                   (unsigned long)gs->reject_control_indirect_call,
-                   (unsigned long)gs->reject_control_indirect_jump,
-                   (unsigned long)gs->reject_control_return,
-                   (unsigned long)gs->reject_control_stop);
-
-            for (j = 0u; j < 256u; ++j) {
-                if (gs->reject_opcode_byte[j] != 0u)
-                    md_say("[native-v2g-opcode] op=%02X count=%lu\n",
-                           j, (unsigned long)gs->reject_opcode_byte[j]);
-            }
-
-            for (j = 0u; j < 256u; ++j) {
-                if (gs->reject_prefix_byte[j] != 0u)
-                    md_say("[native-v2g-prefix] op=%02X count=%lu\n",
-                           j, (unsigned long)gs->reject_prefix_byte[j]);
-            }
-
-            for (j = 0u; j < 256u; ++j) {
-                if (gs->reject_control_opcode[j] != 0u)
-                    md_say("[native-v2g-ctlop] op=%02X count=%lu\n",
-                           j, (unsigned long)gs->reject_control_opcode[j]);
-            }
         }
 #endif
 

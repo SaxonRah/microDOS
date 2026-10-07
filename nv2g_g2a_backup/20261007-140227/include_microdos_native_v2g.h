@@ -11,35 +11,27 @@ extern "C" {
 #endif
 
 /*
- * NV2-G G-2A: measured coverage slice of the general natural-loop
+ * NV2-G G-1A: conservative vertical slice of the general natural-loop
  * compiler described by docs/NATIVE_V2G_DESIGN.md.
  *
  * Existing Native-v2 special compilers stay first in the runtime cascade.
- * NV2-G is called only after they reject an interpreter-observed back-edge.
+ * G-1A is called only after they reject an interpreter-observed back-edge.
  *
- * Implemented through G-2A:
+ * Implemented in this slice:
  *   - one natural loop rooted at the observed back-edge target;
  *   - r11 scheduler-budget ABI, dynamic_retire = 3;
  *   - internal forward CFG edges and up to eight architectural exits;
  *   - all non-parity Jcc conditions when producer fusion is provable;
  *   - JCXZ, LOOP, LOOPZ and LOOPNZ;
  *   - general 8086 ModR/M byte/word loads with DS/SS default segments;
- *   - exact exit lazy-flag recipes for the supported producer subset;
- *   - guarded MOV byte/word stores (including A2/A3 moffs stores);
- *   - single LODSB/LODSW and STOSB/STOSW with a DF==0 entry guard;
- *   - PUSH/POP r16 with original-8086 PUSH SP semantics.
+ *   - exact exit lazy-flag recipes for the supported producer subset.
  *
- * G-2A store guards exit before the instruction on 16-bit offset wrap,
- * overlap with the currently executing guest-code span, or a tracked page.
- * A guard before the current iteration's first flag producer remains a
- * conservative reject until previous-iteration flag handoff is represented.
- *
- * Still deferred:
- *   - segment overrides and SCAS/CMPS single -> G-2B;
- *   - REP string forms stay with the existing special compiler;
+ * Still conservative / deferred exactly where proof is incomplete:
+ *   - prefixes, stores, string instructions and PUSH/POP -> G-2;
  *   - ADC/SBB, CL shifts, CBW/CWD, XCHG -> G-3;
- *   - CALL/RET/INT/far/indirect control stays outside the general loop;
- *   - parity Jcc and exits requiring preserved INC/DEC carry are rejected.
+ *   - parity Jcc and exits requiring preserved INC/DEC carry are rejected;
+ *   - a word-load wrap guard before this iteration's first flag producer is
+ *     rejected until previous-iteration flag handoff is represented.
  */
 MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
                                              size_t max_size,
@@ -80,7 +72,7 @@ typedef struct MdNativeV2GStats {
 const MdNativeV2GStats *md_native_v2g_stats(void);
 
 /*
- * Execute an NV2-G region with `budget` guest instructions available.
+ * Execute a G-1A region with `budget` guest instructions available.
  * Returns unconsumed budget, or MD_NATIVE_V2_EXEC_FALLBACK before native entry
  * when the current runtime state cannot safely execute the region.
  */
@@ -88,7 +80,7 @@ uint32_t md_native_v2g_execute(MdX86 *cpu,
                                const MdNativeV2Code *code,
                                uint32_t budget);
 
-/* True when `code` contains an NV2-G region. */
+/* True when `code` contains an NV2-G G-1A region. */
 int md_native_v2g_is_code(const MdNativeV2Code *code);
 
 #ifdef __cplusplus

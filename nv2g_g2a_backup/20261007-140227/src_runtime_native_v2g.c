@@ -33,14 +33,6 @@ typedef enum GKind {
     G_MOV_RR8,
     G_LOAD16,
     G_LOAD8,
-    G_STORE16,
-    G_STORE8,
-    G_LODS16,
-    G_LODS8,
-    G_STOS16,
-    G_STOS8,
-    G_PUSH16,
-    G_POP16,
     G_ALU16_RR,
     G_ALU16_RI,
     G_ALU16_RM,
@@ -128,9 +120,7 @@ typedef struct GMeta {
     uint8_t needs_memory;
     uint8_t uses_ss_word;
     uint8_t uses_ds_word;
-    uint8_t uses_es_word;
-    uint8_t has_store;
-    uint8_t requires_df_clear;
+    uint8_t _pad0[2];
     GRecipe exits[NV2G_MAX_EXITS];
     GRecipe budget;
 } GMeta;
@@ -220,30 +210,6 @@ static void tstrh_w_imm(TBuf *b, unsigned rt, unsigned rn, unsigned imm12)
 {
     t32(b, (uint16_t)(0xF8A0u | (rn & 15u)),
         (uint16_t)(((rt & 15u) << 12) | (imm12 & 0xfffu)));
-}
-
-static void tstr_w_imm(TBuf *b, unsigned rt, unsigned rn, unsigned imm12)
-{
-    t32(b, (uint16_t)(0xF8C0u | (rn & 15u)),
-        (uint16_t)(((rt & 15u) << 12) | (imm12 & 0xfffu)));
-}
-
-static void tldrb_w_imm(TBuf *b, unsigned rt, unsigned rn, unsigned imm12)
-{
-    t32(b, (uint16_t)(0xF890u | (rn & 15u)),
-        (uint16_t)(((rt & 15u) << 12) | (imm12 & 0xfffu)));
-}
-
-static void tstrb_w_reg(TBuf *b, unsigned rt, unsigned rn, unsigned rm)
-{
-    t32(b, (uint16_t)(0xF800u | (rn & 15u)),
-        (uint16_t)(((rt & 15u) << 12) | (rm & 15u)));
-}
-
-static void tstrh_w_reg(TBuf *b, unsigned rt, unsigned rn, unsigned rm)
-{
-    t32(b, (uint16_t)(0xF820u | (rn & 15u)),
-        (uint16_t)(((rt & 15u) << 12) | (rm & 15u)));
 }
 
 static void tldrb_w_reg(TBuf *b, unsigned rt, unsigned rn, unsigned rm)
@@ -537,46 +503,11 @@ static int g_decode_op(const uint8_t *image, size_t image_size,
             }
             return 1;
         }
+        if (!dir) return 0; /* stores arrive in G-2 */
         if (!g_parse_mem(q, avail, d, &o->mem, NULL)) return 0;
+        o->kind = (uint8_t)(w ? G_LOAD16 : G_LOAD8);
         o->width = (uint8_t)(w ? 16u : 8u);
-        if (!dir) {
-            o->kind = (uint8_t)(w ? G_STORE16 : G_STORE8);
-            o->src = (uint8_t)reg;
-        } else {
-            o->kind = (uint8_t)(w ? G_LOAD16 : G_LOAD8);
-            o->dst = (uint8_t)reg;
-        }
-        return 1;
-    }
-
-    /* MOV accumulator <-> moffs. G-2 uses the same guarded memory path. */
-    if (op >= 0xa0u && op <= 0xa3u && avail >= 3u) {
-        memset(&o->mem, 0, sizeof(o->mem));
-        o->mem.is_direct = 1u;
-        o->mem.direct = (uint16_t)((uint16_t)q[1] | ((uint16_t)q[2] << 8));
-        o->width = (uint8_t)((op & 1u) ? 16u : 8u);
-        if (op == 0xa0u || op == 0xa1u) {
-            o->kind = (uint8_t)((op & 1u) ? G_LOAD16 : G_LOAD8);
-            o->dst = 0u; /* AL/AX */
-        } else {
-            o->kind = (uint8_t)((op & 1u) ? G_STORE16 : G_STORE8);
-            o->src = 0u; /* AL/AX */
-        }
-        return 1;
-    }
-
-    /* G-2 single string operations. REP prefixes remain outside this path. */
-    if (op == 0xacu) { o->kind = G_LODS8;  o->width = 8u;  return 1; }
-    if (op == 0xadu) { o->kind = G_LODS16; o->width = 16u; return 1; }
-    if (op == 0xaau) { o->kind = G_STOS8;  o->width = 8u;  return 1; }
-    if (op == 0xabu) { o->kind = G_STOS16; o->width = 16u; return 1; }
-
-    if ((op & 0xf8u) == 0x50u) {
-        o->kind = G_PUSH16; o->src = (uint8_t)(op & 7u); o->width = 16u;
-        return 1;
-    }
-    if ((op & 0xf8u) == 0x58u) {
-        o->kind = G_POP16; o->dst = (uint8_t)(op & 7u); o->width = 16u;
+        o->dst = (uint8_t)reg;
         return 1;
     }
 
@@ -709,16 +640,6 @@ static uint8_t g_write_mask(const GOp *o)
             return (uint8_t)(1u << (o->dst & 7u));
         case G_MOV_R8_IMM: case G_MOV_RR8: case G_LOAD8:
             return (uint8_t)(1u << r8_parent(o->dst));
-        case G_LODS16:
-            return (uint8_t)((1u << MD_X86_AX) | (1u << MD_X86_SI));
-        case G_LODS8:
-            return (uint8_t)((1u << MD_X86_AX) | (1u << MD_X86_SI));
-        case G_STOS16: case G_STOS8:
-            return (uint8_t)(1u << MD_X86_DI);
-        case G_PUSH16:
-            return (uint8_t)(1u << MD_X86_SP);
-        case G_POP16:
-            return (uint8_t)((1u << MD_X86_SP) | (1u << (o->dst & 7u)));
         case G_ALU16_RR: case G_ALU16_RI: case G_ALU16_RM:
             return o->alu == 7u ? 0u : (uint8_t)(1u << (o->dst & 7u));
         case G_ALU8_RR: case G_ALU8_RI: case G_ALU8_RM:
@@ -970,133 +891,6 @@ static void emit_ea(TBuf *b, const GMem *m, unsigned width,
     twrap20(b, 12u);
 }
 
-
-static int g_add_guard_patch(GPatch *patch, unsigned *np,
-                             size_t at, unsigned cond,
-                             uint8_t tag, uint16_t ip)
-{
-    if (*np >= 64u) return 0;
-    patch[*np].at = at;
-    patch[*np].cond = (uint8_t)cond;
-    patch[*np].is_exit = 1u;
-    patch[*np].exit_tag = tag;
-    patch[*np].target_ip = ip;
-    ++*np;
-    return 1;
-}
-
-/*
- * G-2 guarded-store safety after r12 contains the final 20-bit linear
- * destination address. The generated prologue keeps this region's linear
- * code start at [sp,#4], while [sp,#0] is a transient scratch word.
- *
- * Every failure branches to the instruction's pre-store exit tag, so the
- * guest store and all of its architectural register side effects have not
- * happened yet.
- */
-static int emit_store_safety(TBuf *b, unsigned width,
-                             uint8_t guard_tag,
-                             GPatch *patch, unsigned *np,
-                             unsigned cpexecoff,
-                             unsigned code_span,
-                             uint16_t op_ip)
-{
-    size_t below_code_at;
-    size_t no_tracker_at;
-
-    if (guard_tag == 0xffu || code_span == 0u || code_span > 64u)
-        return 0;
-
-    /* Save the exact linear destination while scratch registers are reused. */
-    tstr_w_imm(b, 12u, 13u, 0u);
-
-    /*
-     * Reject overlap with [code_start, code_end].
-     * For a word store compare data_end, not just data_start.
-     */
-    t16(b, tmovhi(14u, 12u));
-    if (width == 16u)
-        tadd_imm(b, 14u, 14u, 1u);       /* data_end */
-    tldr_w_imm(b, 12u, 13u, 4u);         /* code_start */
-    tcmp_reg_shift(b, 14u, 12u, 0u);
-    below_code_at = tbcc(b, G_CC);        /* data_end < code_start */
-
-    if (code_span > 1u)
-        tadd_imm(b, 12u, 12u, code_span - 1u); /* code_end */
-    tldr_w_imm(b, 14u, 13u, 0u);         /* data_start */
-    tcmp_reg_shift(b, 14u, 12u, 0u);
-    if (!g_add_guard_patch(patch, np, tbcc(b, G_LS), G_LS,
-                           guard_tag, op_ip))
-        return 0;
-
-    if (!tpatch_bcc(b, below_code_at, G_CC, b->at))
-        return 0;
-
-    /*
-     * In tracked builds, direct native stores may touch only pages whose
-     * executable/translated flag is zero. The production NV2-G Pico target
-     * has this pointer NULL, so the common path is one load/cmp/branch.
-     */
-    tldr_w_imm(b, 14u, 8u, cpexecoff);
-    tcmp_imm(b, 14u, 0u);
-    no_tracker_at = tbcc(b, G_EQ);
-
-    tldr_w_imm(b, 12u, 13u, 0u);
-    tshift(b, 1u, 12u, 12u, MD_X86_CODE_PAGE_SHIFT);
-    tadd_reg(b, 14u, 14u, 12u);
-    tldrb_w_imm(b, 14u, 14u, 0u);
-    tcmp_imm(b, 14u, 0u);
-    if (!g_add_guard_patch(patch, np, tbcc(b, G_NE), G_NE,
-                           guard_tag, op_ip))
-        return 0;
-
-    /* A word at xFFF also touches the following tracked page. */
-    if (width == 16u) {
-        tldr_w_imm(b, 14u, 8u, cpexecoff);
-        tldr_w_imm(b, 12u, 13u, 0u);
-        tadd_imm(b, 12u, 12u, 1u);
-        tshift(b, 1u, 12u, 12u, MD_X86_CODE_PAGE_SHIFT);
-        tadd_reg(b, 14u, 14u, 12u);
-        tldrb_w_imm(b, 14u, 14u, 0u);
-        tcmp_imm(b, 14u, 0u);
-        if (!g_add_guard_patch(patch, np, tbcc(b, G_NE), G_NE,
-                               guard_tag, op_ip))
-            return 0;
-    }
-
-    if (!tpatch_bcc(b, no_tracker_at, G_EQ, b->at))
-        return 0;
-
-    /* Restore the exact final linear address for the actual store. */
-    tldr_w_imm(b, 12u, 13u, 0u);
-    return !b->failed;
-}
-
-static void emit_reg_linear(TBuf *b, unsigned guest_reg,
-                            unsigned seg_off, int ds_fast,
-                            unsigned width,
-                            size_t *guard_at, int *needs_guard)
-{
-    t16(b, tmovhi(12u, kArmReg[guest_reg & 7u]));
-    *needs_guard = 0;
-
-    if (width == 16u) {
-        tmovw(b, 14u, 0xffffu);
-        tcmp_reg_shift(b, 12u, 14u, 0u);
-        *guard_at = tbcc(b, G_EQ);
-        *needs_guard = 1;
-    }
-
-    if (ds_fast) {
-        tadd_reg(b, 12u, 12u, 10u);
-    } else {
-        tldrh_w_imm(b, 14u, 8u, seg_off);
-        tshift(b, 0u, 14u, 14u, 4u);
-        tadd_reg(b, 12u, 12u, 14u);
-    }
-    twrap20(b, 12u);
-}
-
 static void emit_budget_dec(TBuf *b) { tsub_imm(b, 11u, 11u, 1u); }
 
 static void emit_recipe_flags(TBuf *b, const GRecipe *r)
@@ -1255,8 +1049,7 @@ static void emit_return_tag(TBuf *b, unsigned roff, unsigned tag)
     tmovw(b,12u,(uint16_t)tag);
     tshift(b,0u,12u,12u,24u);
     torr_reg(b,0u,0u,12u);
-    t16(b,0xB001u); /* add sp,#4: discard G-2 store-guard scratch */
-    t16(b,0xBD08u); /* pop {r3,pc}: saved code-start argument + LR */
+    t16(b,0xBD00u); /* pop {pc}; LR was saved at region entry */
 }
 
 static int emit_simple_alu(TBuf *b, const GOp *o)
@@ -1318,12 +1111,9 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
     GPatch patch[64];
     unsigned np = 0u, i;
     const unsigned roff = (unsigned)offsetof(MdX86, r);
-    const unsigned esoff = (unsigned)offsetof(MdX86, es);
     const unsigned dsoff = (unsigned)offsetof(MdX86, ds);
     const unsigned ssoff = (unsigned)offsetof(MdX86, ss);
     const unsigned moff = (unsigned)offsetof(MdX86, memory);
-    const unsigned cpexecoff = (unsigned)offsetof(MdX86, code_page_executable);
-    const unsigned code_span = (unsigned)(uint16_t)(end_ip - entry_ip);
     size_t loop_top;
 
     memset(out, 0, sizeof(*out));
@@ -1332,12 +1122,8 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
     b.at = 0u;
     b.failed = 0;
 
-    /*
-     * Save r3 (the caller-supplied linear code start) and LR. Reserve one
-     * additional host-stack word as transient store-guard scratch.
-     */
-    t16(&b, 0xB508u); /* push {r3,lr} */
-    t16(&b, 0xB081u); /* sub sp,#4 */
+    /* Save LR so r14 can be a second scratch register inside the region. */
+    t16(&b, 0xB500u); /* push {lr} */
     t16(&b, tmovhi(8u, 0u));
     t16(&b, tmovhi(11u, 2u)); /* r2 = scheduler budget */
     for (i = 1u; i < 8u; ++i)
@@ -1387,157 +1173,6 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                 emit_r8_to(&b, 12u, o->src);
                 emit_r8_from(&b, o->dst, 12u);
                 break;
-
-            case G_STORE16:
-            case G_STORE8: {
-                size_t guard_at = 0u;
-                int needs_guard = 0;
-                const unsigned w = o->kind == G_STORE16 ? 16u : 8u;
-
-                emit_ea(&b, &o->mem, w, &guard_at, &needs_guard, ssoff);
-                if (needs_guard) {
-                    if (o->guard_tag == 0xffu ||
-                        !g_add_guard_patch(patch, &np, guard_at, G_EQ,
-                                           o->guard_tag, o->ip))
-                        return MD_NATIVE_V2_UNSUPPORTED;
-                }
-                if (!emit_store_safety(&b, w, o->guard_tag,
-                                       patch, &np, cpexecoff,
-                                       code_span, o->ip))
-                    return MD_NATIVE_V2_UNSUPPORTED;
-
-                if (w == 16u) {
-                    tstrh_w_reg(&b, kArmReg[o->src & 7u], 9u, 12u);
-                } else {
-                    emit_r8_to(&b, 14u, o->src);
-                    tstrb_w_reg(&b, 14u, 9u, 12u);
-                }
-                break;
-            }
-
-            case G_LODS16:
-            case G_LODS8: {
-                size_t guard_at = 0u;
-                int needs_guard = 0;
-                const unsigned w = o->kind == G_LODS16 ? 16u : 8u;
-
-                emit_reg_linear(&b, MD_X86_SI, dsoff, 1,
-                                w, &guard_at, &needs_guard);
-                if (needs_guard) {
-                    if (o->guard_tag == 0xffu ||
-                        !g_add_guard_patch(patch, &np, guard_at, G_EQ,
-                                           o->guard_tag, o->ip))
-                        return MD_NATIVE_V2_UNSUPPORTED;
-                }
-
-                if (w == 16u) {
-                    tldrh_w_reg(&b, 14u, 9u, 12u);
-                    t16(&b, tmovhi(kArmReg[MD_X86_AX], 14u));
-                    tadd_imm(&b, kArmReg[MD_X86_SI],
-                             kArmReg[MD_X86_SI], 2u);
-                } else {
-                    tldrb_w_reg(&b, 14u, 9u, 12u);
-                    emit_r8_from(&b, 0u, 14u); /* AL */
-                    tadd_imm(&b, kArmReg[MD_X86_SI],
-                             kArmReg[MD_X86_SI], 1u);
-                }
-                tuxth_any(&b, kArmReg[MD_X86_SI]);
-                break;
-            }
-
-            case G_STOS16:
-            case G_STOS8: {
-                size_t guard_at = 0u;
-                int needs_guard = 0;
-                const unsigned w = o->kind == G_STOS16 ? 16u : 8u;
-
-                emit_reg_linear(&b, MD_X86_DI, esoff, 0,
-                                w, &guard_at, &needs_guard);
-                if (needs_guard) {
-                    if (o->guard_tag == 0xffu ||
-                        !g_add_guard_patch(patch, &np, guard_at, G_EQ,
-                                           o->guard_tag, o->ip))
-                        return MD_NATIVE_V2_UNSUPPORTED;
-                }
-                if (!emit_store_safety(&b, w, o->guard_tag,
-                                       patch, &np, cpexecoff,
-                                       code_span, o->ip))
-                    return MD_NATIVE_V2_UNSUPPORTED;
-
-                if (w == 16u) {
-                    tstrh_w_reg(&b, kArmReg[MD_X86_AX], 9u, 12u);
-                    tadd_imm(&b, kArmReg[MD_X86_DI],
-                             kArmReg[MD_X86_DI], 2u);
-                } else {
-                    emit_r8_to(&b, 14u, 0u); /* AL */
-                    tstrb_w_reg(&b, 14u, 9u, 12u);
-                    tadd_imm(&b, kArmReg[MD_X86_DI],
-                             kArmReg[MD_X86_DI], 1u);
-                }
-                tuxth_any(&b, kArmReg[MD_X86_DI]);
-                break;
-            }
-
-            case G_PUSH16: {
-                size_t wrap_at;
-
-                /* Original 8086 PUSH SP stores the already-decremented SP. */
-                t16(&b, tmovhi(12u, kArmReg[MD_X86_SP]));
-                tsub_imm(&b, 12u, 12u, 2u);
-                tuxth_any(&b, 12u);
-                tmovw(&b, 14u, 0xffffu);
-                tcmp_reg_shift(&b, 12u, 14u, 0u);
-                wrap_at = tbcc(&b, G_EQ);
-                if (!g_add_guard_patch(patch, &np, wrap_at, G_EQ,
-                                       o->guard_tag, o->ip))
-                    return MD_NATIVE_V2_UNSUPPORTED;
-
-                tldrh_w_imm(&b, 14u, 8u, ssoff);
-                tshift(&b, 0u, 14u, 14u, 4u);
-                tadd_reg(&b, 12u, 12u, 14u);
-                twrap20(&b, 12u);
-
-                if (!emit_store_safety(&b, 16u, o->guard_tag,
-                                       patch, &np, cpexecoff,
-                                       code_span, o->ip))
-                    return MD_NATIVE_V2_UNSUPPORTED;
-
-                if ((o->src & 7u) == MD_X86_SP) {
-                    t16(&b, tmovhi(14u, kArmReg[MD_X86_SP]));
-                    tsub_imm(&b, 14u, 14u, 2u);
-                    tuxth_any(&b, 14u);
-                } else {
-                    t16(&b, tmovhi(14u, kArmReg[o->src & 7u]));
-                }
-                tstrh_w_reg(&b, 14u, 9u, 12u);
-                tsub_imm(&b, kArmReg[MD_X86_SP],
-                         kArmReg[MD_X86_SP], 2u);
-                tuxth_any(&b, kArmReg[MD_X86_SP]);
-                break;
-            }
-
-            case G_POP16: {
-                size_t guard_at = 0u;
-                int needs_guard = 0;
-
-                emit_reg_linear(&b, MD_X86_SP, ssoff, 0,
-                                16u, &guard_at, &needs_guard);
-                if (!needs_guard || o->guard_tag == 0xffu ||
-                    !g_add_guard_patch(patch, &np, guard_at, G_EQ,
-                                       o->guard_tag, o->ip))
-                    return MD_NATIVE_V2_UNSUPPORTED;
-
-                tldrh_w_reg(&b, 14u, 9u, 12u);
-                if ((o->dst & 7u) == MD_X86_SP) {
-                    t16(&b, tmovhi(kArmReg[MD_X86_SP], 14u));
-                } else {
-                    tadd_imm(&b, kArmReg[MD_X86_SP],
-                             kArmReg[MD_X86_SP], 2u);
-                    tuxth_any(&b, kArmReg[MD_X86_SP]);
-                    t16(&b, tmovhi(kArmReg[o->dst & 7u], 14u));
-                }
-                break;
-            }
 
             case G_LOAD16:
             case G_LOAD8:
@@ -1778,7 +1413,7 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
     out->has_local_loop = 1u;
     out->phase = NV2G_PHASE_G1;
     out->needs_memory = m->needs_memory;
-    out->has_store = m->has_store;
+    out->has_store = 0u;
     out->dynamic_retire = 3u;
     out->retire_base_ops = 0u;
     memcpy(out->g_meta, m, sizeof(*m));
@@ -1788,11 +1423,12 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
 /* -------------------------------------------------------------------------
  * Public compiler.
  *
- * G-1 established the natural-loop/budget/exit ABI and passed the native
- * Thumb differential gate. G-2A adds the first measured stateful coverage:
- * guarded MOV/moffs stores, single LODS/STOS (DF==0), and PUSH/POP r16.
- * Segment overrides and SCAS/CMPS remain for G-2B; CALL/RET/INT stay outside
- * the general-loop path.
+ * G-1 first cut deliberately supports the general region model, budget ABI,
+ * multi-exit CFG, full non-parity Jcc analysis, and general ModR/M loads.
+ * The emitter currently admits JCC only when it can be fused by the narrow
+ * branch path below; LOOPZ/NZ and INC/DEC-fed branches remain conservative
+ * rejects until the qemu differential harness is in place. Existing special
+ * compilers still own all previously-fast MDSTRESS shapes.
  * ------------------------------------------------------------------------- */
 
 const MdNativeV2GStats *md_native_v2g_stats(void)
@@ -1889,21 +1525,8 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
         if (g_is_producer(&ops[n]))
             any_producer = 1;
         if (ops[n].kind == G_LOAD16 || ops[n].kind == G_LOAD8 ||
-            ops[n].kind == G_STORE16 || ops[n].kind == G_STORE8 ||
-            ops[n].kind == G_LODS16 || ops[n].kind == G_LODS8 ||
-            ops[n].kind == G_STOS16 || ops[n].kind == G_STOS8 ||
-            ops[n].kind == G_PUSH16 || ops[n].kind == G_POP16 ||
             ops[n].kind == G_ALU16_RM || ops[n].kind == G_ALU8_RM) {
             m.needs_memory = 1u;
-        }
-        if (ops[n].kind == G_STORE16 || ops[n].kind == G_STORE8 ||
-            ops[n].kind == G_STOS16 || ops[n].kind == G_STOS8 ||
-            ops[n].kind == G_PUSH16) {
-            m.has_store = 1u;
-        }
-        if (ops[n].kind == G_LODS16 || ops[n].kind == G_LODS8 ||
-            ops[n].kind == G_STOS16 || ops[n].kind == G_STOS8) {
-            m.requires_df_clear = 1u;
         }
 
         ++n;
@@ -2022,20 +1645,8 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
             ops[i].exit_tag = tag;
         }
 
-        if (ops[i].kind == G_LOAD16 || ops[i].kind == G_ALU16_RM ||
-            ops[i].kind == G_STORE16 || ops[i].kind == G_STORE8 ||
-            ops[i].kind == G_LODS16 ||
-            ops[i].kind == G_STOS16 || ops[i].kind == G_STOS8 ||
-            ops[i].kind == G_PUSH16 || ops[i].kind == G_POP16) {
+        if (ops[i].kind == G_LOAD16 || ops[i].kind == G_ALU16_RM) {
             uint8_t tag;
-
-            /*
-             * A pre-instruction guard can fire on a later iteration. Until
-             * G-2B carries a previous-iteration flag snapshot, require a
-             * current-iteration producer whenever this loop has producers.
-             * This is the same exactness rule G-1 already used for word-load
-             * wrap guards.
-             */
             if (p == NULL && any_producer) {
                 ++g_nv2g_stats.reject_memory;
                 return MD_NATIVE_V2_UNSUPPORTED;
@@ -2045,20 +1656,10 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
                 return MD_NATIVE_V2_UNSUPPORTED;
             }
             ops[i].guard_tag = tag;
-
-            if (ops[i].kind == G_LOAD16 || ops[i].kind == G_ALU16_RM ||
-                ops[i].kind == G_STORE16) {
-                if (ops[i].mem.uses_ss)
-                    m.uses_ss_word = 1u;
-                else
-                    m.uses_ds_word = 1u;
-            } else if (ops[i].kind == G_LODS16) {
-                m.uses_ds_word = 1u;
-            } else if (ops[i].kind == G_STOS16) {
-                m.uses_es_word = 1u;
-            } else if (ops[i].kind == G_PUSH16 || ops[i].kind == G_POP16) {
+            if (ops[i].mem.uses_ss)
                 m.uses_ss_word = 1u;
-            }
+            else
+                m.uses_ds_word = 1u;
         }
     }
 
@@ -2173,10 +1774,9 @@ int md_native_v2g_is_code(const MdNativeV2Code *code)
 
 #if defined(__arm__) || defined(__thumb__)
 __attribute__((naked,noinline))
-static uint32_t g_call_thumb(MdX86 *cpu,uintptr_t entry,uint32_t budget,
-                             uint32_t code_start)
+static uint32_t g_call_thumb(MdX86 *cpu,uintptr_t entry,uint32_t budget)
 {
-    (void)cpu;(void)entry;(void)budget;(void)code_start;
+    (void)cpu;(void)entry;(void)budget;
     __asm volatile(
         "push {r4-r7, lr}\n"
         "sub sp, sp, #20\n"
@@ -2200,16 +1800,13 @@ uint32_t MD_HOT_FUNC(md_native_v2g_execute)(MdX86 *cpu,
 {
 #if defined(__arm__) || defined(__thumb__)
     const GMeta *m;
-    uint32_t rc,remaining,tag,code_start;
+    uint32_t rc,remaining,tag;
     uintptr_t entry;
     if(!cpu||!code||!md_native_v2g_is_code(code)||code->size==0u||budget==0u||budget>0x00ffffffu)return MD_NATIVE_V2_EXEC_FALLBACK;
     if(code->needs_memory&&!cpu->memory)return MD_NATIVE_V2_EXEC_FALLBACK;
     if(code->requires_safe_ds_word&&cpu->ds>0xefffu)return MD_NATIVE_V2_EXEC_FALLBACK;
     if(code->requires_safe_ss_word&&cpu->ss>0xefffu)return MD_NATIVE_V2_EXEC_FALLBACK;
     m=(const GMeta *)code->g_meta;
-    if(m->uses_es_word&&cpu->es>0xefffu)return MD_NATIVE_V2_EXEC_FALLBACK;
-    if(m->requires_df_clear&&(cpu->flags_raw&MD_X86_FLAG_DF)!=0u)
-        return MD_NATIVE_V2_EXEC_FALLBACK;
     /*
      * The generated loop header's budget exit represents the state after at
      * least one complete iteration and therefore carries the latch producer's
@@ -2220,8 +1817,7 @@ uint32_t MD_HOT_FUNC(md_native_v2g_execute)(MdX86 *cpu,
     if (budget < m->max_ops) return budget;
     __asm volatile("dsb sy\n\tisb sy":::"memory");
     entry=((uintptr_t)&code->bytes[0])|(uintptr_t)1u;
-    code_start=md_x86_linear(cpu->cs,code->start_ip);
-    rc=g_call_thumb(cpu,entry,budget,code_start);
+    rc=g_call_thumb(cpu,entry,budget);
     tag=rc>>24;remaining=rc&0x00ffffffu;
     if(remaining>budget)return MD_NATIVE_V2_EXEC_FALLBACK;
     if(tag==NV2G_TAG_BUDGET){g_finish_recipe(cpu,&m->budget);cpu->ip=code->start_ip;return remaining;}
