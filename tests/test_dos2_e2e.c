@@ -471,9 +471,42 @@ int main(int argc, char **argv)
         return 1;
     }
     if (!aot && sys.runtime.aot_instructions != 0u) { fprintf(stderr, "[e2e] FAIL: AOT ran while disabled\n"); return 1; }
+#ifdef MICRODOS_ENABLE_NATIVE3
+    {
+        const MdN3Stats *n3 = md_native3_stats(&sys.native3);
+
+        printf(
+            "[n3] owned=%llu entries=%llu retired=%llu native=%llu interp=%llu "
+            "lookups=%llu hits=%llu misses=%llu compiles=%llu invalidations=%llu\n",
+            (unsigned long long)sys.native3_instructions,
+            (unsigned long long)(n3 ? n3->entries : 0u),
+            (unsigned long long)(n3 ? n3->retired : 0u),
+            (unsigned long long)(n3 ? n3->native_retired : 0u),
+            (unsigned long long)(n3 ? n3->interp_retired : 0u),
+            (unsigned long long)(n3 ? n3->lookups : 0u),
+            (unsigned long long)(n3 ? n3->hits : 0u),
+            (unsigned long long)(n3 ? n3->misses : 0u),
+            (unsigned long long)(n3 ? n3->compiles : 0u),
+            (unsigned long long)(n3 ? n3->invalidations : 0u));
+
+        if (
+            n3 == NULL ||
+            sys.native3_instructions == 0u ||
+            n3->retired == 0u
+        ) {
+            fprintf(
+                stderr,
+                "[e2e] FAIL: Native-3 was enabled but retired no guest instructions\n");
+
+            return 1;
+        }
+    }
+#endif
+
 #ifdef MICRODOS_ENABLE_JIT
     e2e_report_jit(&sys);
 #endif
+
     puts("[e2e] PASS");
     return 0;
 }

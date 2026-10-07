@@ -270,6 +270,50 @@ if(MD_BUILD_TESTS)
         # M17: compiled kernel + DOS2TEST vs pure interpreter, compared after
         # every compiled unit (CPU state) and periodically (all of memory).
         add_test(NAME dos2_e2e_lockstep COMMAND microdos_dos2_e2e "${MD_MSDOS2_BIN}/MSDOS.SYS" "${MD_E2E_IMG}" --lockstep)
+        # N3 integration: boot released MS-DOS 2.0 through the actual
+        # MICRODOS_ENABLE_NATIVE3 system path. On x86/x64 this exercises the
+        # Native-3 ownership/cache machinery with the portable semantic-oracle
+        # backend; ARM/AArch64 builds may execute their real native backends.
+        # AOT and the block cache are disabled for this test so Native-3 is the
+        # only tier in front of the canonical interpreter.
+        add_executable(microdos_dos2_e2e_native3
+            tests/test_dos2_e2e.c
+            src/system/md_dos2_system.c
+            src/host/msdos2_boot.c
+            src/runtime/native3.c
+            src/runtime/native_v2.c
+            src/runtime/native_v2_runtime.c
+            src/runtime/jit_core.c
+            "${MD_RECOMP_dos2test_C}" "${MD_RECOMP_msdos2_C}")
+        target_link_libraries(microdos_dos2_e2e_native3 PRIVATE
+            microdos::runtime microdos::decode)
+        target_include_directories(microdos_dos2_e2e_native3 PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/include"
+            "${CMAKE_CURRENT_LIST_DIR}/src/runtime"
+            "${CMAKE_CURRENT_LIST_DIR}/src/host"
+            "${CMAKE_CURRENT_LIST_DIR}/src/system"
+            "${MD_GENERATED_DIR}")
+        target_compile_definitions(microdos_dos2_e2e_native3 PRIVATE
+            MICRODOS_ENABLE_NATIVE3=1
+            MD_N3_PROFILE=1
+            MD_JIT_PROFILE=1
+            MD_JIT_LEGACY_HOTNESS=0)
+        if(MSVC)
+            target_compile_definitions(
+                microdos_dos2_e2e_native3
+                PRIVATE
+                _CRT_SECURE_NO_WARNINGS)
+        endif()
+        add_test(NAME dos2_e2e_native3
+            COMMAND microdos_dos2_e2e_native3
+                "${MD_MSDOS2_BIN}/MSDOS.SYS"
+                "${MD_E2E_IMG}"
+                --no-aot --no-cache)
+        set_tests_properties(
+            dos2_e2e_native3
+            PROPERTIES
+            FIXTURES_REQUIRED dos2_image)
+
         # M21.1: the 128 KiB guest used by the Pico SRAM/PSRAM A/B firmware.
         # MdX86's code-page tables are sized from the address space, so this
         # target compiles the runtime itself instead of linking the 1 MiB
@@ -334,7 +378,7 @@ endif()
 # consumer now waits for this single target instead.
 get_property(md_generated_outputs GLOBAL PROPERTY MD_GENERATED_OUTPUTS)
 add_custom_target(md_generated DEPENDS ${md_generated_outputs})
-foreach(md_consumer microdos_bench microdos_dos2_e2e microdos_dos2_e2e_g128 microdos_host
+foreach(md_consumer microdos_bench microdos_dos2_e2e microdos_dos2_e2e_native3 microdos_dos2_e2e_g128 microdos_host
         microdos_msdos2 microdos_tests microdos_region_aot_tests microdos_region_tests
         microdos_jit_diff microdos_jit_m203 microdos_store_tracking)
     if(TARGET ${md_consumer})
