@@ -1,0 +1,28 @@
+{
+  "created": "20261006-212809",
+  "base_head": "e3024907264bd913545eaabf17ac3d54c59954f3",
+  "files": [
+    "include/microdos/translate.h",
+    "src/runtime/translate.c",
+    "pico/microdos_pico.c",
+    "pico/CMakeLists.txt"
+  ],
+  "instrumented": [
+    "md_tr_h_load16",
+    "md_tr_h_load_farptr",
+    "md_tr_h_cfop",
+    "md_tr_h_flags_word",
+    "md_tr_h_muldiv",
+    "md_tr_h_call_near",
+    "md_tr_h_call_far",
+    "md_tr_h_retctl",
+    "md_tr_h_store8",
+    "md_tr_h_store16",
+    "md_tr_h_cond",
+    "md_tr_h_step",
+    "md_tr_h_alu",
+    "md_tr_h_shift",
+    "md_tr_h_capture_cf",
+    "md_tr_h_int"
+  ]
+}

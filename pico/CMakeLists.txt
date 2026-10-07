@@ -454,7 +454,10 @@ md_pico_common(microdos_pico_translate_diff 1)
 target_include_directories(microdos_pico_translate_diff PRIVATE "${MD_ROOT}/tests")
 target_compile_definitions(microdos_pico_translate_diff PRIVATE
     MICRODOS_PICO_SYS_KHZ=300000
-    MICRODOS_ENABLE_BACKEDGE_EXIT=1)
+    MICRODOS_ENABLE_BACKEDGE_EXIT=1
+    MICRODOS_M30_HELPER_ABI=1
+    MICRODOS_M30_SHARED_DISPATCH=1
+    MICRODOS_PICO_HOT_CODE=1)
 pico_set_program_name(microdos_pico_translate_diff "microDOS M25 translate diff")
 
 md_pico_bench(microdos_bench     1 300000)
@@ -475,3 +478,118 @@ target_compile_definitions(microdos_pico_m28h_failure_diag PRIVATE
     MICRODOS_PICO_SYS_KHZ=300000
     MICRODOS_ENABLE_BACKEDGE_EXIT=1)
 pico_set_program_name(microdos_pico_m28h_failure_diag "microDOS M28h failure diag")
+
+# M29a diagnostic INT/service profiler. Same M28 224 KiB COMBO placement;
+# only telemetry is added.
+md_m26_m25_nv2(microdos_pico_m29a_intprofile 0 1 224)
+target_compile_definitions(microdos_pico_m29a_intprofile PRIVATE
+    MICRODOS_PICO_EXEC_HOT_CODE=1 MICRODOS_PICO_QMI_PROFILE=1
+    MICRODOS_PICO_COMPILER_HOT_CODE=1
+    MICRODOS_PICO_INTERP_HELPERS_HOT=1
+    MICRODOS_PICO_DOS_HOT_CODE=1
+    MICRODOS_INT_PROFILE=1)
+
+# M29b: M28-final 224 KiB COMBO with generic native CD imm8 lowering.
+# No INT profiler in this target: production benchmark remains apples-to-apples.
+md_m26_m25_nv2(microdos_pico_m29b_kint_qmi 0 1 224)
+target_compile_definitions(microdos_pico_m29b_kint_qmi PRIVATE
+    MICRODOS_PICO_EXEC_HOT_CODE=1 MICRODOS_PICO_QMI_PROFILE=1
+    MICRODOS_PICO_COMPILER_HOT_CODE=1
+    MICRODOS_PICO_INTERP_HELPERS_HOT=1
+    MICRODOS_PICO_DOS_HOT_CODE=1)
+
+# M30a: generic helper-call ABI compression.
+# Same frozen M29b/M26d COMBO placement and 224 KiB arena; only generated
+# helper call/reload mechanics differ.
+md_m26_m25_nv2(microdos_pico_m30a_helperabi_qmi 0 1 224)
+target_compile_definitions(microdos_pico_m30a_helperabi_qmi PRIVATE
+    MICRODOS_PICO_EXEC_HOT_CODE=1 MICRODOS_PICO_QMI_PROFILE=1
+    MICRODOS_PICO_COMPILER_HOT_CODE=1
+    MICRODOS_PICO_INTERP_HELPERS_HOT=1
+    MICRODOS_PICO_DOS_HOT_CODE=1
+    MICRODOS_M30_HELPER_ABI=1)
+pico_set_program_name(microdos_pico_m30a_helperabi_qmi "microDOS M30a helper ABI")
+
+# M30b: shared generic indirect block dispatcher.
+# Keeps all validated M30a helper-ABI changes and replaces duplicated inline
+# RET/indirect/far-control probes with one arena trampoline.
+md_m26_m25_nv2(microdos_pico_m30b_shareddispatch_qmi 0 1 224)
+target_compile_definitions(microdos_pico_m30b_shareddispatch_qmi PRIVATE
+    MICRODOS_PICO_EXEC_HOT_CODE=1 MICRODOS_PICO_QMI_PROFILE=1
+    MICRODOS_PICO_COMPILER_HOT_CODE=1
+    MICRODOS_PICO_INTERP_HELPERS_HOT=1
+    MICRODOS_PICO_DOS_HOT_CODE=1
+    MICRODOS_M30_HELPER_ABI=1
+    MICRODOS_M30_SHARED_DISPATCH=1)
+pico_set_program_name(microdos_pico_m30b_shareddispatch_qmi "microDOS M30b shared dispatch")
+
+# ---------------------------------------------------------------------------
+# Fast development translator differential.
+#
+# Inherit the current full target's compile definitions at configure time so
+# experiment switches (M30a/M30b/next) stay synchronized automatically.
+# Only test volume changes.
+# ---------------------------------------------------------------------------
+get_target_property(MD_TD_FULL_COMPILE_DEFS
+    microdos_pico_translate_diff COMPILE_DEFINITIONS)
+
+add_executable(microdos_pico_translate_diff_fast
+    "${CMAKE_CURRENT_LIST_DIR}/microdos_translate_diff.c"
+    "${MD_ROOT}/src/runtime/runtime.c"
+    "${MD_ROOT}/src/runtime/x86_interp.c"
+    "${MD_ROOT}/src/runtime/x86_block_cache.c"
+    "${MD_ROOT}/src/runtime/region.c"
+    "${MD_ROOT}/src/runtime/translate.c"
+    "${MD_ROOT}/src/decode/x86_decode.c")
+
+md_pico_common(microdos_pico_translate_diff_fast 1)
+
+target_include_directories(microdos_pico_translate_diff_fast PRIVATE
+    "${MD_ROOT}/tests")
+
+target_compile_definitions(microdos_pico_translate_diff_fast PRIVATE
+    ${MD_TD_FULL_COMPILE_DEFS}
+    MD_TD_FAST=1
+    MD_TD_CASES=100u)
+
+pico_set_program_name(microdos_pico_translate_diff_fast
+    "microDOS translate diff FAST")
+
+# ---------------------------------------------------------------------------
+# Native-3 omnibus targets (N3.0-N3.8). Parallel to M25/M30/M32.
+# ---------------------------------------------------------------------------
+md_pico_dos(microdos_pico_native3 0 0 300000 0 0 0 0 0 0)
+target_sources(microdos_pico_native3 PRIVATE
+    "${MD_ROOT}/src/runtime/native3.c"
+    "${MD_ROOT}/src/runtime/native_v2.c"
+    "${MD_ROOT}/src/runtime/native_v2_runtime.c"
+    "${MD_ROOT}/src/runtime/jit_core.c"
+    "${MD_ROOT}/src/decode/x86_decode.c")
+target_compile_definitions(microdos_pico_native3 PRIVATE
+    MICRODOS_ENABLE_NATIVE3=1
+    MD_N3_PROFILE=0
+    MD_JIT_PROFILE=0
+    MD_JIT_LEGACY_HOTNESS=0
+    MD_JIT_BLOCK_SLOTS=256
+    MD_X86_TRACK_WRITES=1
+    "MICRODOS_NATIVE3_CODE_BYTES=(128u*1024u)")
+pico_set_program_name(microdos_pico_native3 "microDOS Native-3 DOS")
+
+add_executable(microdos_pico_native3_bench
+    "${CMAKE_CURRENT_LIST_DIR}/microdos_native3_bench.c"
+    "${MD_ROOT}/src/runtime/native3.c"
+    "${MD_ROOT}/src/runtime/native_v2.c"
+    "${MD_ROOT}/src/runtime/native_v2_runtime.c"
+    "${MD_ROOT}/src/runtime/jit_core.c"
+    "${MD_ROOT}/src/runtime/runtime.c"
+    "${MD_ROOT}/src/runtime/x86_interp.c"
+    "${MD_ROOT}/src/runtime/region.c"
+    "${MD_ROOT}/src/decode/x86_decode.c")
+md_pico_common(microdos_pico_native3_bench 1)
+target_compile_definitions(microdos_pico_native3_bench PRIVATE
+    MICRODOS_PICO_SYS_KHZ=300000
+    MD_N3_PROFILE=1
+    MD_JIT_PROFILE=1
+    MD_JIT_LEGACY_HOTNESS=0
+    MD_JIT_BLOCK_SLOTS=256)
+pico_set_program_name(microdos_pico_native3_bench "microDOS Native-3 40MIPS gate")

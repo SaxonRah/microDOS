@@ -540,13 +540,62 @@ static const uint8_t kM28hControl[] = {
     0xF4
 };
 
+/*
+ * M29b generic INT directed case.
+ *
+ * INT 60h is unclaimed and therefore exercises real 8086 FLAGS/CS/IP stack
+ * semantics plus IVT dispatch to a tiny IRET handler at 1000:0300.
+ *
+ * INT 61h is claimed by md_m29b_int_hook(). The hook deliberately reads and
+ * rewrites several resident guest registers so a missing spill/reload in the
+ * native INT thunk is guaranteed to diverge from the reference interpreter.
+ */
+static const uint8_t kM29bInt[] = {
+    0xB8,0x34,0x12,
+    0xBB,0x78,0x56,
+    0xBE,0x11,0x11,
+    0xBF,0x22,0x22,
+    0xF9,
+    0xCD,0x60,
+    0xCD,0x61,
+    0xBD,0x77,0x77,
+    0xF4
+};
+
+static const uint8_t kM29bInt60Handler[] = {
+    0x41,
+    0xBA,0xFE,0xCA,
+    0xCF
+};
+
+static bool md_m29b_int_hook(MdRuntime *runtime, uint8_t vector, void *user)
+{
+    MdX86 *cpu = &runtime->cpu;
+    (void)user;
+
+    if (vector != 0x61u) return false;
+
+    cpu->r[MD_X86_AX] = (uint16_t)(cpu->r[MD_X86_AX] ^ cpu->r[MD_X86_BX]);
+    cpu->r[MD_X86_BX] = (uint16_t)(cpu->r[MD_X86_BX] + cpu->r[MD_X86_SI]);
+    cpu->r[MD_X86_SI] = (uint16_t)(cpu->r[MD_X86_SI] ^ cpu->r[MD_X86_DI]);
+    cpu->r[MD_X86_DI] = (uint16_t)(cpu->r[MD_X86_DI] + 0x0101u);
+    cpu->r[MD_X86_SP] = (uint16_t)(cpu->r[MD_X86_SP] - 2u);
+    cpu->ds ^= 0x1111u;
+    md_x86_update_flags(cpu, MD_X86_FLAG_CF, 0u);
+    return true;
+}
+
+#ifndef MD_TD_FAST
+#define MD_TD_FAST 0
+#endif
+
 static unsigned md_translate_directed(uint8_t *mem_a, uint8_t *b_region, int unaligned,
                                       uint8_t *arena, uint32_t arena_size)
 {
     static MdRuntime A, B;
     static MdTranslator T;
     static uint8_t smc[sizeof(kSmcLoop)];
-    DirectedProg progs[14];
+    DirectedProg progs[15];
     uint8_t *mem_b = b_region + (unaligned ? 16u : 0u);
     MdHooks hooks;
     unsigned k, fails = 0u, runs = 0u;
@@ -574,17 +623,55 @@ static unsigned md_translate_directed(uint8_t *mem_a, uint8_t *b_region, int una
     progs[11] = (DirectedProg){ "m28h-group3", kM28hGroup3, sizeof(kM28hGroup3) };
     progs[12] = (DirectedProg){ "m28h-divide-fault", kM28hDivideFault, sizeof(kM28hDivideFault) };
     progs[13] = (DirectedProg){ "m28h-control", kM28hControl, sizeof(kM28hControl) };
+    progs[14] = (DirectedProg){ "m29b-int", kM29bInt, sizeof(kM29bInt) };
 
     memset(&hooks, 0, sizeof(hooks));
-    for (k = 0u; k < 14u; ++k) {
+    for (k = 0u; k < 15u; ++k) {
+#if MD_TD_FAST
+        /* Fast development budget schedule; full target unchanged. */
+        static const uint16_t k_fast_budget[] = {
+            1u,2u,3u,4u,5u,7u,8u,
+            15u,16u,17u,31u,32u,33u,
+            63u,64u,65u,127u,128u,129u,
+            255u,256u,257u,399u,400u
+        };
+        unsigned bi;
+        for (bi = 0u; bi < sizeof(k_fast_budget) / sizeof(k_fast_budget[0]); ++bi) {
+            unsigned d;
+            budget = k_fast_budget[bi];
+#else
         for (budget = 1u; budget <= 400u; budget += (budget < 64u ? 1u : 7u)) {
             unsigned d;
+#endif
             memset(mem_a, 0, MD_X86_ADDRESS_SPACE);
             memset(mem_b, 0, MD_X86_ADDRESS_SPACE);
             md_runtime_init(&A, mem_a, &hooks);
             md_runtime_init(&B, mem_b, &hooks);
             md_runtime_load_com(&A, progs[k].code, progs[k].size, 0x1000u);
             md_runtime_load_com(&B, progs[k].code, progs[k].size, 0x1000u);
+
+            memset(&hooks, 0, sizeof(hooks));
+            if (k == 14u) {
+                const uint32_t vec = 0x60u * 4u;
+                const uint32_t handler = md_x86_linear(0x1000u, 0x0300u);
+
+                hooks.interrupt = md_m29b_int_hook;
+                A.hooks = hooks;
+                B.hooks = hooks;
+
+                A.cpu.memory[vec + 0u] = 0x00u;
+                A.cpu.memory[vec + 1u] = 0x03u;
+                A.cpu.memory[vec + 2u] = 0x00u;
+                A.cpu.memory[vec + 3u] = 0x10u;
+                B.cpu.memory[vec + 0u] = 0x00u;
+                B.cpu.memory[vec + 1u] = 0x03u;
+                B.cpu.memory[vec + 2u] = 0x00u;
+                B.cpu.memory[vec + 3u] = 0x10u;
+
+                memcpy(A.cpu.memory + handler, kM29bInt60Handler, sizeof(kM29bInt60Handler));
+                memcpy(B.cpu.memory + handler, kM29bInt60Handler, sizeof(kM29bInt60Handler));
+            }
+
             A.cpu.memory[0x10200u + 37u] = 0u; B.cpu.memory[0x10200u + 37u] = 0u;
             {
                 unsigned i;

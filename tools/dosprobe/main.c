@@ -46,6 +46,7 @@ typedef struct DpStats {
     DpOpcodeStat opcode[256];
     DpOpcodeStat unsupported[256];
     uint64_t prefixes[256];
+    uint64_t int_vector[256];       /* reachable CD imm8 only */
 } DpStats;
 
 typedef struct DpScan {
@@ -210,6 +211,11 @@ static int dp_scan(DpScan *scan)
             }
 
             offset = (size_t)((uint32_t)ip - scan->base);
+            if (inst.opcode == 0xCDu &&
+                offset + inst.prefix_count + 1u < scan->image_size) {
+                const uint8_t vector = scan->image[offset + inst.prefix_count + 1u];
+                ++scan->stats.int_vector[vector];
+            }
             for (i = 0u; i < inst.length && offset + i < scan->image_size; ++i) {
                 if (!scan->seen_byte[offset + i]) {
                     scan->seen_byte[offset + i] = 1u;
@@ -395,6 +401,23 @@ static void dp_print_report(const DpScan *scan, const DpOptions *opt)
            (unsigned long long)s->returns,
            (unsigned long long)s->stops);
 
+    {
+        uint8_t taken_int[256];
+        unsigned k, v, best;
+        memset(taken_int, 0, sizeof(taken_int));
+        printf("  reachable INT vectors:");
+        for (k = 0u; k < 16u; ++k) {
+            best = 256u;
+            for (v = 0u; v < 256u; ++v)
+                if (!taken_int[v] && s->int_vector[v] != 0u &&
+                    (best == 256u || s->int_vector[v] > s->int_vector[best])) best = v;
+            if (best == 256u) break;
+            taken_int[best] = 1u;
+            printf(" %02X:%llu", best, (unsigned long long)s->int_vector[best]);
+        }
+        printf("\n");
+    }
+
     printf("\n  top unsupported reachable opcodes:\n");
     printf("    opcode  count   examples              class\n");
     for (i = 0u; i < show; ++i) {
@@ -451,7 +474,7 @@ static int dp_write_json(const DpScan *scan, const DpOptions *opt)
             "  \"decode_errors\": %llu,\n  \"flow\": {\n"
             "    \"conditional\": %llu, \"direct_calls\": %llu, \"direct_jumps\": %llu,\n"
             "    \"indirect_calls\": %llu, \"indirect_jumps\": %llu, \"returns\": %llu, \"stops\": %llu\n"
-            "  },\n  \"top_unsupported\": [\n",
+            "  },\n  \"interrupt_vectors\": {",
             (unsigned long)scan->image_size,
             (unsigned)scan->base,
             (unsigned)scan->entry,
@@ -469,6 +492,32 @@ static int dp_write_json(const DpScan *scan, const DpOptions *opt)
             (unsigned long long)s->indirect_jumps,
             (unsigned long long)s->returns,
             (unsigned long long)s->stops);
+
+    {
+        unsigned v;
+        int first = 1;
+        for (v = 0u; v < 256u; ++v) {
+            if (s->int_vector[v] == 0u) continue;
+            fprintf(file, "%s\n    \"%02X\": %llu",
+                    first ? "" : ",",
+                    v, (unsigned long long)s->int_vector[v]);
+            first = 0;
+        }
+        fputs(first ? "},\n  \"opcode_counts\": {"
+                    : "\n  },\n  \"opcode_counts\": {", file);
+    }
+    {
+        unsigned op;
+        int first = 1;
+        for (op = 0u; op < 256u; ++op) {
+            if (s->opcode[op].count == 0u) continue;
+            fprintf(file, "%s\n    \"%02X\": %llu", first ? "" : ",", op,
+                    (unsigned long long)s->opcode[op].count);
+            first = 0;
+        }
+        fputs(first ? "},\n  \"top_unsupported\": [\n"
+                    : "\n  },\n  \"top_unsupported\": [\n", file);
+    }
 
     for (i = 0u; i < show; ++i) {
         const uint8_t op = rank[i].opcode;

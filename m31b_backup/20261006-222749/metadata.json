@@ -1,0 +1,10 @@
+{
+  "created": "20261006-222749",
+  "base_head": "e3024907264bd913545eaabf17ac3d54c59954f3",
+  "files": [
+    "include/microdos/translate.h",
+    "src/runtime/translate.c",
+    "pico/microdos_pico.c",
+    "pico/CMakeLists.txt"
+  ]
+}

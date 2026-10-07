@@ -1,0 +1,23 @@
+{
+  "created": "20261007-014056",
+  "head": "e3024907264bd913545eaabf17ac3d54c59954f3",
+  "modified": [
+    "CMakeLists.txt",
+    "src/system/md_dos2_system.h",
+    "src/system/md_dos2_system.c",
+    "src/runtime/jit_aarch64_backend.inc",
+    "pico/CMakeLists.txt",
+    "pi0w/CMakeLists.txt"
+  ],
+  "new": [
+    "include/microdos/native3.h",
+    "src/runtime/native3.c",
+    "src/runtime/native3_a64_direct.inc",
+    "tests/test_native3.c",
+    "tools/native3_cache.c",
+    "pico/microdos_native3_bench.c",
+    "pi0w/microdos_pi0w_native3_bench.c",
+    "scripts/md_native3_all.ps1",
+    "docs/NATIVE3_OMNIBUS.md"
+  ]
+}

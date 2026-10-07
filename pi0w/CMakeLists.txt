@@ -224,3 +224,61 @@ add_custom_command(TARGET microdos_pi0w_bench.elf POST_BUILD
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/kernel8_bench.img"
     COMMENT "Producing Pi Zero 2 W benchmark kernel8_bench.img"
 )
+
+# ---------------------------------------------------------------------------
+# Native-3 omnibus targets (N3.0-N3.8). Parallel to legacy hybrid JIT.
+# ---------------------------------------------------------------------------
+md_pi0w_dos(microdos_pi0w_native3.elf kernel8_native3.img 0 0 0 0 0 0)
+target_sources(microdos_pi0w_native3.elf PRIVATE
+    "${MD_ROOT}/src/runtime/native3.c"
+    "${MD_ROOT}/src/runtime/native_v2.c"
+    "${MD_ROOT}/src/runtime/native_v2_runtime.c"
+    "${MD_ROOT}/src/runtime/region.c"
+    "${MD_ROOT}/src/runtime/jit_core.c"
+    "${MD_ROOT}/src/decode/x86_decode.c")
+target_compile_definitions(microdos_pi0w_native3.elf PRIVATE
+    MICRODOS_ENABLE_NATIVE3=1
+    MICRODOS_NATIVE3_A64_DIRECT_EXT=1
+    MD_N3_PROFILE=0
+    MD_JIT_PROFILE=0
+    MD_JIT_LEGACY_HOTNESS=0
+    MD_JIT_BLOCK_SLOTS=256
+    "MICRODOS_NATIVE3_CODE_BYTES=(128u*1024u)")
+
+add_executable(microdos_pi0w_native3_bench.elf
+    "${CMAKE_CURRENT_LIST_DIR}/start.S"
+    "${CMAKE_CURRENT_LIST_DIR}/microdos_pi0w_native3_bench.c"
+    "${CMAKE_CURRENT_LIST_DIR}/mini_libc.c"
+    "${MD_ROOT}/src/runtime/native3.c"
+    "${MD_ROOT}/src/runtime/native_v2.c"
+    "${MD_ROOT}/src/runtime/native_v2_runtime.c"
+    "${MD_ROOT}/src/runtime/runtime.c"
+    "${MD_ROOT}/src/runtime/x86_interp.c"
+    "${MD_ROOT}/src/runtime/region.c"
+    "${MD_ROOT}/src/runtime/jit_core.c"
+    "${MD_ROOT}/src/decode/x86_decode.c")
+target_include_directories(microdos_pi0w_native3_bench.elf PRIVATE
+    "${MD_ROOT}/include" "${MD_ROOT}/src/runtime")
+target_compile_definitions(microdos_pi0w_native3_bench.elf PRIVATE
+    NDEBUG=1
+    MD_THREADED_DISPATCH=1
+    MICRODOS_PI0W_BAREMETAL=1
+    MICRODOS_NATIVE3_A64_DIRECT_EXT=1
+    MD_N3_PROFILE=1
+    MD_JIT_PROFILE=1
+    MD_JIT_LEGACY_HOTNESS=0
+    MD_JIT_BLOCK_SLOTS=256)
+target_compile_options(microdos_pi0w_native3_bench.elf PRIVATE
+    -O3 -Wall -Wextra -Wno-unused-parameter -ffunction-sections -fdata-sections)
+target_link_options(microdos_pi0w_native3_bench.elf PRIVATE
+    -nostdlib -static "-T${CMAKE_CURRENT_LIST_DIR}/linker.ld"
+    -Wl,--gc-sections -Wl,--build-id=none
+    "-Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/microdos_pi0w_native3_bench.map")
+target_link_libraries(microdos_pi0w_native3_bench.elf PRIVATE gcc)
+add_custom_command(TARGET microdos_pi0w_native3_bench.elf POST_BUILD
+    COMMAND "${CMAKE_OBJCOPY}" -O binary
+        "$<TARGET_FILE:microdos_pi0w_native3_bench.elf>"
+        "${CMAKE_CURRENT_BINARY_DIR}/kernel8_native3_bench.img"
+    COMMAND "${CMAKE_SIZE}" "$<TARGET_FILE:microdos_pi0w_native3_bench.elf>"
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/kernel8_native3_bench.img"
+    COMMENT "Producing Native-3 kernel8_native3_bench.img")

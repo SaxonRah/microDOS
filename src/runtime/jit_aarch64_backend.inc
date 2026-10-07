@@ -1335,6 +1335,14 @@ static int md_jit_a64_emit_live_resident(MdJit *jit, MdJitBlock *block, int allo
     return 0;
 }
 
+
+#ifndef MICRODOS_NATIVE3_A64_DIRECT_EXT
+#define MICRODOS_NATIVE3_A64_DIRECT_EXT 0
+#endif
+#if MICRODOS_NATIVE3_A64_DIRECT_EXT
+#include "native3_a64_direct.inc"
+#endif
+
 /*
  * First true direct lowering slice. X0 is MdRuntime* and MdRuntime begins with
  * MdX86, so the architectural register/IP offsets are direct X0-relative
@@ -1441,6 +1449,9 @@ static int md_jit_emit_aarch64(MdJit *jit, MdJitBlock *block, int allow_live)
      * Jcc/LOOP, etc. execute as one A64 trampoline -> shared semantic block.
      * Pure MOV/NOP/JMP blocks still use the smaller true direct emitter.
      */
+#if MICRODOS_NATIVE3_A64_DIRECT_EXT
+    if (md_n3_a64_emit_direct_ext(jit, block)) return 1;
+#endif
     if (md_jit_a64_emit_block_helper(jit, block)) return 1;
 
     if (md_jit_a64_emit_direct(jit, block)) return 1;

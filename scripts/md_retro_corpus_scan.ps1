@@ -1,0 +1,5 @@
+param([string]$MountedRoot,[string]$IsoDir,[string]$Out="C:\microDOS-corpus\retro",[string]$SevenZip="",[int]$MaxGames=0,[int]$MaxFilesPerGame=0)
+$ErrorActionPreference="Stop"; $repo=(Resolve-Path (Join-Path $PSScriptRoot "..")).Path; $scan=Join-Path $repo "tools\int_corpus\retro_corpus_scan.py"; $dp=Join-Path $repo "build-host\Release\dosprobe.exe"
+if([string]::IsNullOrWhiteSpace($MountedRoot) -eq [string]::IsNullOrWhiteSpace($IsoDir)){throw "Specify exactly one of -MountedRoot or -IsoDir"}
+if(-not(Test-Path $dp)){Push-Location $repo;try{& .\md.bat build host;if($LASTEXITCODE -ne 0){throw "host build failed"}}finally{Pop-Location}}
+$a=@($scan,"--dosprobe",$dp,"--out",$Out); if($MountedRoot){$a+=@("--mounted",$MountedRoot)}else{$a+=@("--iso-dir",$IsoDir)}; if($SevenZip){$a+=@("--sevenzip",$SevenZip)}; if($MaxGames -gt 0){$a+=@("--max-games","$MaxGames")}; if($MaxFilesPerGame -gt 0){$a+=@("--max-files-per-game","$MaxFilesPerGame")}; & python @a; if($LASTEXITCODE -ne 0){throw "corpus scan failed"}

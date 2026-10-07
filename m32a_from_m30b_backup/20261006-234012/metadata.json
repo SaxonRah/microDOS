@@ -1,0 +1,17 @@
+{
+  "created": "20261006-234012",
+  "base_head": "e3024907264bd913545eaabf17ac3d54c59954f3",
+  "files": [
+    "include/microdos/translate.h",
+    "src/runtime/translate.c",
+    "pico/microdos_pico.c",
+    "pico/CMakeLists.txt"
+  ],
+  "stages": [
+    "M31a region topology support",
+    "M31b trace-region execution",
+    "M31b-v2 refund-safe chaining",
+    "M31b-v3 compact 32-byte block",
+    "M32a canonical shared regions"
+  ]
+}

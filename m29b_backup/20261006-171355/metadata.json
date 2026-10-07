@@ -1,0 +1,12 @@
+{
+  "base_head": "e3024907264bd913545eaabf17ac3d54c59954f3",
+  "created": "20261006-171355",
+  "files": [
+    "include/microdos/translate.h",
+    "include/microdos/runtime.h",
+    "src/runtime/x86_interp.c",
+    "src/runtime/translate.c",
+    "tests/test_translate_diff.c",
+    "pico/CMakeLists.txt"
+  ]
+}

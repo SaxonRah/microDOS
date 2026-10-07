@@ -6,6 +6,53 @@
 #include <stddef.h>
 #include <string.h>
 
+#if MICRODOS_INT_PROFILE
+static MdIntProfile g_md_int_profile;
+
+void md_int_profile_record(const MdX86 *cpu, uint8_t vector, uint16_t ip_before)
+{
+    MdIntProfile *p = &g_md_int_profile;
+    const uint16_t ax = cpu->r[MD_X86_AX];
+    const uint8_t ah = (uint8_t)(ax >> 8);
+    unsigned probe;
+    unsigned slot = (((unsigned)cpu->cs * 33u) ^ (unsigned)ip_before ^
+                     ((unsigned)vector << 5) ^ (unsigned)ax) &
+                    (MD_INT_PROFILE_SITE_SLOTS - 1u);
+
+    ++p->total;
+    ++p->vector[vector];
+    switch (vector) {
+        case 0x21u: ++p->int21_ah[ah]; break;
+        case 0x10u: ++p->int10_ah[ah]; break;
+        case 0x13u: ++p->int13_ah[ah]; break;
+        case 0x16u: ++p->int16_ah[ah]; break;
+        case 0x33u: ++p->int33_ax_low[(uint8_t)ax]; break;
+        default: break;
+    }
+
+    for (probe = 0u; probe < 8u; ++probe) {
+        MdIntProfileSite *s = &p->site[(slot + probe) & (MD_INT_PROFILE_SITE_SLOTS - 1u)];
+        if (s->count == 0u) {
+            s->cs = cpu->cs; s->ip = ip_before; s->ax = ax;
+            s->vector = vector; s->ah = ah; s->count = 1u;
+            return;
+        }
+        if (s->cs == cpu->cs && s->ip == ip_before && s->vector == vector && s->ax == ax) {
+            ++s->count;
+            return;
+        }
+    }
+    ++p->site_drops;
+}
+
+const MdIntProfile *md_int_profile_counts(void) { return &g_md_int_profile; }
+void md_int_profile_reset(void) { memset(&g_md_int_profile, 0, sizeof(g_md_int_profile)); }
+#define MD_INT_PROFILE_SOFTWARE(cpu, vector, ip_before) \
+    md_int_profile_record((cpu), (uint8_t)(vector), (uint16_t)(ip_before))
+#else
+#define MD_INT_PROFILE_SOFTWARE(cpu, vector, ip_before) ((void)0)
+#endif
+
 #if MD_INTERP_OPCODE_PROFILE
 static uint32_t g_md_opcode_profile[256];
 static uint32_t g_md_unpref_modrm_profile[6u * 256u];
@@ -1519,6 +1566,7 @@ MD_INTERP_INLINE int md_execute_opcode(MdRuntime *runtime, uint8_t opcode, uint1
             break;
         case 0xCD: {
             const uint8_t vector = md_fetch8(runtime);
+            MD_INT_PROFILE_SOFTWARE(cpu, vector, ip_before);
             (void)md_runtime_interrupt(runtime, vector);
             break;
         }
@@ -2482,6 +2530,7 @@ op_nop:
 
 op_int: {
     const uint8_t vector = MD_CODE_FETCH8();
+    MD_INT_PROFILE_SOFTWARE(&runtime->cpu, vector, ip_before);
     runtime->instructions += done;     /* hooks may observe the count */
     done = 0u;
     (void)md_runtime_interrupt(runtime, vector);

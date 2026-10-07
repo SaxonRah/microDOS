@@ -1,0 +1,14 @@
+{
+  "created": "20261006-180907",
+  "base_head": "e3024907264bd913545eaabf17ac3d54c59954f3",
+  "files": [
+    "include/microdos/runtime.h",
+    "src/runtime/runtime.c",
+    "include/microdos/translate.h",
+    "src/runtime/translate.c",
+    "src/host/msdos2_boot.c",
+    "tests/test_translate_diff.c",
+    "pico/microdos_pico.c",
+    "pico/CMakeLists.txt"
+  ]
+}

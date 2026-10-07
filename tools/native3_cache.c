@@ -1,0 +1,5 @@
+#include "microdos/native3.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+int main(int argc,char**argv){FILE*f;long n;uint8_t*b;const MdN3CacheHeader*h;const MdN3CacheRecord*r;unsigned i;if(argc<3){fprintf(stderr,"usage: %s inspect cache.bin\n",argv[0]);return 2;}f=fopen(argv[2],"rb");if(!f){perror(argv[2]);return 2;}fseek(f,0,SEEK_END);n=ftell(f);rewind(f);b=(uint8_t*)malloc((size_t)n);if(!b||fread(b,1,(size_t)n,f)!=(size_t)n){fclose(f);free(b);return 2;}fclose(f);h=(const MdN3CacheHeader*)b;if(n<(long)sizeof(*h)||h->magic!=MD_N3_CACHE_MAGIC||h->version!=MD_N3_CACHE_VERSION){fprintf(stderr,"bad Native-3 cache\n");free(b);return 2;}r=(const MdN3CacheRecord*)(h+1);printf("Native-3 cache v%u records=%u record_size=%u guest_bits=%u features=%08x checksum=%08x\n",h->version,h->record_count,h->record_size,h->guest_address_bits,h->feature_bits,h->checksum);for(i=0;i<h->record_count;i++)printf("%04x:%04x sig=%08x pages=%u backend=%u heat=%u\n",r[i].cs,r[i].ip,r[i].signature,r[i].page_count,r[i].backend_hint,r[i].heat);free(b);return 0;}

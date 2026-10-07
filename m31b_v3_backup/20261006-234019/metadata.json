@@ -1,0 +1,8 @@
+{
+  "created": "20261006-234019",
+  "files": [
+    "src/runtime/translate.c",
+    "pico/microdos_pico.c",
+    "pico/CMakeLists.txt"
+  ]
+}
