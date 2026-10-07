@@ -795,12 +795,6 @@ static void md_stats(uint64_t start_us)
                (unsigned long)g_sys.runtime.code_epoch,
                (unsigned long)g_sys.runtime.code_write_epoch);
 
-#if MD_JIT_BYTE_EXACT_TRACKING && MICRODOS_TRANSLATION_SUPPORT
-        md_say("[native3-jit-smc] exact-pages=%u fallback-pages=%u\n",
-               (unsigned)g_sys.native3.jit.live_used,
-               (unsigned)g_sys.native3.jit.live_fallback_pages);
-#endif
-
         md_say("[native3-nv2] retired=%llu entries=%llu lookups=%llu "
                "hit/miss=%llu/%llu probes=%llu compiles=%llu "
                "compile-reject=%llu stack-guard=%llu budget=%llu short=%llu\n",

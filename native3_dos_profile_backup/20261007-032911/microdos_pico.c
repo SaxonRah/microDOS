@@ -753,71 +753,6 @@ static void md_stats(uint64_t start_us)
         md_int_profile_reset();
     }
 #endif
-#if defined(MICRODOS_ENABLE_NATIVE3) && MD_N3_PROFILE
-    {
-        const MdN3Stats *n3 = md_native3_stats(&g_sys.native3);
-        const MdNativeV2Runtime *nv = &g_sys.native3.nv2;
-
-        md_say("[native3] owned=%llu retired=%llu native=%llu interp=%llu "
-               "entries=%llu jit=%llu/%llu nv2=%llu/%llu\n",
-               (unsigned long long)g_sys.native3_instructions,
-               (unsigned long long)(n3 ? n3->retired : 0u),
-               (unsigned long long)(n3 ? n3->native_retired : 0u),
-               (unsigned long long)(n3 ? n3->interp_retired : 0u),
-               (unsigned long long)(n3 ? n3->entries : 0u),
-               (unsigned long long)(n3 ? n3->jit_entries : 0u),
-               (unsigned long long)(n3 ? n3->jit_retired : 0u),
-               (unsigned long long)(n3 ? n3->nv2_entries : 0u),
-               (unsigned long long)(n3 ? n3->nv2_retired : 0u));
-
-        md_say("[native3] lookup hit/miss=%llu/%llu compiles=%llu "
-               "reject=%llu invalid=%llu shadow=%llu/%llu/%llu "
-               "smc=%llu\n",
-               (unsigned long long)(n3 ? n3->hits : 0u),
-               (unsigned long long)(n3 ? n3->misses : 0u),
-               (unsigned long long)(n3 ? n3->compiles : 0u),
-               (unsigned long long)(n3 ? n3->rejects : 0u),
-               (unsigned long long)(n3 ? n3->invalidations : 0u),
-               (unsigned long long)(n3 ? n3->shadow_pushes : 0u),
-               (unsigned long long)(n3 ? n3->shadow_hits : 0u),
-               (unsigned long long)(n3 ? n3->shadow_misses : 0u),
-               (unsigned long long)(n3 ? n3->smc_rejects : 0u));
-
-        md_say("[native3-inv] cold=%llu collision=%llu "
-               "p0=%llu p1=%llu both=%llu epoch-reset=%llu "
-               "code-epoch=%lu write-epoch=%lu\n",
-               (unsigned long long)(n3 ? n3->cold_misses : 0u),
-               (unsigned long long)(n3 ? n3->site_collisions : 0u),
-               (unsigned long long)(n3 ? n3->invalid_page0_only : 0u),
-               (unsigned long long)(n3 ? n3->invalid_page1_only : 0u),
-               (unsigned long long)(n3 ? n3->invalid_both_pages : 0u),
-               (unsigned long long)(n3 ? n3->epoch_resets : 0u),
-               (unsigned long)g_sys.runtime.code_epoch,
-               (unsigned long)g_sys.runtime.code_write_epoch);
-
-#if MD_JIT_BYTE_EXACT_TRACKING && MICRODOS_TRANSLATION_SUPPORT
-        md_say("[native3-jit-smc] exact-pages=%u fallback-pages=%u\n",
-               (unsigned)g_sys.native3.jit.live_used,
-               (unsigned)g_sys.native3.jit.live_fallback_pages);
-#endif
-
-        md_say("[native3-nv2] retired=%llu entries=%llu lookups=%llu "
-               "hit/miss=%llu/%llu probes=%llu compiles=%llu "
-               "compile-reject=%llu stack-guard=%llu budget=%llu short=%llu\n",
-               (unsigned long long)nv->retired,
-               (unsigned long long)nv->entries,
-               (unsigned long long)nv->lookups,
-               (unsigned long long)nv->cache_hits,
-               (unsigned long long)nv->cache_misses,
-               (unsigned long long)nv->probes,
-               (unsigned long long)nv->compiles,
-               (unsigned long long)nv->compile_rejects,
-               (unsigned long long)nv->stack_guard_rejects,
-               (unsigned long long)nv->budget_rejects,
-               (unsigned long long)nv->short_rejects);
-    }
-#endif
-
 #if MICRODOS_PICO_NATIVE_V2
     {
         const MdNativeV2Runtime *nv = &g_sys.native_v2;
@@ -970,15 +905,6 @@ int main(void)
            MD_PICO_CODE_PLACEMENT,
            MICRODOS_PICO_CACHE?"ON":"OFF", MICRODOS_PICO_JIT?"ON":"OFF",
            MICRODOS_PICO_NATIVE_V2?"ON":"OFF");
-#if defined(MICRODOS_ENABLE_NATIVE3)
-    md_say("  n3:      Native-3 ON%s\n",
-#if MD_N3_PROFILE
-           " (profile counters ON)"
-#else
-           ""
-#endif
-    );
-#endif
     md_say("  keys:    Ctrl+] -> tier/native statistics (boot + interval)\n");
 
     start_us=time_us_64();

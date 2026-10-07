@@ -83,24 +83,6 @@ extern "C" {
 #define MD_JIT_PROFILE 1
 #endif
 
-/*
- * Optional M25-style byte-exact SMC tracking for the runtime JIT.
- *
- * The historical JIT marks every 4 KiB page containing a translated block as
- * MD_X86_PAGE_TRANSLATED, so any data/stack store sharing that page bumps the
- * generation and invalidates JIT/N3 metadata. With this switch enabled, JIT
- * source bytes use MD_X86_PAGE_TRBYTES + a per-byte bitmap, just like the M25
- * translator. Pool exhaustion or coexistence with another bitmap owner falls
- * back conservatively to the old page-granular tracking.
- */
-#ifndef MD_JIT_BYTE_EXACT_TRACKING
-#define MD_JIT_BYTE_EXACT_TRACKING 0
-#endif
-
-#ifndef MD_JIT_LIVE_PAGES
-#define MD_JIT_LIVE_PAGES 16u
-#endif
-
 typedef enum MdJitExitReason {
     MD_JIT_EXIT_NONE = 0,
     MD_JIT_EXIT_COMPILE_FAIL,
@@ -298,19 +280,6 @@ struct MdJit {
 #if MD_JIT_LEGACY_HOTNESS
     MdJitHotness hotness[MD_JIT_HOTNESS_SLOTS];
 #endif
-
-#if MD_JIT_BYTE_EXACT_TRACKING && MICRODOS_TRANSLATION_SUPPORT
-    /*
-     * One bit per guest byte for pages containing JIT source code.
-     * cpu.tr_live_bits points at live_table while this JIT owns the byte-exact
-     * tracker. 16 pages cost 8 KiB and cover the normal DOS/JIT working set.
-     */
-    uint8_t *live_table[MD_X86_CODE_PAGE_COUNT];
-    uint8_t live_pool[MD_JIT_LIVE_PAGES][MD_X86_CODE_PAGE_SIZE / 8u];
-    uint16_t live_used;
-    uint16_t live_fallback_pages;
-#endif
-
     uint8_t last_lookup_cold;
 };
 

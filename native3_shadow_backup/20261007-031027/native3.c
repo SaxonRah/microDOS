@@ -51,82 +51,30 @@ static void n3_pages(MdN3Site *s, const MdRuntime *rt, uint16_t cs, uint16_t ip)
     s->gen1 = rt->code_page_generation[s->page1];
 }
 
-/*
- * Return a bit mask describing why a cached site is stale:
- *   bit 0 = first tracked 4 KiB guest code page changed
- *   bit 1 = second tracked guest code page changed
- *
- * n3_pages() currently tracks the 32-byte site window, so most sites occupy
- * one page and cross-page sites occupy exactly two.
- */
-static unsigned n3_stale_mask(const MdN3Site *s, const MdRuntime *rt)
-{
-    unsigned mask = 0u;
-
-    if (s->state == MD_N3_SITE_EMPTY)
-        return 3u;
-
-    if (s->page_count &&
-        rt->code_page_generation[s->page0] != s->gen0)
-        mask |= 1u;
-
-    if (s->page_count > 1u &&
-        rt->code_page_generation[s->page1] != s->gen1)
-        mask |= 2u;
-
-    return mask;
-}
-
 static int n3_fresh(const MdN3Site *s, const MdRuntime *rt)
 {
-    return s->state != MD_N3_SITE_EMPTY &&
-           n3_stale_mask(s, rt) == 0u;
+    if (s->state == MD_N3_SITE_EMPTY) return 0;
+    if (s->page_count && rt->code_page_generation[s->page0] != s->gen0) return 0;
+    if (s->page_count > 1u && rt->code_page_generation[s->page1] != s->gen1) return 0;
+    return 1;
 }
 
 static MdN3Site *n3_site(MdNative3 *n3, MdRuntime *rt, uint16_t cs, uint16_t ip)
 {
     MdN3Site *s = &n3->site[n3_hash(cs, ip)];
-
     N3STAT_INC(n3, lookups);
-
-    if (s->state != MD_N3_SITE_EMPTY &&
-        s->cs == cs &&
-        s->ip == ip) {
-        const unsigned stale = n3_stale_mask(s, rt);
-
-        if (stale == 0u) {
-            N3STAT_INC(n3, hits);
-            return s;
-        }
-
-        if (stale == 1u)
-            N3STAT_INC(n3, invalid_page0_only);
-        else if (stale == 2u)
-            N3STAT_INC(n3, invalid_page1_only);
-        else
-            N3STAT_INC(n3, invalid_both_pages);
-
+    if (s->state != MD_N3_SITE_EMPTY && s->cs == cs && s->ip == ip) {
+        if (n3_fresh(s, rt)) { N3STAT_INC(n3, hits); return s; }
         memset(s, 0, sizeof(*s));
         N3STAT_INC(n3, invalidations);
     } else if (s->state != MD_N3_SITE_EMPTY) {
-        /*
-         * Direct-map replacement of an unrelated CS:IP.  This is capacity /
-         * hash collision churn, not guest self-modifying code.
-         */
-        N3STAT_INC(n3, site_collisions);
         memset(s, 0, sizeof(*s));
-    } else {
-        N3STAT_INC(n3, cold_misses);
     }
-
     N3STAT_INC(n3, misses);
-
-    s->cs = cs;
-    s->ip = ip;
+    s->cs = cs; s->ip = ip;
     s->signature = n3_signature(rt, cs, ip);
     n3_pages(s, rt, cs, ip);
     s->state = MD_N3_SITE_SEEN;
-
     return s;
 }
 
@@ -187,42 +135,6 @@ static int n3_shadow_pop(MdNative3 *n3, uint16_t cs, uint16_t ip)
         }
     }
     N3STAT_INC(n3, shadow_misses); return 0;
-}
-
-/*
- * N3.2 shadow metadata must describe control transfers that actually retired,
- * never transfers merely discovered by look-ahead probing.
- *
- * n3_probe() may decode several fallthrough instructions before reaching the
- * first CALL/RET. A scheduler budget can stop before that control instruction,
- * so committing at probe time creates phantom calls. Only commit when the
- * execution episode retired exactly through the probed control boundary.
- *
- * RET matching uses the architectural post-RET CS:IP, which is the predicted
- * return address stored by the corresponding CALL.
- */
-static void n3_shadow_commit(MdNative3 *n3, MdRuntime *rt,
-                             const N3Probe *p, uint64_t retired)
-{
-    if (n3 == NULL || rt == NULL || p == NULL)
-        return;
-
-    if (!p->call && !p->ret)
-        return;
-
-    if (retired != (uint64_t)p->decoded)
-        return;
-
-    if (p->call && p->direct) {
-        n3_shadow_push(
-            n3,
-            rt->cpu.cs,
-            p->next_ip,
-            rt->cpu.cs,
-            p->target);
-    } else if (p->ret) {
-        (void)n3_shadow_pop(n3, rt->cpu.cs, rt->cpu.ip);
-    }
 }
 
 static int n3_prepare_jit(MdNative3 *n3, MdRuntime *rt, MdN3Site *s)
@@ -324,20 +236,9 @@ bool MD_EXEC_HOT_FUNC(md_native3_run)(MdNative3 *n3, MdRuntime *rt, uint64_t bud
     if (!n3 || !rt || !n3->initialized || !budget || rt->stop_reason!=MD_STOP_NONE) return false;
 
     if (n3->seen_code_epoch != rt->code_epoch) {
-        /*
-         * seen_code_epoch==0 is the first attachment after md_native3_init(),
-         * not an invalidation event.  Count only subsequent whole-engine
-         * resets so page-local SMC and image/reset churn remain distinguishable.
-         */
-        if (n3->seen_code_epoch != 0u)
-            N3STAT_INC(n3, epoch_resets);
-
-        md_jit_reset(&n3->jit);
-        md_native_v2_runtime_init(&n3->nv2);
-        memset(n3->site,0,sizeof(n3->site));
-        memset(n3->shadow,0,sizeof(n3->shadow));
-        n3->shadow_top=n3->shadow_count=0;
-        n3->seen_code_epoch=rt->code_epoch;
+        md_jit_reset(&n3->jit); md_native_v2_runtime_init(&n3->nv2);
+        memset(n3->site,0,sizeof(n3->site)); memset(n3->shadow,0,sizeof(n3->shadow));
+        n3->shadow_top=n3->shadow_count=0; n3->seen_code_epoch=rt->code_epoch;
     }
     N3STAT_INC(n3, entries);
 
@@ -358,15 +259,13 @@ bool MD_EXEC_HOT_FUNC(md_native3_run)(MdNative3 *n3, MdRuntime *rt, uint64_t bud
             if (!n3_probe(rt,rt->cpu.cs,rt->cpu.ip,&p)) {
                 uint64_t r=n3_interp(n3,rt,left); total+=r; interp+=r; if(!r)break; continue;
             }
+            if (p.call && p.direct) n3_shadow_push(n3,rt->cpu.cs,p.next_ip,rt->cpu.cs,p.target);
+            else if (p.ret) (void)n3_shadow_pop(n3,rt->cpu.cs,rt->cpu.ip);
 
             if (s->state != MD_N3_SITE_NATIVE) {
                 if (!n3_prepare_jit(n3,rt,s)) {
                     s->state=s->penalty>=3u?MD_N3_SITE_FALLBACK:MD_N3_SITE_SEEN;
-                    {
-                        uint64_t r=n3_interp(n3,rt,left);
-                        n3_shadow_commit(n3,rt,&p,r);
-                        total+=r; interp+=r; if(!r)break; continue;
-                    }
+                    { uint64_t r=n3_interp(n3,rt,left); total+=r; interp+=r; if(!r)break; continue; }
                 }
                 n3_prefetch(n3,rt,&p);
             }
@@ -378,7 +277,6 @@ bool MD_EXEC_HOT_FUNC(md_native3_run)(MdNative3 *n3, MdRuntime *rt, uint64_t bud
              */
             {
                 uint64_t r = n3_interp(n3, rt, left);
-                n3_shadow_commit(n3,rt,&p,r);
                 total += r;
                 interp += r;
                 if (!r) break;
@@ -389,16 +287,13 @@ bool MD_EXEC_HOT_FUNC(md_native3_run)(MdNative3 *n3, MdRuntime *rt, uint64_t bud
                 MdJitRunResult jr; uint64_t before=rt->instructions;
                 (void)md_jit_run_region(&n3->jit,rt,left,&jr);
                 if (jr.retired) {
-                    n3_shadow_commit(n3,rt,&p,jr.retired);
                     total+=jr.retired; native+=jr.native; interp+=jr.fallback;
                     N3STAT_INC(n3, jit_entries); N3STAT_ADD(n3, jit_retired, jr.native);
                     if (jr.invalidated) { s->state=MD_N3_SITE_SEEN; N3STAT_INC(n3, smc_rejects); }
                     continue;
                 }
                 if (rt->instructions==before) {
-                    uint64_t r=n3_interp(n3,rt,left);
-                    n3_shadow_commit(n3,rt,&p,r);
-                    total+=r; interp+=r; if(!r)break;
+                    uint64_t r=n3_interp(n3,rt,left); total+=r; interp+=r; if(!r)break;
                 }
             }
 #endif

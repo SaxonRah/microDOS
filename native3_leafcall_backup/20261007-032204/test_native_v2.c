@@ -292,33 +292,6 @@ static void build_phase4_call_graph(uint8_t *memory)
     memcpy(memory + 0x0176u, proc_c, sizeof(proc_c));
 }
 
-static void build_leaf_call_graph(uint8_t *memory)
-{
-    /*
-     * Generic Phase-3Q class:
-     *
-     *   0106: call 010d
-     *   0109: dec cx
-     *   010a: jnz 0106
-     *
-     *   010d: add bx,3
-     *   0110: ret
-     */
-    static const uint8_t caller[] = {
-        0xE8,0x04,0x00,
-        0x49,
-        0x75,0xFA
-    };
-    static const uint8_t leaf[] = {
-        0x83,0xC3,0x03,
-        0xC3
-    };
-
-    memset(memory, 0, 1u << 20);
-    memcpy(memory + 0x0106u, caller, sizeof(caller));
-    memcpy(memory + 0x010Du, leaf, sizeof(leaf));
-}
-
 static int check(const char *name,
                  const uint8_t *image, size_t n,
                  unsigned expected_ops, uint16_t end_ip,
@@ -975,94 +948,6 @@ int main(void)
     }
 
     {
-        static uint8_t leaf_memory[1u << 20];
-        MdNativeV2Code code;
-        MdNativeV2Status st;
-        uint8_t counter = 0xFFu;
-
-        build_leaf_call_graph(leaf_memory);
-
-        memset(&code, 0, sizeof(code));
-        st = md_native_v2_compile_local_call_loop(
-            leaf_memory, 0u, 0x0106u, &code, &counter);
-
-        if (st != MD_NATIVE_V2_OK ||
-            counter != MD_X86_CX ||
-            code.phase != 16u ||
-            code.op_count != 5u ||
-            code.start_ip != 0x0106u ||
-            code.end_ip != 0x010Cu ||
-            code.loop_terminal != 0x75u ||
-            code.chunkable_loop != 2u ||
-            !code.local_call_graph ||
-            code.call_stack_bytes != 2u ||
-            code.guest_span_count != 2u ||
-            code.guest_span_ip[0] != 0x0106u ||
-            code.guest_span_len[0] != 6u ||
-            code.guest_span_ip[1] != 0x010Du ||
-            code.guest_span_len[1] != 4u ||
-            !code.needs_memory ||
-            !code.has_store ||
-            !code.requires_safe_ss_word ||
-            code.exit_flags_reg != MD_X86_CX ||
-            code.exit_lazy_op != MD_LAZY_DEC16 ||
-            code.size == 0u) {
-            fprintf(stderr,
-                    "phase3q leaf CALL graph compile failed st=%s "
-                    "phase=%u ops=%u end=%04x counter=%u graph=%u "
-                    "depth=%u spans=%u size=%u\n",
-                    md_native_v2_status_name(st),
-                    (unsigned)code.phase,
-                    (unsigned)code.op_count,
-                    code.end_ip,
-                    (unsigned)counter,
-                    (unsigned)code.local_call_graph,
-                    (unsigned)code.call_stack_bytes,
-                    (unsigned)code.guest_span_count,
-                    (unsigned)code.size);
-            return 1;
-        }
-
-        /* Destination register/immediate are class parameters, not constants. */
-        leaf_memory[0x010Eu] = 0xC2u; /* ADD DX,imm8 */
-        leaf_memory[0x010Fu] = 0x17u;
-        memset(&code, 0, sizeof(code));
-        st = md_native_v2_compile_local_call_loop(
-            leaf_memory, 0u, 0x0106u, &code, &counter);
-        if (st != MD_NATIVE_V2_OK || code.phase != 16u) {
-            fprintf(stderr,
-                    "phase3q parameterized leaf rejected st=%s\n",
-                    md_native_v2_status_name(st));
-            return 1;
-        }
-
-        /* A leaf may not modify the counted register. */
-        leaf_memory[0x010Eu] = 0xC1u; /* ADD CX,imm8 */
-        memset(&code, 0, sizeof(code));
-        st = md_native_v2_compile_local_call_loop(
-            leaf_memory, 0u, 0x0106u, &code, &counter);
-        if (st != MD_NATIVE_V2_UNSUPPORTED) {
-            fprintf(stderr,
-                    "phase3q counter-clobber leaf admitted st=%s\n",
-                    md_native_v2_status_name(st));
-            return 1;
-        }
-
-        /* RET is part of the proof. */
-        build_leaf_call_graph(leaf_memory);
-        leaf_memory[0x0110u] = 0x90u;
-        memset(&code, 0, sizeof(code));
-        st = md_native_v2_compile_local_call_loop(
-            leaf_memory, 0u, 0x0106u, &code, &counter);
-        if (st != MD_NATIVE_V2_UNSUPPORTED) {
-            fprintf(stderr,
-                    "phase3q missing-RET leaf admitted st=%s\n",
-                    md_native_v2_status_name(st));
-            return 1;
-        }
-    }
-
-    {
         static uint8_t call_memory[1u << 20];
         MdNativeV2Code code;
         MdNativeV2Status st;
@@ -1191,6 +1076,6 @@ int main(void)
         }
     }
 
-    puts("native-v2 phase3q leaf + phase3p REP/string + CALL/RET graph tests: PASS");
+    puts("native-v2 phase3p REP/string + CALL/RET graph tests: PASS");
     return 0;
 }

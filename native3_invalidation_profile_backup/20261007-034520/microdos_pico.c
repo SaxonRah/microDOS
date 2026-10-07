@@ -783,24 +783,6 @@ static void md_stats(uint64_t start_us)
                (unsigned long long)(n3 ? n3->shadow_misses : 0u),
                (unsigned long long)(n3 ? n3->smc_rejects : 0u));
 
-        md_say("[native3-inv] cold=%llu collision=%llu "
-               "p0=%llu p1=%llu both=%llu epoch-reset=%llu "
-               "code-epoch=%lu write-epoch=%lu\n",
-               (unsigned long long)(n3 ? n3->cold_misses : 0u),
-               (unsigned long long)(n3 ? n3->site_collisions : 0u),
-               (unsigned long long)(n3 ? n3->invalid_page0_only : 0u),
-               (unsigned long long)(n3 ? n3->invalid_page1_only : 0u),
-               (unsigned long long)(n3 ? n3->invalid_both_pages : 0u),
-               (unsigned long long)(n3 ? n3->epoch_resets : 0u),
-               (unsigned long)g_sys.runtime.code_epoch,
-               (unsigned long)g_sys.runtime.code_write_epoch);
-
-#if MD_JIT_BYTE_EXACT_TRACKING && MICRODOS_TRANSLATION_SUPPORT
-        md_say("[native3-jit-smc] exact-pages=%u fallback-pages=%u\n",
-               (unsigned)g_sys.native3.jit.live_used,
-               (unsigned)g_sys.native3.jit.live_fallback_pages);
-#endif
-
         md_say("[native3-nv2] retired=%llu entries=%llu lookups=%llu "
                "hit/miss=%llu/%llu probes=%llu compiles=%llu "
                "compile-reject=%llu stack-guard=%llu budget=%llu short=%llu\n",

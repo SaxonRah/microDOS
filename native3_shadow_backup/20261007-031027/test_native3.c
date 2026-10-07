@@ -81,70 +81,6 @@ static int exact_run(void)
     return 1;
 }
 
-static int shadow_budget_run(void)
-{
-    static const uint8_t p[] = {
-        0xB9,0x01,0x00,             /* mov cx,1 */
-        0xBB,0x00,0x00,             /* mov bx,0 */
-        0xE8,0x04,0x00,             /* call 010d */
-        0x49,                       /* dec cx */
-        0x75,0xFA,                  /* jnz 0106 */
-        0xF4,                       /* hlt */
-        0x83,0xC3,0x03,             /* add bx,3 */
-        0xC3                        /* ret */
-    };
-    MdHooks h;
-    MdN3RunResult rr;
-    const MdN3Stats *st;
-    unsigned guard = 0u;
-
-    puts("native3 shadow BEGIN");
-
-    memset(&h, 0, sizeof(h));
-    memset(g_mem_a, 0, sizeof(g_mem_a));
-    memset(&g_rt_a, 0, sizeof(g_rt_a));
-    memset(&g_n3_a, 0, sizeof(g_n3_a));
-
-    memcpy(g_mem_a + 0x100, p, sizeof(p));
-
-    md_runtime_init(&g_rt_a, g_mem_a, &h);
-    g_rt_a.cpu.cs = 0u;
-    g_rt_a.cpu.ip = 0x100u;
-    g_rt_a.cpu.ss = 0u;
-    g_rt_a.cpu.r[MD_X86_SP] = 0xFFFEu;
-
-    md_native3_init(&g_n3_a, g_code_a, sizeof(g_code_a));
-
-    while (g_rt_a.stop_reason == MD_STOP_NONE && guard++ < 32u) {
-        if (!md_native3_run(&g_n3_a, &g_rt_a, 1u, &rr))
-            break;
-    }
-
-    st = md_native3_stats(&g_n3_a);
-
-    if (g_rt_a.stop_reason != MD_STOP_HALT ||
-        g_rt_a.cpu.r[MD_X86_BX] != 3u ||
-        g_rt_a.cpu.r[MD_X86_SP] != 0xFFFEu ||
-        st == NULL ||
-        st->shadow_pushes != 1u ||
-        st->shadow_hits != 1u ||
-        st->shadow_misses != 0u) {
-        printf(
-            "native3 shadow FAIL stop=%u BX=%04x SP=%04x "
-            "push=%llu hit=%llu miss=%llu\n",
-            (unsigned)g_rt_a.stop_reason,
-            g_rt_a.cpu.r[MD_X86_BX],
-            g_rt_a.cpu.r[MD_X86_SP],
-            (unsigned long long)(st ? st->shadow_pushes : 0u),
-            (unsigned long long)(st ? st->shadow_hits : 0u),
-            (unsigned long long)(st ? st->shadow_misses : 0u));
-        return 0;
-    }
-
-    puts("native3 shadow PASS");
-    return 1;
-}
-
 static int cache_roundtrip(void)
 {
     MdHooks h;
@@ -202,7 +138,6 @@ int main(void)
     puts("=== Native-3 host semantic gate ===");
 
     ok &= exact_run();
-    ok &= shadow_budget_run();
     ok &= cache_roundtrip();
 
     printf("native3 tests %s\n", ok ? "PASS" : "FAIL");

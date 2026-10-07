@@ -75,21 +75,6 @@ typedef struct MdN3Stats {
     uint64_t prewarm_requests, prewarm_success;
     uint64_t cache_imported, cache_exported;
     uint64_t smc_rejects, budget_rejects;
-
-    /*
-     * Native-3 site-cache diagnostics.
-     *
-     * cold_misses, site_collisions and invalidations are mutually exclusive
-     * reasons for an n3_site() miss.  The invalid_* counters further split
-     * freshness failures by which tracked 4 KiB guest code page changed.
-     *
-     * epoch_resets counts whole-engine code_epoch changes after initial
-     * attachment; normal self-modifying writes should normally appear in
-     * page-generation invalidation counters instead.
-     */
-    uint64_t cold_misses, site_collisions;
-    uint64_t invalid_page0_only, invalid_page1_only, invalid_both_pages;
-    uint64_t epoch_resets;
 } MdN3Stats;
 
 typedef struct MdN3CacheHeader {

@@ -575,32 +575,6 @@ target_compile_definitions(microdos_pico_native3 PRIVATE
     "MICRODOS_NATIVE3_CODE_BYTES=(128u*1024u)")
 pico_set_program_name(microdos_pico_native3 "microDOS Native-3 DOS")
 
-# Native-3 DOS profiling image. Same engine/policy as the production Native-3
-# DOS target, but enables Native-3/JIT counters so Ctrl+] can prove ownership,
-# backend split, CALL/RET shadow locality and Native-v2 graph use on real DOS.
-md_pico_dos(microdos_pico_native3_profile 1 0 300000 0 0 0 0 0 0)
-target_sources(microdos_pico_native3_profile PRIVATE
-    "${MD_ROOT}/src/runtime/native3.c"
-    "${MD_ROOT}/src/runtime/native_v2.c"
-    "${MD_ROOT}/src/runtime/native_v2_runtime.c"
-    "${MD_ROOT}/src/runtime/jit_core.c"
-    "${MD_ROOT}/src/decode/x86_decode.c")
-target_compile_definitions(microdos_pico_native3_profile PRIVATE
-    MICRODOS_ENABLE_NATIVE3=1
-    MD_N3_PROFILE=1
-    MD_JIT_PROFILE=1
-    MD_JIT_LEGACY_HOTNESS=0
-    MD_JIT_BLOCK_SLOTS=256
-    MD_N3_SITE_SLOTS=256
-    MD_NATIVE_V2_RT_SLOTS=32
-    MD_JIT_BYTE_EXACT_TRACKING=1
-    MD_JIT_LIVE_PAGES=16
-    MD_X86_TRACK_WRITES=1
-    "MICRODOS_NATIVE3_CODE_BYTES=(128u*1024u)")
-pico_set_program_name(
-    microdos_pico_native3_profile
-    "microDOS Native-3 DOS profile")
-
 add_executable(microdos_pico_native3_bench
     "${CMAKE_CURRENT_LIST_DIR}/microdos_native3_bench.c"
     "${MD_ROOT}/src/runtime/native3.c"

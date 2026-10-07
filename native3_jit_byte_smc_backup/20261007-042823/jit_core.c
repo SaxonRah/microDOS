@@ -1060,94 +1060,6 @@ static uint32_t md_jit_shared_checksum(MdRuntime *rt, MdJitBlock *block, uint32_
 #define MD_JIT_EMIT_ARCH md_jit_emit_thumb
 #endif
 
-#if MD_JIT_BYTE_EXACT_TRACKING && MICRODOS_TRANSLATION_SUPPORT
-
-/*
- * Bind this JIT as the byte-exact translated-code bitmap owner when no other
- * translator already owns cpu.tr_live_bits. Native-3 does not instantiate the
- * M25 translator, so its normal profile path takes this branch.
- */
-static int md_jit_bind_live(MdJit *jit, MdRuntime *runtime)
-{
-    if (runtime->cpu.tr_live_bits == NULL)
-        runtime->cpu.tr_live_bits = jit->live_table;
-
-    return runtime->cpu.tr_live_bits == jit->live_table;
-}
-
-/*
- * Mark only the guest bytes actually decoded into this JIT block.
- *
- * A page already carrying MD_X86_PAGE_TRANSLATED remains page-granular:
- * another cache/explicit code-range marker may depend on that semantics.
- * Likewise, if the bitmap pool is exhausted, fall back to the historical
- * page-granular mark. Both cases remain fully conservative.
- */
-static void md_jit_mark_code_range(MdJit *jit,
-                                   MdRuntime *runtime,
-                                   uint16_t cs,
-                                   uint16_t ip,
-                                   size_t len)
-{
-    size_t i;
-
-    if (!md_jit_bind_live(jit, runtime)) {
-        md_runtime_mark_code_range(runtime, cs, ip, len);
-        return;
-    }
-
-    for (i = 0u; i < len; ++i) {
-        const uint32_t a =
-            md_x86_linear(cs, (uint16_t)(ip + i)) & MD_X86_ADDRESS_MASK;
-        const unsigned page = md_x86_code_page(a);
-        uint8_t *bm = jit->live_table[page];
-
-        if (bm == NULL) {
-            /*
-             * Never try to convert a page that is already conservatively
-             * tracked by another subsystem. We do not know that subsystem's
-             * exact live-byte set.
-             */
-            if ((runtime->code_page_executable[page] &
-                 MD_X86_PAGE_TRANSLATED) != 0u) {
-                continue;
-            }
-
-            if (jit->live_used >= MD_JIT_LIVE_PAGES) {
-                if ((runtime->code_page_executable[page] &
-                     MD_X86_PAGE_TRANSLATED) == 0u) {
-                    runtime->code_page_executable[page] |=
-                        MD_X86_PAGE_TRANSLATED;
-                    ++jit->live_fallback_pages;
-                }
-                continue;
-            }
-
-            bm = jit->live_pool[jit->live_used++];
-            memset(bm, 0, sizeof(jit->live_pool[0]));
-            jit->live_table[page] = bm;
-            runtime->code_page_executable[page] |= MD_X86_PAGE_TRBYTES;
-        }
-
-        bm[(a & MD_X86_CODE_PAGE_MASK) >> 3] |=
-            (uint8_t)(1u << (a & 7u));
-    }
-}
-
-#else
-
-static void md_jit_mark_code_range(MdJit *jit,
-                                   MdRuntime *runtime,
-                                   uint16_t cs,
-                                   uint16_t ip,
-                                   size_t len)
-{
-    (void)jit;
-    md_runtime_mark_code_range(runtime, cs, ip, len);
-}
-
-#endif
-
 static int md_jit_block_current(const MdJitBlock *block, const MdRuntime *runtime)
 {
     if (!block->valid || block->code_epoch != runtime->code_epoch) return 0;
@@ -1226,7 +1138,7 @@ static MdJitBlock *md_jit_compile(MdJit *jit, MdRuntime *runtime, int allow_live
     const uint16_t cs = runtime->cpu.cs, start_ip = runtime->cpu.ip;
     MdJitBlock *block = &jit->blocks[md_jit_hash(cs, start_ip)];
     if (!md_jit_decode_block(jit, runtime, cs, start_ip, block, NULL)) return NULL;
-    md_jit_mark_code_range(jit, runtime, cs, start_ip, block->source_bytes);
+    md_runtime_mark_code_range(runtime, cs, start_ip, block->source_bytes);
     block->code_epoch = runtime->code_epoch;
     block->page_gen0 = runtime->code_page_generation[block->page0];
     block->page_gen1 = runtime->code_page_generation[block->page1];
@@ -1234,7 +1146,6 @@ static MdJitBlock *md_jit_compile(MdJit *jit, MdRuntime *runtime, int allow_live
         md_jit_flush_code(jit);
         block = &jit->blocks[md_jit_hash(cs, start_ip)];
         if (!md_jit_decode_block(jit, runtime, cs, start_ip, block, NULL)) return NULL;
-        md_jit_mark_code_range(jit, runtime, cs, start_ip, block->source_bytes);
         block->code_epoch = runtime->code_epoch;
         block->page_gen0 = runtime->code_page_generation[block->page0];
         block->page_gen1 = runtime->code_page_generation[block->page1];
