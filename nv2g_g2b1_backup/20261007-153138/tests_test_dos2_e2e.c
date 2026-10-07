@@ -96,22 +96,16 @@ typedef struct E2e {
     bool quiet;
 } E2e;
 
-/* Tools that #include this harness (nv2g_census) may supply their own script. */
-#ifndef E2E_SCRIPT
-#define E2E_SCRIPT kScript
-#define E2E_SCRIPT_COUNT (sizeof(kScript) / sizeof(kScript[0]))
-#endif
-
 static void e2e_release(E2e *e)
 {
     if ((e->keys == NULL || *e->keys == '\0') &&
-        e->step < E2E_SCRIPT_COUNT) {
+        e->step < sizeof(kScript) / sizeof(kScript[0])) {
         const char *hit;
         e->out[e->out_len] = '\0';
-        hit = strstr(e->out + e->search_from, E2E_SCRIPT[e->step].after);
+        hit = strstr(e->out + e->search_from, kScript[e->step].after);
         if (hit != NULL) {
-            e->search_from = (size_t)(hit - e->out) + strlen(E2E_SCRIPT[e->step].after);
-            e->keys = E2E_SCRIPT[e->step].keys;
+            e->search_from = (size_t)(hit - e->out) + strlen(kScript[e->step].after);
+            e->keys = kScript[e->step].keys;
             ++e->step;
         }
     }

@@ -171,37 +171,9 @@ int main(void)
     };
 
     /*
-     * JCXZ side exit ahead of the producer in a loop that writes CX: G-2B0
-     * rejected it (iteration >= 2 needs carried FLAGS); G-2B1 handles it.
+     * G-1 exactness hole: JCXZ side exit ahead of the producer in a loop that
+     * writes CX could fire on iteration >= 2 with the entry FLAGS. Reject.
      */
-    static const uint8_t masm_fill[] = {
-        0x8B,0x3E,0x7E,0x03, 0xC6,0x85,0xD0,0x17,0x20, 0xA1,0x7E,0x03, 0x40,
-        0xA3,0x7E,0x03, 0x3D,0x20,0x00, 0x75,0xEB
-    };
-    static const uint8_t masm_swap[] = {
-        0x8B,0x7E,0xFC, 0x8B,0x95,0x89,0x01, 0x88,0x56,0xFA, 0x8B,0x95,0xD0,0x17,
-        0x88,0x95,0x89,0x01, 0x8B,0x56,0xFA, 0x88,0x95,0xD0,0x17, 0x8B,0x56,0xFC,
-        0x42, 0x89,0x56,0xFC, 0x83,0xFA,0x20, 0x75,0xDB
-    };
-    static const uint8_t masm_gather[] = {
-        0x8B,0x7E,0xF8, 0x8B,0x7D,0x04, 0x03,0x3E,0x7E,0x03, 0x8B,0x15,
-        0x8B,0x3E,0x7E,0x03, 0x88,0x95,0x05,0x03, 0xA1,0x7E,0x03, 0x40,
-        0xA3,0x7E,0x03, 0x48, 0x3B,0x46,0xF6, 0x75,0xDF
-    };
-    static const uint8_t scan_mem[] = {
-        0x3B,0x04, 0x74,0x06, 0x83,0xC6,0x04, 0xE0,0xF7
-    };
-    static const uint8_t carried_inc_latch[] = {
-        0x8B,0xFE, 0xAA, 0x40, 0x75,0xFA     /* mov di,si/stosb/inc ax/jnz */
-    };
-    static const uint8_t producer_merge[] = {
-        0x3B,0xC2,             /* cmp ax,dx */
-        0x73,0x01,             /* jae +1    */
-        0x41,                  /* inc cx    */
-        0x88,0x4E,0xF6,        /* mov [bp-0Ah],cl */
-        0x83,0xFE,0x10,        /* cmp si,10h */
-        0x75,0xF3              /* jne 0100   */
-    };
     static const uint8_t jcxz_head_cx[] = {
         0xE3,0x08, 0x83,0xE9,0x01, 0x3D,0x34,0x12, 0x75,0xF6
     };
@@ -212,34 +184,20 @@ int main(void)
     ok &= expect_ok("word-load", word_load, sizeof(word_load), 0x0100u, 1u);
     ok &= expect_reject("parity", parity, sizeof(parity), 0x0100u);
     ok &= expect_ok_mem("early-word", early_word, sizeof(early_word), 0u);
-    /* G-2B1: unhoistable pre-producer guards exit with carried FLAGS. */
-    ok &= expect_ok_mem("early-word-moved", early_word_moved,
-                        sizeof(early_word_moved), 0u);
+    ok &= expect_reject("early-word-moved", early_word_moved,
+                        sizeof(early_word_moved), 0x0100u);
     ok &= expect_ok_mem("strcpy", strcpy_loop, sizeof(strcpy_loop), 1u);
     ok &= expect_ok_mem("stosb-pre", stosb_pre, sizeof(stosb_pre), 1u);
     ok &= expect_ok_mem("store16-pre", store16_pre, sizeof(store16_pre), 1u);
     ok &= expect_ok_mem("push-pre", push_pre, sizeof(push_pre), 1u);
     ok &= expect_ok_mem("pop-pre", pop_pre, sizeof(pop_pre), 0u);
-    ok &= expect_ok_mem("stos-moved", stos_moved, sizeof(stos_moved), 1u);
-    ok &= expect_ok("jcxz-head-cx", jcxz_head_cx, sizeof(jcxz_head_cx),
-                    0x0100u, 0u);
-
-    /* G-2B1 real MASM / FIND loops (census top ranks) must compile. */
-    ok &= expect_ok_mem("masm-fill", masm_fill, sizeof(masm_fill), 1u);
-    ok &= expect_ok_mem("masm-swap", masm_swap, sizeof(masm_swap), 1u);
-    ok &= expect_ok_mem("masm-gather", masm_gather, sizeof(masm_gather), 1u);
-    ok &= expect_ok_mem("scan-mem", scan_mem, sizeof(scan_mem), 0u);
-
-    /* Carried FLAGS need an NLM-capable latch producer: INC cannot be. */
-    ok &= expect_reject("carried-inc-latch", carried_inc_latch,
-                        sizeof(carried_inc_latch), 0x0100u);
-    /* Different producers merging at a join (21A5:00E3 shape): G-3. */
-    ok &= expect_reject("producer-merge", producer_merge,
-                        sizeof(producer_merge), 0x0100u);
+    ok &= expect_reject("stos-moved", stos_moved, sizeof(stos_moved), 0x0100u);
+    ok &= expect_reject("jcxz-head-cx", jcxz_head_cx,
+                        sizeof(jcxz_head_cx), 0x0100u);
 
     if (!ok)
         return 1;
 
-    puts("native-v2g G-1A/G-2B0/G-2B1 compiler tests PASS");
+    puts("native-v2g G-1A/G-2B0 compiler tests PASS");
     return 0;
 }

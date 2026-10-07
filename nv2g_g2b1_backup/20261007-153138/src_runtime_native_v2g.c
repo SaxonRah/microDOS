@@ -79,15 +79,7 @@ typedef enum GRecipeKind {
     GR_LOGIC8_R,
     GR_TEST8_RI,
     GR_INC16,
-    GR_DEC16,
-    /* G-2B1: branch fusion from the producer's natively materialized lazy
-       state in MdX86 (lazy_a/lazy_b/lazy_res). Never an exit recipe. */
-    GR_LAZY_ADD16,
-    GR_LAZY_SUB16,
-    GR_LAZY_LOGIC16,
-    GR_LAZY_ADD8,
-    GR_LAZY_SUB8,
-    GR_LAZY_LOGIC8
+    GR_DEC16
 } GRecipeKind;
 
 typedef struct GMem {
@@ -128,8 +120,6 @@ typedef struct GOp {
     uint8_t fall_tag;
     uint8_t arm_cond;
     uint8_t hoisted;   /* G-2B0: guard checked at the loop header instead */
-    uint8_t nlm;       /* G-2B1: write MdX86 lazy flags right after this producer */
-    uint8_t has_imm;   /* G-2B1: STORE8/16 value is `imm` (MOV r/m,imm) */
 } GOp;
 
 typedef struct GMeta {
@@ -142,7 +132,6 @@ typedef struct GMeta {
     uint8_t uses_es_word;
     uint8_t has_store;
     uint8_t requires_df_clear;
-    uint8_t untracked;   /* G-2B1 compact layout: no inline tracked-page check */
     GRecipe exits[NV2G_MAX_EXITS];
     GRecipe budget;
 } GMeta;
@@ -561,33 +550,6 @@ static int g_decode_op(const uint8_t *image, size_t image_size,
         return 1;
     }
 
-    /* G-2B1: MOV r/m8,imm8 / MOV r/m16,imm16 (C6 /0, C7 /0). */
-    if ((op == 0xc6u || op == 0xc7u) && d->has_modrm &&
-        ((d->modrm >> 3) & 7u) == 0u) {
-        const unsigned w = op & 1u;
-        size_t imm_at = 2u;
-        if ((d->modrm >> 6) == 3u) {
-            if (avail < (w ? 4u : 3u)) return 0;
-            o->dst = (uint8_t)(d->modrm & 7u);
-            if (w) {
-                o->kind = G_MOV_R16_IMM;
-                o->imm = (uint16_t)((uint16_t)q[2] | ((uint16_t)q[3] << 8));
-            } else {
-                o->kind = G_MOV_R8_IMM;
-                o->imm = q[2];
-            }
-            return 1;
-        }
-        if (!g_parse_mem(q, avail, d, &o->mem, &imm_at)) return 0;
-        if (avail < imm_at + (w ? 2u : 1u)) return 0;
-        o->kind = (uint8_t)(w ? G_STORE16 : G_STORE8);
-        o->width = (uint8_t)(w ? 16u : 8u);
-        o->has_imm = 1u;
-        o->imm = w ? (uint16_t)((uint16_t)q[imm_at] | ((uint16_t)q[imm_at + 1u] << 8))
-                   : (uint16_t)q[imm_at];
-        return 1;
-    }
-
     /* MOV accumulator <-> moffs. G-2 uses the same guarded memory path. */
     if (op >= 0xa0u && op <= 0xa3u && avail >= 3u) {
         memset(&o->mem, 0, sizeof(o->mem));
@@ -913,11 +875,6 @@ static int g_cond_for(unsigned recipe_kind, unsigned cc)
             return add[cc];
         case GR_INC16: case GR_DEC16:
             return incdec[cc];
-        case GR_LAZY_ADD16: case GR_LAZY_ADD8:
-            return add[cc];
-        case GR_LAZY_SUB16: case GR_LAZY_SUB8:
-        case GR_LAZY_LOGIC16: case GR_LAZY_LOGIC8:
-            return sub[cc];
         case GR_SUB16_RR: case GR_SUB16_RI: case GR_CMP16_RR: case GR_CMP16_RI:
         case GR_LOGIC16_R: case GR_TEST16_RI:
         case GR_SUB8_RR: case GR_SUB8_RI: case GR_CMP8_RR: case GR_CMP8_RI:
@@ -980,6 +937,30 @@ static int g_flag_dataflow(const GOp *ops, unsigned n,
             }
         }
     }
+    return 1;
+}
+
+static int g_exit_recipe_ok(const GRecipe *r)
+{
+    /*
+     * INC/DEC preserve the incoming x86 CF. G-1A can fuse their N/Z/V
+     * result directly into a branch, but an architectural exit would also
+     * need the pre-producer CF. Keep those exits conservative until the
+     * G-1 differential harness proves the dedicated carry snapshot path.
+     */
+    return r->kind != GR_INC16 && r->kind != GR_DEC16;
+}
+
+static int g_add_exit(GMeta *m, uint16_t ip, const GOp *producer,
+                      uint8_t clobber, uint8_t *tag_out)
+{
+    GRecipe *r;
+    if (m->exit_count >= NV2G_MAX_EXITS) return 0;
+    if (producer != NULL && (clobber & g_required_mask(producer)) != 0u) return 0;
+    r = &m->exits[m->exit_count];
+    if (!g_recipe_from_producer(producer, r) || !g_exit_recipe_ok(r)) return 0;
+    r->ip = ip;
+    *tag_out = m->exit_count++;
     return 1;
 }
 
@@ -1068,8 +1049,7 @@ static int emit_store_safety(TBuf *b, unsigned width,
                              GPatch *patch, unsigned *np,
                              unsigned cpexecoff,
                              unsigned code_span,
-                             uint16_t op_ip,
-                             int tracked)
+                             uint16_t op_ip)
 {
     size_t below_code_at;
     size_t no_tracker_at;
@@ -1101,12 +1081,6 @@ static int emit_store_safety(TBuf *b, unsigned width,
 
     if (!tpatch_bcc(b, below_code_at, G_CC, b->at))
         return 0;
-
-    if (!tracked) {
-        /* Compact layout: execute refuses entry when a tracker is present. */
-        tldr_w_imm(b, 12u, 13u, 0u);
-        return !b->failed;
-    }
 
     /*
      * In tracked builds, direct native stores may touch only pages whose
@@ -1185,7 +1159,7 @@ static int emit_hoisted_guard(TBuf *b, const GOp *o, uint8_t tag,
                               GPatch *patch, unsigned *np,
                               unsigned esoff, unsigned dsoff,
                               unsigned ssoff, unsigned cpexecoff,
-                              unsigned code_span, int tracked)
+                              unsigned code_span)
 {
     size_t at = 0u;
     int ng = 0;
@@ -1198,7 +1172,7 @@ static int emit_hoisted_guard(TBuf *b, const GOp *o, uint8_t tag,
             if (ng && !g_add_guard_patch(patch, np, at, G_EQ, tag, o->ip))
                 return 0;
             return emit_store_safety(b, w, tag, patch, np, cpexecoff,
-                                     code_span, o->ip, tracked);
+                                     code_span, o->ip);
         }
 
         case G_LOAD16:
@@ -1217,7 +1191,7 @@ static int emit_hoisted_guard(TBuf *b, const GOp *o, uint8_t tag,
             if (ng && !g_add_guard_patch(patch, np, at, G_EQ, tag, o->ip))
                 return 0;
             return emit_store_safety(b, w, tag, patch, np, cpexecoff,
-                                     code_span, o->ip, tracked);
+                                     code_span, o->ip);
         }
 
         case G_PUSH16:
@@ -1233,7 +1207,7 @@ static int emit_hoisted_guard(TBuf *b, const GOp *o, uint8_t tag,
             tadd_reg(b, 12u, 12u, 14u);
             twrap20(b, 12u);
             return emit_store_safety(b, 16u, tag, patch, np, cpexecoff,
-                                     code_span, o->ip, tracked);
+                                     code_span, o->ip);
 
         case G_POP16:
             emit_reg_linear(b, MD_X86_SP, ssoff, 0, 16u, &at, &ng, 1);
@@ -1382,27 +1356,6 @@ static void emit_recipe_flags(TBuf *b, const GRecipe *r)
             tcmp_imm(b, 12u, 0u);
             return;
 
-        case GR_LAZY_ADD16: case GR_LAZY_SUB16:
-        case GR_LAZY_ADD8:  case GR_LAZY_SUB8: {
-            const unsigned sh = (r->kind == GR_LAZY_ADD16 ||
-                                 r->kind == GR_LAZY_SUB16) ? 16u : 24u;
-            tldrh_w_imm(b, 12u, 8u, (unsigned)offsetof(MdX86, lazy_a));
-            tldrh_w_imm(b, 14u, 8u, (unsigned)offsetof(MdX86, lazy_b));
-            tshift(b, 0u, 12u, 12u, sh);
-            tshift(b, 0u, 14u, 14u, sh);
-            if (r->kind == GR_LAZY_ADD16 || r->kind == GR_LAZY_ADD8)
-                tadds_reg(b, 12u, 12u, 14u);
-            else
-                tcmp_reg_shift(b, 12u, 14u, 0u);
-            return;
-        }
-
-        case GR_LAZY_LOGIC16: case GR_LAZY_LOGIC8:
-            tldrh_w_imm(b, 12u, 8u, (unsigned)offsetof(MdX86, lazy_res));
-            tshift(b, 0u, 12u, 12u, r->kind == GR_LAZY_LOGIC16 ? 16u : 24u);
-            tcmp_imm(b, 12u, 0u);
-            return;
-
         default:
             b->failed = 1;
             return;
@@ -1478,150 +1431,11 @@ static int emit_simple_alu(TBuf *b, const GOp *o)
     return 0;
 }
 
-/* -------------------------------------------------------------------------
- * G-2B1 native lazy materialization (NLM).
- *
- * An NLM producer writes the canonical MdX86 lazy state (exactly what the
- * interpreter's md_x86_lazy() would hold) right after it executes. Every
- * consumer of that producer can then use the state in `cpu`:
- *   - exits keep FLAGS as they are (GR_PRESERVE);
- *   - fused branches compare lazy_a/lazy_b (or lazy_res) read back from cpu.
- * Used when a register recipe is impossible (memory operand), when the
- * producer's operands are overwritten before a consumer, and for the latch
- * producer when an exit can occur before the next iteration's first
- * producer (the "carried FLAGS" case). Nothing is emitted otherwise.
- * ------------------------------------------------------------------------- */
-
-static int g_nlm_lazy_op(const GOp *o)
-{
-    const int w16 = o->width == 16u;
-    unsigned alu;
-    switch ((GKind)o->kind) {
-        case G_TEST16_RI: return MD_LAZY_LOGIC16;
-        case G_TEST8_RI:  return MD_LAZY_LOGIC8;
-        case G_ALU16_RR: case G_ALU16_RI: case G_ALU16_RM:
-        case G_ALU8_RR:  case G_ALU8_RI:  case G_ALU8_RM:
-            alu = o->alu;
-            /* ADD r,r with the same register loses the left operand. */
-            if (alu == 0u && (o->kind == G_ALU16_RR || o->kind == G_ALU8_RR) &&
-                o->dst == o->src)
-                return -1;
-            if (alu == 0u) return w16 ? MD_LAZY_ADD16 : MD_LAZY_ADD8;
-            if (alu == 5u || alu == 7u) return w16 ? MD_LAZY_SUB16 : MD_LAZY_SUB8;
-            if (alu == 1u || alu == 4u || alu == 6u)
-                return w16 ? MD_LAZY_LOGIC16 : MD_LAZY_LOGIC8;
-            return -1;
-        default:
-            return -1;
-    }
-}
-
-static unsigned g_nlm_branch_kind(const GOp *o)
-{
-    switch (g_nlm_lazy_op(o)) {
-        case MD_LAZY_ADD16: return GR_LAZY_ADD16;
-        case MD_LAZY_SUB16: return GR_LAZY_SUB16;
-        case MD_LAZY_LOGIC16: return GR_LAZY_LOGIC16;
-        case MD_LAZY_ADD8: return GR_LAZY_ADD8;
-        case MD_LAZY_SUB8: return GR_LAZY_SUB8;
-        case MD_LAZY_LOGIC8: return GR_LAZY_LOGIC8;
-        default: return GR_PRESERVE;
-    }
-}
-
-static void tstrb_w_imm(TBuf *b, unsigned rt, unsigned rn, unsigned imm12)
-{
-    t32(b, (uint16_t)(0xF880u | (rn & 15u)),
-        (uint16_t)(((rt & 15u) << 12) | (imm12 & 0xfffu)));
-}
-
-/*
- * Emitted immediately after the producer's own code. On entry the guest
- * destination holds the result (or, for CMP/TEST, the unchanged left
- * operand); for memory forms r14 still holds the loaded right operand.
- * Uses r12/r14 only; guest registers are never modified.
- */
-static int emit_nlm(TBuf *b, const GOp *o)
-{
-    const unsigned aoff = (unsigned)offsetof(MdX86, lazy_a);
-    const unsigned boff = (unsigned)offsetof(MdX86, lazy_b);
-    const unsigned res_off = (unsigned)offsetof(MdX86, lazy_res);
-    const unsigned opoff = (unsigned)offsetof(MdX86, lazy_op);
-    const unsigned coff = (unsigned)offsetof(MdX86, lazy_carry);
-    const int lop = g_nlm_lazy_op(o);
-    const int w16 = o->width == 16u;
-    const int is_test = o->kind == G_TEST16_RI || o->kind == G_TEST8_RI;
-    const int is_rm = o->kind == G_ALU16_RM || o->kind == G_ALU8_RM;
-    const int is_rr = o->kind == G_ALU16_RR || o->kind == G_ALU8_RR;
-    unsigned x;
-
-    if (lop < 0) return 0;
-
-    /* r14 = right operand b, zero-extended to the operand width. */
-    if (is_rr) {
-        if (w16) t16(b, tmovhi(14u, kArmReg[o->src & 7u]));
-        else emit_r8_to(b, 14u, o->src);
-    } else if (!is_rm) {
-        tmovw(b, 14u, w16 ? o->imm : (uint16_t)(o->imm & 0xffu));
-    }
-
-    /* x = destination value after the op (result, or a for CMP/TEST). */
-    if (w16) {
-        x = kArmReg[o->dst & 7u];
-    } else {
-        emit_r8_to(b, 12u, o->dst);
-        x = 12u;
-    }
-
-    if (is_test) {
-        if (x != 12u) t16(b, tmovhi(12u, x));
-        tand_reg(b, 12u, 12u, 14u);
-        tstrh_w_imm(b, 12u, 8u, res_off);
-        tmovw(b, 14u, 0u);
-        tstrh_w_imm(b, 14u, 8u, aoff);
-        tstrh_w_imm(b, 14u, 8u, boff);
-    } else if (lop == MD_LAZY_LOGIC16 || lop == MD_LAZY_LOGIC8) {
-        tstrh_w_imm(b, x, 8u, res_off);
-        tmovw(b, 14u, 0u);
-        tstrh_w_imm(b, 14u, 8u, aoff);
-        tstrh_w_imm(b, 14u, 8u, boff);
-    } else if (o->alu == 7u) {
-        /* CMP: a = x, res = a - b. */
-        tstrh_w_imm(b, x, 8u, aoff);
-        tstrh_w_imm(b, 14u, 8u, boff);
-        if (x != 12u) t16(b, tmovhi(12u, x));
-        tsub_reg(b, 12u, 12u, 14u);
-        if (w16) tuxth_any(b, 12u); else tuxtb_any(b, 12u);
-        tstrh_w_imm(b, 12u, 8u, res_off);
-    } else {
-        /* ADD/SUB: res = x, a = res -/+ b. */
-        tstrh_w_imm(b, x, 8u, res_off);
-        tstrh_w_imm(b, 14u, 8u, boff);
-        if (x != 12u) t16(b, tmovhi(12u, x));
-        if (o->alu == 0u) tsub_reg(b, 12u, 12u, 14u);
-        else tadd_reg(b, 12u, 12u, 14u);
-        if (w16) tuxth_any(b, 12u); else tuxtb_any(b, 12u);
-        tstrh_w_imm(b, 12u, 8u, aoff);
-    }
-
-    /* lazy_op = op; lazy_carry = 0 (what the C recipes leave behind). */
-    tmovw(b, 12u, (uint16_t)lop);
-    tstrb_w_imm(b, 12u, 8u, opoff);
-    tmovw(b, 12u, 0u);
-    tstrb_w_imm(b, 12u, 8u, coff);
-    return !b->failed;
-}
-
-/* An emit failure caused by a full code buffer is reported as TOO_LARGE so
-   the caller can retry with the compact exit layout. */
-#define G_EMIT_FAIL(tb) ((tb).failed ? MD_NATIVE_V2_TOO_LARGE : MD_NATIVE_V2_UNSUPPORTED)
-
 static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
-                               uint16_t end_ip, GMeta *m, MdNativeV2Code *out,
-                               int compact)
+                               uint16_t end_ip, GMeta *m, MdNativeV2Code *out)
 {
     TBuf b;
-    size_t op_at[NV2G_MAX_OPS], exit_at[NV2G_MAX_EXITS], budget_at = 0u;
+    size_t op_at[NV2G_MAX_OPS], exit_at[NV2G_MAX_EXITS], budget_at;
     unsigned hoisted = 0u;
     GPatch patch[64];
     unsigned np = 0u, i;
@@ -1632,7 +1446,6 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
     const unsigned moff = (unsigned)offsetof(MdX86, memory);
     const unsigned cpexecoff = (unsigned)offsetof(MdX86, code_page_executable);
     const unsigned code_span = (unsigned)(uint16_t)(end_ip - entry_ip);
-    const int tracked = !compact;
     size_t loop_top;
 
     memset(out, 0, sizeof(*out));
@@ -1691,8 +1504,8 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
             if (ops[i].hoisted &&
                 !emit_hoisted_guard(&b, &ops[i], NV2G_TAG_BUDGET,
                                     patch, &np, esoff, dsoff, ssoff,
-                                    cpexecoff, code_span, tracked))
-                return G_EMIT_FAIL(b);
+                                    cpexecoff, code_span))
+                return MD_NATIVE_V2_UNSUPPORTED;
         }
         if (b.failed)
             return MD_NATIVE_V2_TOO_LARGE;
@@ -1733,20 +1546,15 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                     if (o->guard_tag == 0xffu ||
                         !g_add_guard_patch(patch, &np, guard_at, G_EQ,
                                            o->guard_tag, o->ip))
-                        return G_EMIT_FAIL(b);
+                        return MD_NATIVE_V2_UNSUPPORTED;
                 }
                 if (!o->hoisted &&
                     !emit_store_safety(&b, w, o->guard_tag,
                                        patch, &np, cpexecoff,
-                                       code_span, o->ip, tracked))
-                    return G_EMIT_FAIL(b);
+                                       code_span, o->ip))
+                    return MD_NATIVE_V2_UNSUPPORTED;
 
-                if (o->has_imm) {
-                    tmovw(&b, 14u, w == 16u ? o->imm
-                                            : (uint16_t)(o->imm & 0xffu));
-                    if (w == 16u) tstrh_w_reg(&b, 14u, 9u, 12u);
-                    else tstrb_w_reg(&b, 14u, 9u, 12u);
-                } else if (w == 16u) {
+                if (w == 16u) {
                     tstrh_w_reg(&b, kArmReg[o->src & 7u], 9u, 12u);
                 } else {
                     emit_r8_to(&b, 14u, o->src);
@@ -1767,7 +1575,7 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                     if (o->guard_tag == 0xffu ||
                         !g_add_guard_patch(patch, &np, guard_at, G_EQ,
                                            o->guard_tag, o->ip))
-                        return G_EMIT_FAIL(b);
+                        return MD_NATIVE_V2_UNSUPPORTED;
                 }
 
                 if (w == 16u) {
@@ -1797,13 +1605,13 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                     if (o->guard_tag == 0xffu ||
                         !g_add_guard_patch(patch, &np, guard_at, G_EQ,
                                            o->guard_tag, o->ip))
-                        return G_EMIT_FAIL(b);
+                        return MD_NATIVE_V2_UNSUPPORTED;
                 }
                 if (!o->hoisted &&
                     !emit_store_safety(&b, w, o->guard_tag,
                                        patch, &np, cpexecoff,
-                                       code_span, o->ip, tracked))
-                    return G_EMIT_FAIL(b);
+                                       code_span, o->ip))
+                    return MD_NATIVE_V2_UNSUPPORTED;
 
                 if (w == 16u) {
                     tstrh_w_reg(&b, kArmReg[MD_X86_AX], 9u, 12u);
@@ -1832,7 +1640,7 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                     wrap_at = tbcc(&b, G_EQ);
                     if (!g_add_guard_patch(patch, &np, wrap_at, G_EQ,
                                            o->guard_tag, o->ip))
-                        return G_EMIT_FAIL(b);
+                        return MD_NATIVE_V2_UNSUPPORTED;
                 }
 
                 tldrh_w_imm(&b, 14u, 8u, ssoff);
@@ -1843,8 +1651,8 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                 if (!o->hoisted &&
                     !emit_store_safety(&b, 16u, o->guard_tag,
                                        patch, &np, cpexecoff,
-                                       code_span, o->ip, tracked))
-                    return G_EMIT_FAIL(b);
+                                       code_span, o->ip))
+                    return MD_NATIVE_V2_UNSUPPORTED;
 
                 if ((o->src & 7u) == MD_X86_SP) {
                     t16(&b, tmovhi(14u, kArmReg[MD_X86_SP]));
@@ -1870,7 +1678,7 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                     (!needs_guard || o->guard_tag == 0xffu ||
                      !g_add_guard_patch(patch, &np, guard_at, G_EQ,
                                         o->guard_tag, o->ip)))
-                    return G_EMIT_FAIL(b);
+                    return MD_NATIVE_V2_UNSUPPORTED;
 
                 tldrh_w_reg(&b, 14u, 9u, 12u);
                 if ((o->dst & 7u) == MD_X86_SP) {
@@ -1897,7 +1705,7 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                         !o->hoisted);
                 if (needs_guard) {
                     if (o->guard_tag == 0xffu || np >= 64u)
-                        return G_EMIT_FAIL(b);
+                        return MD_NATIVE_V2_UNSUPPORTED;
                     patch[np].at = guard_at;
                     patch[np].cond = G_EQ;
                     patch[np].is_exit = 1u;
@@ -1924,7 +1732,7 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                         case 5u: tsub_reg(&b, d, d, 14u); break;
                         case 6u: teor_reg(&b, d, d, 14u); break;
                         case 7u: break; /* CMP: value unchanged */
-                        default: return G_EMIT_FAIL(b);
+                        default: return MD_NATIVE_V2_UNSUPPORTED;
                     }
                     if (o->alu != 7u)
                         tuxth_any(&b, d);
@@ -1937,7 +1745,7 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                         case 5u: tsub_reg(&b, 12u, 12u, 14u); break;
                         case 6u: teor_reg(&b, 12u, 12u, 14u); break;
                         case 7u: break;
-                        default: return G_EMIT_FAIL(b);
+                        default: return MD_NATIVE_V2_UNSUPPORTED;
                     }
                     if (o->alu != 7u)
                         emit_r8_from(&b, o->dst, 12u);
@@ -1950,7 +1758,7 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
             case G_ALU8_RR:
             case G_ALU8_RI:
                 if (!emit_simple_alu(&b, o))
-                    return G_EMIT_FAIL(b);
+                    return MD_NATIVE_V2_UNSUPPORTED;
                 break;
 
             case G_TEST16_RI:
@@ -1986,11 +1794,8 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                 break;
 
             default:
-                return G_EMIT_FAIL(b);
+                return MD_NATIVE_V2_UNSUPPORTED;
         }
-
-        if (o->nlm && !emit_nlm(&b, o))
-            return G_EMIT_FAIL(b);
 
         /* This guest instruction has now completed. */
         emit_budget_dec(&b);
@@ -1999,7 +1804,7 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
             case G_JCC:
                 emit_recipe_flags(&b, &o->branch_recipe);
                 if (b.failed || np >= 64u)
-                    return G_EMIT_FAIL(b);
+                    return MD_NATIVE_V2_UNSUPPORTED;
                 patch[np].at = tbcc(&b, o->arm_cond);
                 patch[np].cond = o->arm_cond;
                 patch[np].is_exit = o->external;
@@ -2053,7 +1858,7 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                     ++np;
 
                     emit_recipe_flags(&b, &o->branch_recipe);
-                    if (b.failed) return G_EMIT_FAIL(b);
+                    if (b.failed) return MD_NATIVE_V2_UNSUPPORTED;
                     patch[np].at = tbcc(&b, o->cc == 1u ? G_EQ : G_NE);
                     patch[np].cond = (uint8_t)(o->cc == 1u ? G_EQ : G_NE);
                     patch[np].is_exit = o->external;
@@ -2071,7 +1876,7 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
     /* Conditional latches have a fall-through architectural exit. */
     if (ops[n - 1u].kind != G_JMP) {
         if (ops[n - 1u].fall_tag >= m->exit_count)
-            return G_EMIT_FAIL(b);
+            return MD_NATIVE_V2_UNSUPPORTED;
         if (np >= 64u)
             return MD_NATIVE_V2_TOO_LARGE;
         patch[np].at = tb(&b);
@@ -2082,40 +1887,12 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
         ++np;
     }
 
-    if (!compact) {
-        for (i = 0u; i < m->exit_count; ++i) {
-            exit_at[i] = b.at;
-            emit_return_tag(&b, roff, i);
-        }
-        budget_at = b.at;
-        emit_return_tag(&b, roff, NV2G_TAG_BUDGET);
-    } else {
-        /*
-         * G-2B1 compact layout, used only when the normal layout overflows
-         * the code buffer: each stub loads its tag into r12 and branches to
-         * one shared epilogue (same register write-back and return value).
-         */
-        size_t to_common[NV2G_MAX_EXITS + 1u];
-        size_t common_at;
-        for (i = 0u; i <= m->exit_count; ++i) {
-            const unsigned tag = i < m->exit_count ? i : NV2G_TAG_BUDGET;
-            if (i < m->exit_count) exit_at[i] = b.at; else budget_at = b.at;
-            tmovw(&b, 12u, (uint16_t)tag);
-            to_common[i] = tb(&b);
-        }
-        common_at = b.at;
-        emit_store_regs(&b, roff);
-        t16(&b, tmovhi(0u, 11u));
-        tshift(&b, 0u, 12u, 12u, 24u);
-        torr_reg(&b, 0u, 0u, 12u);
-        t16(&b, 0xB001u); /* add sp,#4 */
-        t16(&b, 0xBD08u); /* pop {r3,pc} */
-        if (b.failed)
-            return MD_NATIVE_V2_TOO_LARGE;
-        for (i = 0u; i <= m->exit_count; ++i)
-            if (!tpatch_b(&b, to_common[i], common_at))
-                return MD_NATIVE_V2_BRANCH_RANGE;
+    for (i = 0u; i < m->exit_count; ++i) {
+        exit_at[i] = b.at;
+        emit_return_tag(&b, roff, i);
     }
+    budget_at = b.at;
+    emit_return_tag(&b, roff, NV2G_TAG_BUDGET);
 
     if (b.failed)
         return MD_NATIVE_V2_TOO_LARGE;
@@ -2147,7 +1924,6 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
         }
     }
 
-    m->untracked = (uint8_t)(compact && m->has_store);
     out->_align_word = 0x4E563247u; /* NV2G */
     out->size = (uint16_t)b.at;
     out->op_count = (uint16_t)n;
@@ -2172,94 +1948,6 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
  * Segment overrides and SCAS/CMPS remain for G-2B; CALL/RET/INT stay outside
  * the general-loop path.
  * ------------------------------------------------------------------------- */
-
-/*
- * G-2B1: exact FLAGS for an exit (or the budget exit) reached with producer
- * index `pi` (-1: none yet in this iteration) and clobber mask `clob`.
- * May mark producers NLM; NLM marks never invalidate earlier decisions.
- */
-static int g_carried_ok(GOp *ops, unsigned n, const int16_t *in_prod)
-{
-    /* FLAGS at the root on iteration >= 2 are the latch producer's. */
-    const int pl = in_prod[n - 1u];
-    if (pl < 0)
-        return 1;                 /* no producer reaches the latch: entry FLAGS */
-    if (ops[pl].nlm)
-        return 1;
-    if (g_nlm_lazy_op(&ops[pl]) < 0)
-        return 0;
-    ops[pl].nlm = 1u;
-    return 1;
-}
-
-static int g_exit_flags(GOp *ops, unsigned n, const int16_t *in_prod,
-                        int any_producer, int pi, uint8_t clob, GRecipe *r)
-{
-    GOp *p;
-
-    memset(r, 0, sizeof(*r));
-    r->kind = GR_PRESERVE;
-
-    if (pi < 0) {
-        /* Iteration 1: entry FLAGS (cpu untouched). Later iterations: the
-           latch producer's state, which must therefore be in cpu. */
-        return !any_producer || g_carried_ok(ops, n, in_prod);
-    }
-
-    p = &ops[(unsigned)pi];
-    if (p->nlm)
-        return 1;
-
-    if ((clob & g_required_mask(p)) == 0u && g_recipe_from_producer(p, r)) {
-        if (r->kind != GR_INC16 && r->kind != GR_DEC16)
-            return 1;
-        /* INC/DEC keep the incoming CF: the C recipe reads it from cpu, so
-           whatever produced that CF must be in cpu at the exit. */
-        {
-            int q = in_prod[(unsigned)pi];
-            unsigned hops = 0u;
-            /* INC/DEC preserve CF: walk back to the producer that wrote it. */
-            while (q >= 0 && (ops[q].kind == G_INC16 || ops[q].kind == G_DEC16) &&
-                   hops++ < n)
-                q = in_prod[(unsigned)q];
-            if (q < 0) {
-                unsigned k;
-                int cf_writer = 0;
-                for (k = 0u; k < n; ++k)
-                    if (g_is_producer(&ops[k]) && ops[k].kind != G_INC16 &&
-                        ops[k].kind != G_DEC16)
-                        cf_writer = 1;
-                if (!cf_writer) return 1;      /* CF invariant = entry */
-                return g_carried_ok(ops, n, in_prod);
-            }
-            if (ops[q].nlm) return 1;
-            if (g_nlm_lazy_op(&ops[q]) < 0) return 0;
-            ops[q].nlm = 1u;
-            return 1;
-        }
-    }
-
-    /* Register recipe impossible (memory operand) or clobbered: NLM. */
-    if (g_nlm_lazy_op(p) < 0)
-        return 0;
-    p->nlm = 1u;
-    memset(r, 0, sizeof(*r));
-    r->kind = GR_PRESERVE;
-    return 1;
-}
-
-static int g_add_exit_g2b1(GMeta *m, GOp *ops, unsigned n,
-                           const int16_t *in_prod, int any_producer,
-                           uint16_t ip, int pi, uint8_t clob, uint8_t *tag_out)
-{
-    GRecipe r;
-    if (m->exit_count >= NV2G_MAX_EXITS) return 0;
-    if (!g_exit_flags(ops, n, in_prod, any_producer, pi, clob, &r)) return 0;
-    r.ip = ip;
-    m->exits[m->exit_count] = r;
-    *tag_out = m->exit_count++;
-    return 1;
-}
 
 const MdNativeV2GStats *md_native_v2g_stats(void)
 {
@@ -2416,7 +2104,11 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
                 ++g_nv2g_stats.reject_cfg;
                 return MD_NATIVE_V2_UNSUPPORTED;
             }
-            /* G-2B1: an external JMP is an unconditional side exit. */
+            /* G-1 models conditional side exits; external JMP is not a loop. */
+            if (ops[i].kind == G_JMP && ops[i].external) {
+                ++g_nv2g_stats.reject_cfg;
+                return MD_NATIVE_V2_UNSUPPORTED;
+            }
         }
     }
 
@@ -2425,43 +2117,38 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
         return MD_NATIVE_V2_UNSUPPORTED;
     }
 
-    /* Unreachable body ops (only after an external JMP) are not modelled. */
-    for (i = 0u; i < n; ++i) {
-        if (in_prod[i] == -2) {
-            ++g_nv2g_stats.reject_cfg;
-            return MD_NATIVE_V2_UNSUPPORTED;
-        }
-    }
-
     /* Prepare fused condition recipes for every flag-consuming control op. */
     for (i = 0u; i < n; ++i) {
-        GOp *p = in_prod[i] >= 0 ? &ops[(unsigned)in_prod[i]] : NULL;
+        const GOp *p = in_prod[i] >= 0 ? &ops[(unsigned)in_prod[i]] : NULL;
 
-        if (ops[i].kind == G_JCC ||
-            (ops[i].kind == G_LOOP && ops[i].cc != 2u)) {
-            /* LOOPNZ/LOOPZ consume ZF while decrementing CX without changing it. */
-            const unsigned cc = ops[i].kind == G_JCC ? ops[i].cc
-                              : (ops[i].cc == 1u ? 4u : 5u);
+        if (ops[i].kind == G_JCC) {
             GRecipe rr;
-            int cond = -1;
-            if (p == NULL) {
+            int cond;
+            if (p == NULL || (in_clob[i] & g_required_mask(p)) != 0u ||
+                !g_recipe_from_producer(p, &rr)) {
                 ++g_nv2g_stats.reject_flags;
                 return MD_NATIVE_V2_UNSUPPORTED;
             }
-            if ((in_clob[i] & g_required_mask(p)) == 0u &&
-                g_recipe_from_producer(p, &rr))
-                cond = g_cond_for(rr.kind, cc);
-            if (cond < 0 && g_nlm_lazy_op(p) >= 0) {
-                /* G-2B1: memory operand or overwritten operand -> NLM. */
-                memset(&rr, 0, sizeof(rr));
-                rr.kind = (uint8_t)g_nlm_branch_kind(p);
-                cond = g_cond_for(rr.kind, cc);
-                if (cond >= 0)
-                    p->nlm = 1u;
-            }
+            cond = g_cond_for(rr.kind, ops[i].cc);
             if (cond < 0) {
                 ++g_nv2g_stats.reject_flags;
                 return MD_NATIVE_V2_UNSUPPORTED; /* parity and unfusable flags */
+            }
+            ops[i].branch_recipe = rr;
+            ops[i].arm_cond = (uint8_t)cond;
+        } else if (ops[i].kind == G_LOOP && ops[i].cc != 2u) {
+            /* LOOPNZ/LOOPZ consume ZF while decrementing CX without changing it. */
+            GRecipe rr;
+            int cond;
+            if (p == NULL || (in_clob[i] & g_required_mask(p)) != 0u ||
+                !g_recipe_from_producer(p, &rr)) {
+                ++g_nv2g_stats.reject_flags;
+                return MD_NATIVE_V2_UNSUPPORTED;
+            }
+            cond = g_cond_for(rr.kind, ops[i].cc == 1u ? 4u : 5u);
+            if (cond < 0) {
+                ++g_nv2g_stats.reject_flags;
+                return MD_NATIVE_V2_UNSUPPORTED;
             }
             ops[i].branch_recipe = rr;
             ops[i].arm_cond = (uint8_t)cond;
@@ -2469,30 +2156,44 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
     }
 
     /*
-     * Allocate exact exit recipes (G-2B1 policy, see g_exit_flags):
-     * register recipe when exact; otherwise the producer becomes NLM and the
-     * exit preserves cpu FLAGS. Pre-instruction guards ahead of the
-     * iteration's first producer are hoisted when possible (G-2B0), else
-     * they also exit with carried FLAGS from the latch producer's NLM state.
+     * Allocate exact exit recipes. A 16-bit wrap guard exits before the load,
+     * so its retirement/IP are exact. If that guard can occur before the first
+     * flag producer of an iteration, a later-iteration exit would need the
+     * previous iteration's flags; conservatively reject that case in G-1A.
      */
+    {
+        uint8_t loop_writes = 0u;
+        for (i = 0u; i < n; ++i)
+            loop_writes |= g_write_mask(&ops[i]);
+
+        /*
+         * G-2B0 fix (G-1 exactness hole): an external JCXZ/LOOP side exit
+         * ahead of the iteration's first flag producer was given a PRESERVE
+         * recipe. That is only the entry FLAGS on iteration 1; on later
+         * iterations FLAGS come from the previous iteration's producer.
+         * Keep the exit only when it provably cannot be taken after
+         * iteration 1: JCXZ in a loop that never writes CX.
+         */
+        for (i = 0u; i < n; ++i) {
+            if (!ops[i].external || in_prod[i] >= 0 || !any_producer)
+                continue;
+            if (ops[i].kind == G_JCXZ &&
+                (loop_writes & (1u << MD_X86_CX)) == 0u)
+                continue;
+            ++g_nv2g_stats.reject_flags;
+            return MD_NATIVE_V2_UNSUPPORTED;
+        }
+    }
+
     for (i = 0u; i < n; ++i) {
+        const GOp *p = in_prod[i] >= 0 ? &ops[(unsigned)in_prod[i]] : NULL;
         uint8_t clob = in_clob[i];
 
         if (ops[i].external) {
             uint8_t tag;
-            int any = any_producer;
             if (ops[i].kind == G_LOOP)
                 clob |= (uint8_t)(1u << MD_X86_CX);
-            /* A JCXZ ahead of every producer in a loop that never writes CX
-               can only be taken on iteration 1: entry FLAGS, no NLM needed. */
-            if (ops[i].kind == G_JCXZ && in_prod[i] < 0) {
-                uint8_t w = 0u;
-                unsigned k;
-                for (k = 0u; k < n; ++k) w |= g_write_mask(&ops[k]);
-                if ((w & (1u << MD_X86_CX)) == 0u) any = 0;
-            }
-            if (!g_add_exit_g2b1(&m, ops, n, in_prod, any,
-                                 ops[i].target, in_prod[i], clob, &tag)) {
+            if (!g_add_exit(&m, ops[i].target, p, clob, &tag)) {
                 ++g_nv2g_stats.reject_exits;
                 return MD_NATIVE_V2_UNSUPPORTED;
             }
@@ -2506,12 +2207,23 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
             ops[i].kind == G_PUSH16 || ops[i].kind == G_POP16) {
             uint8_t tag;
 
-            if (in_prod[i] < 0 && any_producer && g_guard_hoistable(ops, i)) {
+            /*
+             * A pre-instruction guard ahead of the iteration's first flag
+             * producer would need the previous iteration's FLAGS when it
+             * fires on iteration >= 2. G-2B0 avoids that by hoisting the
+             * guard to the loop header when its address registers are not
+             * written earlier in the body: a failure there is the exact
+             * budget-exit state. Otherwise stay conservative.
+             */
+            if (p == NULL && any_producer) {
+                if (!g_guard_hoistable(ops, i)) {
+                    ++g_nv2g_stats.reject_memory;
+                    return MD_NATIVE_V2_UNSUPPORTED;
+                }
                 ops[i].hoisted = 1u;
                 ++g_nv2g_stats.hoisted_guards;
             } else {
-                if (!g_add_exit_g2b1(&m, ops, n, in_prod, any_producer,
-                                     ops[i].ip, in_prod[i], in_clob[i], &tag)) {
+                if (!g_add_exit(&m, ops[i].ip, p, in_clob[i], &tag)) {
                     ++g_nv2g_stats.reject_memory;
                     return MD_NATIVE_V2_UNSUPPORTED;
                 }
@@ -2537,6 +2249,7 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
     /* Latch fall-through is the normal region exit; JMP has no fall-through. */
     {
         const unsigned li = n - 1u;
+        const GOp *p = in_prod[li] >= 0 ? &ops[(unsigned)in_prod[li]] : NULL;
         uint8_t clob = in_clob[li];
 
         ops[li].fall_tag = 0xffu;
@@ -2545,8 +2258,7 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
 
         if (ops[li].kind != G_JMP) {
             uint8_t tag;
-            if (!g_add_exit_g2b1(&m, ops, n, in_prod, any_producer,
-                                 end_ip, in_prod[li], clob, &tag)) {
+            if (!g_add_exit(&m, end_ip, p, clob, &tag)) {
                 ++g_nv2g_stats.reject_exits;
                 return MD_NATIVE_V2_UNSUPPORTED;
             }
@@ -2554,8 +2266,12 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
         }
 
         /* Budget exit occurs at the next loop header, after a full iteration. */
-        if (!g_exit_flags(ops, n, in_prod, any_producer, in_prod[li], clob,
-                          &m.budget)) {
+        if (p != NULL && (clob & g_required_mask(p)) != 0u) {
+            ++g_nv2g_stats.reject_flags;
+            return MD_NATIVE_V2_UNSUPPORTED;
+        }
+        if (!g_recipe_from_producer(p, &m.budget) ||
+            !g_exit_recipe_ok(&m.budget)) {
             ++g_nv2g_stats.reject_flags;
             return MD_NATIVE_V2_UNSUPPORTED;
         }
@@ -2578,9 +2294,8 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
     m.magic = NV2G_MAGIC;
 
     {
-        MdNativeV2Status st = g_emit(ops, n, entry_ip, end_ip, &m, out, 0);
-        if (st == MD_NATIVE_V2_TOO_LARGE)
-            st = g_emit(ops, n, entry_ip, end_ip, &m, out, 1);
+        const MdNativeV2Status st =
+            g_emit(ops, n, entry_ip, end_ip, &m, out);
         if (st != MD_NATIVE_V2_OK) {
             ++g_nv2g_stats.reject_emit;
             memset(out, 0, sizeof(*out));
@@ -2678,9 +2393,6 @@ uint32_t MD_HOT_FUNC(md_native_v2g_execute)(MdX86 *cpu,
     m=(const GMeta *)code->g_meta;
     if(m->uses_es_word&&cpu->es>0xefffu)return MD_NATIVE_V2_EXEC_FALLBACK;
     if(m->requires_df_clear&&(cpu->flags_raw&MD_X86_FLAG_DF)!=0u)
-        return MD_NATIVE_V2_EXEC_FALLBACK;
-    /* G-2B1 compact-layout stores carry no inline tracked-page check. */
-    if(m->untracked&&cpu->code_page_executable!=NULL)
         return MD_NATIVE_V2_EXEC_FALLBACK;
     /*
      * The generated loop header's budget exit represents the state after at

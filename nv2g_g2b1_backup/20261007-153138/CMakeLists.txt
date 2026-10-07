@@ -271,23 +271,6 @@ if(MD_BUILD_TESTS)
         if(MSVC)
             target_compile_definitions(microdos_dos2_e2e PRIVATE _CRT_SECURE_NO_WARNINGS)
         endif()
-        # NV2-G hot-loop census: boots the same session single-stepped and ranks
-        # interpreter back-edge loops by dynamic weight, with every NV2-G blocker.
-        # A measurement tool, not a test (scripts/md_nv2g_census.ps1).
-        add_executable(microdos_nv2g_census tests/nv2g_census.c
-            src/system/md_dos2_system.c src/host/msdos2_boot.c
-            src/runtime/native_v2.c
-            "${MD_RECOMP_dos2test_C}" "${MD_RECOMP_dos2test_H}"
-            "${MD_RECOMP_msdos2_C}" "${MD_RECOMP_msdos2_H}")
-        target_link_libraries(microdos_nv2g_census PRIVATE microdos::runtime microdos::decode)
-        target_include_directories(microdos_nv2g_census PRIVATE
-            "${CMAKE_CURRENT_LIST_DIR}/include"
-            "${CMAKE_CURRENT_LIST_DIR}/tests"
-            "${CMAKE_CURRENT_LIST_DIR}/src/host" "${CMAKE_CURRENT_LIST_DIR}/src/system" "${MD_GENERATED_DIR}")
-        target_compile_definitions(microdos_nv2g_census PRIVATE MICRODOS_ENABLE_NATIVE_V2G=1)
-        if(MSVC)
-            target_compile_definitions(microdos_nv2g_census PRIVATE _CRT_SECURE_NO_WARNINGS)
-        endif()
         set(MD_E2E_IMG "${CMAKE_CURRENT_BINARY_DIR}/e2e_msdos2.img")
         add_test(NAME dos2_e2e_image COMMAND mkfat12
             --command "${MD_MSDOS2_BIN}/COMMAND.COM"

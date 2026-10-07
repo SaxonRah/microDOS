@@ -40,28 +40,12 @@ extern "C" {
  * reject. JCXZ/LOOP side exits ahead of the first producer are rejected
  * unless provably first-iteration-only (JCXZ in a loop that never writes CX).
  *
- * G-2B1 (measured on MASM/SORT/FIND/CHKDSK with tests/nv2g_census.c):
- *   - native lazy materialization (NLM): a producer whose FLAGS cannot be
- *     rebuilt from registers writes the canonical MdX86 lazy state right
- *     after it executes; exits then preserve cpu FLAGS and fused branches
- *     read lazy_a/lazy_b back. Covers memory-operand producers (CMP r,[m]),
- *     overwritten producer operands, carried FLAGS for unhoistable guards
- *     and JCXZ/LOOP/JMP exits ahead of the iteration's first producer, and
- *     INC/DEC exits (CF source found through INC/DEC chains);
- *   - MOV r/m,imm (C6/C7) and external JMP side exits;
- *   - compact layout (shared exit epilogue, no inline tracked-page check)
- *     used only when the normal layout overflows the code buffer; execute
- *     refuses such code when a code-page tracker is present.
- *
  * Still deferred:
  *   - segment overrides and SCAS/CMPS single -> G-2B;
  *   - REP string forms stay with the existing special compiler;
  *   - ADC/SBB, CL shifts, CBW/CWD, XCHG -> G-3;
- *   - CALL/RET/INT/far/indirect control stays outside the general loop
- *     (the largest remaining census item: SORT's read loop);
- *   - different producers merging at a join (MASM 21A5:00E3);
- *   - parity Jcc, and INC/DEC exits whose incoming CF cannot be placed in
- *     cpu state (e.g. an INC/DEC latch producer with carried FLAGS).
+ *   - CALL/RET/INT/far/indirect control stays outside the general loop;
+ *   - parity Jcc and exits requiring preserved INC/DEC carry are rejected.
  */
 MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
                                              size_t max_size,
