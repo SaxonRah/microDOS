@@ -16,6 +16,9 @@
 #include "microdos/block_cache.h"
 #include "microdos/runtime.h"
 #include "microdos/exec_router.h"
+#ifdef MICRODOS_ENABLE_NATIVE3
+#include "microdos/native3.h"
+#endif
 #ifdef MICRODOS_ENABLE_NATIVE_V2
 #include "microdos/native_v2_runtime.h"
 #endif
@@ -45,6 +48,10 @@ typedef struct MdDos2System {
        interprets unknown code first and admits only proven hot regions. */
     MdJit *jit;
     MdExecRouter router;
+#ifdef MICRODOS_ENABLE_NATIVE3
+    MdNative3 native3;
+    uint64_t native3_instructions;
+#endif
 #ifdef MICRODOS_ENABLE_NATIVE_V2
     MdNativeV2Runtime native_v2;
     uint64_t native_v2_instructions;

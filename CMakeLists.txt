@@ -341,3 +341,27 @@ foreach(md_consumer microdos_bench microdos_dos2_e2e microdos_dos2_e2e_g128 micr
         add_dependencies(${md_consumer} md_generated)
     endif()
 endforeach()
+
+# ---------------------------------------------------------------------------
+# Native-3 omnibus host validation / cache tools (N3.0-N3.8)
+# ---------------------------------------------------------------------------
+add_executable(native3_cache_tool tools/native3_cache.c)
+target_include_directories(native3_cache_tool PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+
+if(MD_BUILD_TESTS)
+    add_executable(microdos_native3_tests
+        tests/test_native3.c
+        src/runtime/native3.c
+        src/runtime/native_v2.c
+        src/runtime/native_v2_runtime.c
+        src/runtime/jit_core.c)
+    target_link_libraries(microdos_native3_tests PRIVATE microdos::runtime microdos::decode)
+    target_include_directories(microdos_native3_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/include"
+        "${CMAKE_CURRENT_LIST_DIR}/src/runtime")
+    target_compile_definitions(microdos_native3_tests PRIVATE
+        MD_N3_PROFILE=1
+        MD_JIT_PROFILE=1
+        MD_JIT_LEGACY_HOTNESS=0)
+    add_test(NAME native3 COMMAND microdos_native3_tests)
+endif()

@@ -1,4 +1,15 @@
 #include "md_dos2_system.h"
+
+#ifdef MICRODOS_ENABLE_NATIVE3
+#ifndef MICRODOS_NATIVE3_CODE_BYTES
+#define MICRODOS_NATIVE3_CODE_BYTES (128u * 1024u)
+#endif
+#if defined(_MSC_VER)
+__declspec(align(64)) static uint8_t g_md_native3_code[MICRODOS_NATIVE3_CODE_BYTES];
+#else
+static uint8_t g_md_native3_code[MICRODOS_NATIVE3_CODE_BYTES] __attribute__((aligned(64)));
+#endif
+#endif
 #include "microdos/hot_code.h"
 
 #ifdef MICRODOS_ENABLE_JIT
@@ -46,6 +57,10 @@ void md_dos2_system_init(MdDos2System *sys, uint8_t *memory, MdBlockCache *cache
     hooks.interrupt = md_msdos2_boot_interrupt;
     hooks.user = &sys->boot;
     md_runtime_init(&sys->runtime, memory, &hooks);
+#ifdef MICRODOS_ENABLE_NATIVE3
+    md_native3_init(&sys->native3, g_md_native3_code, sizeof(g_md_native3_code));
+    sys->native3_instructions = 0u;
+#endif
 #ifdef MICRODOS_ENABLE_NATIVE_V2
     md_native_v2_runtime_init(&sys->native_v2);
 #endif
@@ -81,6 +96,10 @@ void md_dos2_system_set_jit(MdDos2System *sys, MdJit *jit)
     if (sys != NULL) {
         sys->jit = jit;
         md_exec_router_init(&sys->router);
+#ifdef MICRODOS_ENABLE_NATIVE3
+    md_native3_reset(&sys->native3);
+    sys->native3_instructions = 0u;
+#endif
     }
 }
 
@@ -237,7 +256,7 @@ MdStopReason MD_EXEC_HOT_FUNC(md_dos2_system_run)(MdDos2System *sys, uint64_t bu
     rt->native_v2_suppress_bloom[1] = 0u;
 #endif
 
-#if !MICRODOS_SYSTEM_ENABLE_AOT && !MICRODOS_SYSTEM_ENABLE_CACHE && !defined(MICRODOS_ENABLE_JIT) && !defined(MICRODOS_ENABLE_NATIVE_V2)
+#if !MICRODOS_SYSTEM_ENABLE_AOT && !MICRODOS_SYSTEM_ENABLE_CACHE && !defined(MICRODOS_ENABLE_JIT) && !defined(MICRODOS_ENABLE_NATIVE_V2) && !defined(MICRODOS_ENABLE_NATIVE3)
     MdStopReason st = md_interp_run(rt, budget);
     if (st == MD_STOP_BUDGET) {
         rt->stop_reason = MD_STOP_NONE;
@@ -253,6 +272,18 @@ MdStopReason MD_EXEC_HOT_FUNC(md_dos2_system_run)(MdDos2System *sys, uint64_t bu
 
         if (used >= budget) break;
         left = budget - used;
+
+#ifdef MICRODOS_ENABLE_NATIVE3
+        if (rt->cpu.cs != sys->boot.bios_segment) {
+            MdN3RunResult n3_result;
+            if (md_native3_run(&sys->native3, rt, left, &n3_result) &&
+                n3_result.retired != 0u) {
+                sys->native3_instructions += n3_result.retired;
+                if (rt->stop_reason != MD_STOP_NONE) break;
+                continue;
+            }
+        }
+#endif
 
 #ifdef MICRODOS_ENABLE_NATIVE_V2
         if (rt->native_v2_backedge_hit) {
