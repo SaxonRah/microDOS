@@ -119,7 +119,6 @@ typedef struct GOp {
     uint8_t exit_tag;
     uint8_t fall_tag;
     uint8_t arm_cond;
-    uint8_t hoisted;   /* G-2B0: guard checked at the loop header instead */
 } GOp;
 
 typedef struct GMeta {
@@ -731,55 +730,6 @@ static uint8_t g_write_mask(const GOp *o)
     }
 }
 
-/* Guest registers that form the effective address of a guarded op. */
-static uint8_t g_guard_addr_mask(const GOp *o)
-{
-    switch ((GKind)o->kind) {
-        case G_STORE16: case G_STORE8: case G_LOAD16: case G_ALU16_RM:
-            if (o->mem.is_direct)
-                return 0u;
-            switch (o->mem.rm & 7u) {
-                case 0u: return (uint8_t)((1u << MD_X86_BX) | (1u << MD_X86_SI));
-                case 1u: return (uint8_t)((1u << MD_X86_BX) | (1u << MD_X86_DI));
-                case 2u: return (uint8_t)((1u << MD_X86_BP) | (1u << MD_X86_SI));
-                case 3u: return (uint8_t)((1u << MD_X86_BP) | (1u << MD_X86_DI));
-                case 4u: return (uint8_t)(1u << MD_X86_SI);
-                case 5u: return (uint8_t)(1u << MD_X86_DI);
-                case 6u: return (uint8_t)(1u << MD_X86_BP);
-                default: return (uint8_t)(1u << MD_X86_BX);
-            }
-        case G_LODS16:
-            return (uint8_t)(1u << MD_X86_SI);
-        case G_STOS16: case G_STOS8:
-            return (uint8_t)(1u << MD_X86_DI);
-        case G_PUSH16: case G_POP16:
-            return (uint8_t)(1u << MD_X86_SP);
-        default:
-            return 0xffu;
-    }
-}
-
-static uint8_t g_write_mask(const GOp *o);
-
-/*
- * G-2B0: a guard can move to the loop header when no instruction earlier in
- * the body (on any path; the CFG is forward-only) writes its address
- * registers. Segments are invariant inside a region. The header computes the
- * same linear address the op will use, so a failing check exits at the root
- * before the iteration begins: the exact budget-exit state.
- */
-static int g_guard_hoistable(const GOp *ops, unsigned i)
-{
-    uint8_t written = 0u;
-    unsigned k;
-    const uint8_t need = g_guard_addr_mask(&ops[i]);
-    if (need == 0xffu)
-        return 0;
-    for (k = 0u; k < i; ++k)
-        written |= g_write_mask(&ops[k]);
-    return (written & need) == 0u;
-}
-
 static int g_is_producer(const GOp *o)
 {
     switch ((GKind)o->kind) {
@@ -970,7 +920,7 @@ static int g_add_exit(GMeta *m, uint16_t ip, const GOp *producer,
 
 static void emit_ea(TBuf *b, const GMem *m, unsigned width,
                     size_t guard_patch_at[1], int *needs_guard,
-                    unsigned ssoff, int want_guard)
+                    unsigned ssoff)
 {
     unsigned a = 0xffu, c = 0xffu;
     *needs_guard = 0;
@@ -1003,7 +953,7 @@ static void emit_ea(TBuf *b, const GMem *m, unsigned width,
         tuxth_any(b, 12u);
     }
 
-    if (width == 16u && want_guard) {
+    if (width == 16u) {
         tmovw(b, 14u, 0xffffu);
         tcmp_reg_shift(b, 12u, 14u, 0u);
         guard_patch_at[0] = tbcc(b, G_EQ);
@@ -1125,13 +1075,12 @@ static int emit_store_safety(TBuf *b, unsigned width,
 static void emit_reg_linear(TBuf *b, unsigned guest_reg,
                             unsigned seg_off, int ds_fast,
                             unsigned width,
-                            size_t *guard_at, int *needs_guard,
-                            int want_guard)
+                            size_t *guard_at, int *needs_guard)
 {
     t16(b, tmovhi(12u, kArmReg[guest_reg & 7u]));
     *needs_guard = 0;
 
-    if (width == 16u && want_guard) {
+    if (width == 16u) {
         tmovw(b, 14u, 0xffffu);
         tcmp_reg_shift(b, 12u, 14u, 0u);
         *guard_at = tbcc(b, G_EQ);
@@ -1146,76 +1095,6 @@ static void emit_reg_linear(TBuf *b, unsigned guest_reg,
         tadd_reg(b, 12u, 12u, 14u);
     }
     twrap20(b, 12u);
-}
-
-/*
- * G-2B0 hoisted guard. Emits exactly the address computation and pre-access
- * checks that `o` would perform in-line, but at the loop header, branching to
- * `tag` on failure. Valid only for ops whose address registers are not written
- * earlier in the iteration (g_guard_hoistable), so the address computed here is
- * the address the op will use. Clobbers r12, r14 and the [sp,#0] scratch word.
- */
-static int emit_hoisted_guard(TBuf *b, const GOp *o, uint8_t tag,
-                              GPatch *patch, unsigned *np,
-                              unsigned esoff, unsigned dsoff,
-                              unsigned ssoff, unsigned cpexecoff,
-                              unsigned code_span)
-{
-    size_t at = 0u;
-    int ng = 0;
-
-    switch ((GKind)o->kind) {
-        case G_STORE16:
-        case G_STORE8: {
-            const unsigned w = o->kind == G_STORE16 ? 16u : 8u;
-            emit_ea(b, &o->mem, w, &at, &ng, ssoff, 1);
-            if (ng && !g_add_guard_patch(patch, np, at, G_EQ, tag, o->ip))
-                return 0;
-            return emit_store_safety(b, w, tag, patch, np, cpexecoff,
-                                     code_span, o->ip);
-        }
-
-        case G_LOAD16:
-        case G_ALU16_RM:
-            emit_ea(b, &o->mem, 16u, &at, &ng, ssoff, 1);
-            return ng && g_add_guard_patch(patch, np, at, G_EQ, tag, o->ip);
-
-        case G_LODS16:
-            emit_reg_linear(b, MD_X86_SI, dsoff, 1, 16u, &at, &ng, 1);
-            return ng && g_add_guard_patch(patch, np, at, G_EQ, tag, o->ip);
-
-        case G_STOS16:
-        case G_STOS8: {
-            const unsigned w = o->kind == G_STOS16 ? 16u : 8u;
-            emit_reg_linear(b, MD_X86_DI, esoff, 0, w, &at, &ng, 1);
-            if (ng && !g_add_guard_patch(patch, np, at, G_EQ, tag, o->ip))
-                return 0;
-            return emit_store_safety(b, w, tag, patch, np, cpexecoff,
-                                     code_span, o->ip);
-        }
-
-        case G_PUSH16:
-            t16(b, tmovhi(12u, kArmReg[MD_X86_SP]));
-            tsub_imm(b, 12u, 12u, 2u);
-            tuxth_any(b, 12u);
-            tmovw(b, 14u, 0xffffu);
-            tcmp_reg_shift(b, 12u, 14u, 0u);
-            if (!g_add_guard_patch(patch, np, tbcc(b, G_EQ), G_EQ, tag, o->ip))
-                return 0;
-            tldrh_w_imm(b, 14u, 8u, ssoff);
-            tshift(b, 0u, 14u, 14u, 4u);
-            tadd_reg(b, 12u, 12u, 14u);
-            twrap20(b, 12u);
-            return emit_store_safety(b, 16u, tag, patch, np, cpexecoff,
-                                     code_span, o->ip);
-
-        case G_POP16:
-            emit_reg_linear(b, MD_X86_SP, ssoff, 0, 16u, &at, &ng, 1);
-            return ng && g_add_guard_patch(patch, np, at, G_EQ, tag, o->ip);
-
-        default:
-            return 0;
-    }
 }
 
 static void emit_budget_dec(TBuf *b) { tsub_imm(b, 11u, 11u, 1u); }
@@ -1436,7 +1315,6 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
 {
     TBuf b;
     size_t op_at[NV2G_MAX_OPS], exit_at[NV2G_MAX_EXITS], budget_at;
-    unsigned hoisted = 0u;
     GPatch patch[64];
     unsigned np = 0u, i;
     const unsigned roff = (unsigned)offsetof(MdX86, r);
@@ -1472,9 +1350,6 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
     }
     tldrh_w_imm(&b, 0u, 8u, roff);
 
-    for (i = 0u; i < n; ++i)
-        hoisted += ops[i].hoisted ? 1u : 0u;
-
     /*
      * G-1A spends one budget unit per actually executed guest instruction.
      * The conservative header check prevents a partial iteration: max_ops is
@@ -1489,27 +1364,6 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
     patch[np].exit_tag = NV2G_TAG_BUDGET;
     patch[np].target_ip = entry_ip;
     ++np;
-
-    /*
-     * G-2B0 hoisted guards. A failure leaves through the budget-exit stub:
-     *  - iteration >= 2: IP = root, nothing partial, FLAGS from the latch
-     *    producer's m.budget recipe -- the already-validated exact state;
-     *  - first pass: nothing has retired (C enters only when budget >=
-     *    max_ops, so the budget test above cannot fire on the first pass).
-     *    md_native_v2g_execute sees remaining == budget and returns FALLBACK
-     *    without applying the recipe; the stub wrote back unchanged registers.
-     */
-    if (hoisted != 0u) {
-        for (i = 0u; i < n; ++i) {
-            if (ops[i].hoisted &&
-                !emit_hoisted_guard(&b, &ops[i], NV2G_TAG_BUDGET,
-                                    patch, &np, esoff, dsoff, ssoff,
-                                    cpexecoff, code_span))
-                return MD_NATIVE_V2_UNSUPPORTED;
-        }
-        if (b.failed)
-            return MD_NATIVE_V2_TOO_LARGE;
-    }
 
     for (i = 0u; i < n && !b.failed; ++i) {
         GOp *o = &ops[i];
@@ -1540,16 +1394,14 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                 int needs_guard = 0;
                 const unsigned w = o->kind == G_STORE16 ? 16u : 8u;
 
-                emit_ea(&b, &o->mem, w, &guard_at, &needs_guard, ssoff,
-                        !o->hoisted);
+                emit_ea(&b, &o->mem, w, &guard_at, &needs_guard, ssoff);
                 if (needs_guard) {
                     if (o->guard_tag == 0xffu ||
                         !g_add_guard_patch(patch, &np, guard_at, G_EQ,
                                            o->guard_tag, o->ip))
                         return MD_NATIVE_V2_UNSUPPORTED;
                 }
-                if (!o->hoisted &&
-                    !emit_store_safety(&b, w, o->guard_tag,
+                if (!emit_store_safety(&b, w, o->guard_tag,
                                        patch, &np, cpexecoff,
                                        code_span, o->ip))
                     return MD_NATIVE_V2_UNSUPPORTED;
@@ -1570,7 +1422,7 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                 const unsigned w = o->kind == G_LODS16 ? 16u : 8u;
 
                 emit_reg_linear(&b, MD_X86_SI, dsoff, 1,
-                                w, &guard_at, &needs_guard, !o->hoisted);
+                                w, &guard_at, &needs_guard);
                 if (needs_guard) {
                     if (o->guard_tag == 0xffu ||
                         !g_add_guard_patch(patch, &np, guard_at, G_EQ,
@@ -1600,15 +1452,14 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                 const unsigned w = o->kind == G_STOS16 ? 16u : 8u;
 
                 emit_reg_linear(&b, MD_X86_DI, esoff, 0,
-                                w, &guard_at, &needs_guard, !o->hoisted);
+                                w, &guard_at, &needs_guard);
                 if (needs_guard) {
                     if (o->guard_tag == 0xffu ||
                         !g_add_guard_patch(patch, &np, guard_at, G_EQ,
                                            o->guard_tag, o->ip))
                         return MD_NATIVE_V2_UNSUPPORTED;
                 }
-                if (!o->hoisted &&
-                    !emit_store_safety(&b, w, o->guard_tag,
+                if (!emit_store_safety(&b, w, o->guard_tag,
                                        patch, &np, cpexecoff,
                                        code_span, o->ip))
                     return MD_NATIVE_V2_UNSUPPORTED;
@@ -1634,22 +1485,19 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                 t16(&b, tmovhi(12u, kArmReg[MD_X86_SP]));
                 tsub_imm(&b, 12u, 12u, 2u);
                 tuxth_any(&b, 12u);
-                if (!o->hoisted) {
-                    tmovw(&b, 14u, 0xffffu);
-                    tcmp_reg_shift(&b, 12u, 14u, 0u);
-                    wrap_at = tbcc(&b, G_EQ);
-                    if (!g_add_guard_patch(patch, &np, wrap_at, G_EQ,
-                                           o->guard_tag, o->ip))
-                        return MD_NATIVE_V2_UNSUPPORTED;
-                }
+                tmovw(&b, 14u, 0xffffu);
+                tcmp_reg_shift(&b, 12u, 14u, 0u);
+                wrap_at = tbcc(&b, G_EQ);
+                if (!g_add_guard_patch(patch, &np, wrap_at, G_EQ,
+                                       o->guard_tag, o->ip))
+                    return MD_NATIVE_V2_UNSUPPORTED;
 
                 tldrh_w_imm(&b, 14u, 8u, ssoff);
                 tshift(&b, 0u, 14u, 14u, 4u);
                 tadd_reg(&b, 12u, 12u, 14u);
                 twrap20(&b, 12u);
 
-                if (!o->hoisted &&
-                    !emit_store_safety(&b, 16u, o->guard_tag,
+                if (!emit_store_safety(&b, 16u, o->guard_tag,
                                        patch, &np, cpexecoff,
                                        code_span, o->ip))
                     return MD_NATIVE_V2_UNSUPPORTED;
@@ -1673,11 +1521,10 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                 int needs_guard = 0;
 
                 emit_reg_linear(&b, MD_X86_SP, ssoff, 0,
-                                16u, &guard_at, &needs_guard, !o->hoisted);
-                if (!o->hoisted &&
-                    (!needs_guard || o->guard_tag == 0xffu ||
-                     !g_add_guard_patch(patch, &np, guard_at, G_EQ,
-                                        o->guard_tag, o->ip)))
+                                16u, &guard_at, &needs_guard);
+                if (!needs_guard || o->guard_tag == 0xffu ||
+                    !g_add_guard_patch(patch, &np, guard_at, G_EQ,
+                                       o->guard_tag, o->ip))
                     return MD_NATIVE_V2_UNSUPPORTED;
 
                 tldrh_w_reg(&b, 14u, 9u, 12u);
@@ -1701,8 +1548,7 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                 const unsigned w =
                     (o->kind == G_LOAD16 || o->kind == G_ALU16_RM) ? 16u : 8u;
 
-                emit_ea(&b, &o->mem, w, &guard_at, &needs_guard, ssoff,
-                        !o->hoisted);
+                emit_ea(&b, &o->mem, w, &guard_at, &needs_guard, ssoff);
                 if (needs_guard) {
                     if (o->guard_tag == 0xffu || np >= 64u)
                         return MD_NATIVE_V2_UNSUPPORTED;
@@ -2161,30 +2007,6 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
      * flag producer of an iteration, a later-iteration exit would need the
      * previous iteration's flags; conservatively reject that case in G-1A.
      */
-    {
-        uint8_t loop_writes = 0u;
-        for (i = 0u; i < n; ++i)
-            loop_writes |= g_write_mask(&ops[i]);
-
-        /*
-         * G-2B0 fix (G-1 exactness hole): an external JCXZ/LOOP side exit
-         * ahead of the iteration's first flag producer was given a PRESERVE
-         * recipe. That is only the entry FLAGS on iteration 1; on later
-         * iterations FLAGS come from the previous iteration's producer.
-         * Keep the exit only when it provably cannot be taken after
-         * iteration 1: JCXZ in a loop that never writes CX.
-         */
-        for (i = 0u; i < n; ++i) {
-            if (!ops[i].external || in_prod[i] >= 0 || !any_producer)
-                continue;
-            if (ops[i].kind == G_JCXZ &&
-                (loop_writes & (1u << MD_X86_CX)) == 0u)
-                continue;
-            ++g_nv2g_stats.reject_flags;
-            return MD_NATIVE_V2_UNSUPPORTED;
-        }
-    }
-
     for (i = 0u; i < n; ++i) {
         const GOp *p = in_prod[i] >= 0 ? &ops[(unsigned)in_prod[i]] : NULL;
         uint8_t clob = in_clob[i];
@@ -2208,27 +2030,21 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
             uint8_t tag;
 
             /*
-             * A pre-instruction guard ahead of the iteration's first flag
-             * producer would need the previous iteration's FLAGS when it
-             * fires on iteration >= 2. G-2B0 avoids that by hoisting the
-             * guard to the loop header when its address registers are not
-             * written earlier in the body: a failure there is the exact
-             * budget-exit state. Otherwise stay conservative.
+             * A pre-instruction guard can fire on a later iteration. Until
+             * G-2B carries a previous-iteration flag snapshot, require a
+             * current-iteration producer whenever this loop has producers.
+             * This is the same exactness rule G-1 already used for word-load
+             * wrap guards.
              */
             if (p == NULL && any_producer) {
-                if (!g_guard_hoistable(ops, i)) {
-                    ++g_nv2g_stats.reject_memory;
-                    return MD_NATIVE_V2_UNSUPPORTED;
-                }
-                ops[i].hoisted = 1u;
-                ++g_nv2g_stats.hoisted_guards;
-            } else {
-                if (!g_add_exit(&m, ops[i].ip, p, in_clob[i], &tag)) {
-                    ++g_nv2g_stats.reject_memory;
-                    return MD_NATIVE_V2_UNSUPPORTED;
-                }
-                ops[i].guard_tag = tag;
+                ++g_nv2g_stats.reject_memory;
+                return MD_NATIVE_V2_UNSUPPORTED;
             }
+            if (!g_add_exit(&m, ops[i].ip, p, in_clob[i], &tag)) {
+                ++g_nv2g_stats.reject_memory;
+                return MD_NATIVE_V2_UNSUPPORTED;
+            }
+            ops[i].guard_tag = tag;
 
             if (ops[i].kind == G_LOAD16 || ops[i].kind == G_ALU16_RM ||
                 ops[i].kind == G_STORE16) {
@@ -2408,13 +2224,7 @@ uint32_t MD_HOT_FUNC(md_native_v2g_execute)(MdX86 *cpu,
     rc=g_call_thumb(cpu,entry,budget,code_start);
     tag=rc>>24;remaining=rc&0x00ffffffu;
     if(remaining>budget)return MD_NATIVE_V2_EXEC_FALLBACK;
-    if(tag==NV2G_TAG_BUDGET){
-        /* G-2B0: zero-retire budget exit = hoisted guard failed on the first
-           pass. Nothing executed; registers were written back unchanged.
-           FLAGS must stay as they were, so do not apply the latch recipe. */
-        if(remaining==budget)return MD_NATIVE_V2_EXEC_FALLBACK;
-        g_finish_recipe(cpu,&m->budget);cpu->ip=code->start_ip;return remaining;
-    }
+    if(tag==NV2G_TAG_BUDGET){g_finish_recipe(cpu,&m->budget);cpu->ip=code->start_ip;return remaining;}
     if(tag>=m->exit_count)return MD_NATIVE_V2_EXEC_FALLBACK;
     g_finish_recipe(cpu,&m->exits[tag]);cpu->ip=m->exits[tag].ip;return remaining;
 #else

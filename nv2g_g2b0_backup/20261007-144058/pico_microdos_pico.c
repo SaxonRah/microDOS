@@ -881,9 +881,6 @@ static void md_stats(uint64_t start_us)
                    (unsigned long)gs->reject_control_return,
                    (unsigned long)gs->reject_control_stop);
 
-            md_say("[native-v2g-hoist] guards=%lu\n",
-                   (unsigned long)gs->hoisted_guards);
-
             for (j = 0u; j < 256u; ++j) {
                 if (gs->reject_opcode_byte[j] != 0u)
                     md_say("[native-v2g-opcode] op=%02X count=%lu\n",

@@ -31,14 +31,8 @@ extern "C" {
  *
  * G-2A store guards exit before the instruction on 16-bit offset wrap,
  * overlap with the currently executing guest-code span, or a tracked page.
- *
- * G-2B0: a guard ahead of the iteration's first flag producer is hoisted to
- * the loop header when its address registers are not written earlier in the
- * body (the normal DOS shape: store first, compare at the latch). A failure
- * there is the exact budget-exit state; on the first pass it retires nothing
- * and execute returns FALLBACK. Unhoistable guards remain a conservative
- * reject. JCXZ/LOOP side exits ahead of the first producer are rejected
- * unless provably first-iteration-only (JCXZ in a loop that never writes CX).
+ * A guard before the current iteration's first flag producer remains a
+ * conservative reject until previous-iteration flag handoff is represented.
  *
  * Still deferred:
  *   - segment overrides and SCAS/CMPS single -> G-2B;
@@ -80,10 +74,6 @@ typedef struct MdNativeV2GStats {
     uint32_t reject_control_indirect_jump;
     uint32_t reject_control_return;
     uint32_t reject_control_stop;
-
-    /* G-2B0: guards moved to the loop header (counted per compiled op,
-       including attempts that later reject for another reason). */
-    uint32_t hoisted_guards;
 } MdNativeV2GStats;
 
 /* Cumulative since boot/process start. Read-only telemetry. */
