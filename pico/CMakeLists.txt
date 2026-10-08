@@ -124,6 +124,20 @@ function(md_pico_dos target code_in_sram cache sys_khz kernel_aot app_aot jit pr
         "${MD_ROOT}/src/host/msdos2_boot.c"
         ${MD_RUNTIME_BASE_SOURCES})
 
+    # blitzBUS owner: optional Pico 4-inch LCD text console (COM input unchanged)
+    if(target STREQUAL "microdos_pico")
+        target_sources(${target} PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/../blitzbus-overlay/bb_lcd_console.c"
+            "${CMAKE_CURRENT_LIST_DIR}/../blitzbus-overlay/mr_pico_ili9341.c"
+            "${CMAKE_CURRENT_LIST_DIR}/../blitzbus-overlay/gfx_font5x7.c")
+        target_include_directories(${target} PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/../blitzbus-overlay")
+        target_compile_definitions(${target} PRIVATE
+            BLITZBUS_LCD_CONSOLE=1
+            MR_LCD_PANEL_ST7796S=1 MR_ILI9341_MADCTL=0xE8 MR_LCD_SPI_BAUD=40000000u)
+        target_link_libraries(${target} PRIVATE hardware_spi hardware_dma)
+    endif()
+
     if(cache OR kernel_aot OR app_aot)
         # dosrecomp AOT fallback contains a link-time reference to
         # md_interp_run_cached_until(). AOT references therefore need the
@@ -643,3 +657,50 @@ include("${MD_ROOT}/pico/blitz86_target.cmake")
 
 # Optional blitz86 native JIT diagnostic target
 include("${MD_ROOT}/pico/blitz86_pico_jit_target.cmake")
+
+# === blitzBUS v0.6 JIT PROBE BEGIN ===
+# Standalone hardware gate: not connected to DOS runtime yet.
+add_executable(blitzbus_b86_jit_probe
+    "C:/blitzBUS/pico/bb_jit_probe.c"
+    "C:/blitz86_v2/src/interp.c"
+    "C:/blitz86_v2/src/jit.c"
+    "C:/blitz86_v2/src/be_t2.c")
+target_include_directories(blitzbus_b86_jit_probe PRIVATE "C:/blitz86_v2/include")
+# Bounded metadata footprint, independent of the benchmark's JIT configuration.
+target_compile_definitions(blitzbus_b86_jit_probe PRIVATE
+    B86_MAXB=256 B86_MAP_BITS=10 MICRODOS_PICO_SYS_KHZ=300000)
+md_pico_common(blitzbus_b86_jit_probe 0)
+pico_set_program_name(blitzbus_b86_jit_probe "blitzBUS Thumb2 JIT proof")
+# === blitzBUS v0.6 JIT PROBE END ===
+
+# === blitzBUS v0.7 LIVE DOS BEGIN ===
+# The original microdos_pico target and original source files remain untouched.
+md_pico_dos(blitzbus_pico_b86_dos 0 0 300000 0 0 0 0 0 0)
+get_target_property(_bb_src blitzbus_pico_b86_dos SOURCES)
+list(REMOVE_ITEM _bb_src "${CMAKE_CURRENT_LIST_DIR}/microdos_pico.c")
+list(REMOVE_ITEM _bb_src "${MD_ROOT}/src/system/md_dos2_system.c")
+list(APPEND _bb_src "C:/blitzBUS/generated/bb_microdos_pico.c"
+    "C:/blitzBUS/generated/bb_md_dos2_system.c"
+    "C:/blitzBUS/src/bb_live.c"
+    "C:/blitz86_v2/src/interp.c"
+    "C:/blitz86_v2/src/jit.c"
+    "C:/blitz86_v2/src/be_t2.c")
+set_property(TARGET blitzbus_pico_b86_dos PROPERTY SOURCES "${_bb_src}")
+target_include_directories(blitzbus_pico_b86_dos PRIVATE
+    "C:/blitzBUS/src"
+    "C:/blitz86_v2/include"
+    "${MD_ROOT}/src/system"
+    "${MD_ROOT}/pico")
+target_compile_definitions(blitzbus_pico_b86_dos PRIVATE
+    B86_MAXB=256 B86_MAP_BITS=10
+    BLITZBUS_LIVE_BACKEND=1
+    BLITZBUS_LCD_CONSOLE=1
+    MR_LCD_PANEL_ST7796S=1 MR_ILI9341_MADCTL=0xE8 MR_LCD_SPI_BAUD=40000000u)
+target_sources(blitzbus_pico_b86_dos PRIVATE
+    "${MD_ROOT}/blitzbus-overlay/bb_lcd_console.c"
+    "${MD_ROOT}/blitzbus-overlay/mr_pico_ili9341.c"
+    "${MD_ROOT}/blitzbus-overlay/gfx_font5x7.c")
+target_include_directories(blitzbus_pico_b86_dos PRIVATE "${MD_ROOT}/blitzbus-overlay")
+target_link_libraries(blitzbus_pico_b86_dos PRIVATE hardware_spi hardware_dma)
+pico_set_program_name(blitzbus_pico_b86_dos "blitzBUS DOS + blitz86 gated")
+# === blitzBUS v0.7 LIVE DOS END ===

@@ -45,6 +45,9 @@
 #include "hardware/structs/xip_ctrl.h"
 #include "pico/stdio_usb.h"
 #include "pico/stdlib.h"
+#if defined(BLITZBUS_LCD_CONSOLE) && BLITZBUS_LCD_CONSOLE
+#include "bb_lcd_console.h"
+#endif
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -232,6 +235,10 @@ static void con_write(void *user, const uint8_t *data, size_t size)
     size_t i;
     con->idle_polls = 0u;
     for (i = 0; i < size; ++i) putchar_raw((int)data[i]);
+#if defined(BLITZBUS_LCD_CONSOLE) && BLITZBUS_LCD_CONSOLE
+    bb_lcd_console_write(data, size);
+    bb_lcd_console_flush();
+#endif
     stdio_flush();
     g_perf.console_out_us += time_us_64() - t0;
 }
@@ -986,6 +993,9 @@ int main(void)
            (unsigned long)(MD_GUEST_BYTES / 1024u),(void*)g_guest,MICRODOS_PICO_GUEST_SRAM?"SRAM":"PSRAM",
            (unsigned long)MD_MSDOS2_DEFAULT_MEMORY_PARAGRAPHS / 64ul);
     if(disk_size!=MD_DISK_BYTES){md_say("microDOS: embedded disk is %lu bytes, expected %lu; halting.\n",(unsigned long)disk_size,(unsigned long)MD_DISK_BYTES);for(;;)sleep_ms(1000);}
+#if defined(BLITZBUS_LCD_CONSOLE) && BLITZBUS_LCD_CONSOLE
+    bb_lcd_console_init();
+#endif
     memset(g_guest,0,MD_GUEST_BYTES); memcpy(g_disk,md_blob_disk,MD_DISK_BYTES);
     md_say("  disk:    360 KiB image copied from flash to PSRAM (writes are lost at reset)\n");
 
