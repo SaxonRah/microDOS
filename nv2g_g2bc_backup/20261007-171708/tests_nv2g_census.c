@@ -259,7 +259,7 @@ static void census_classify(Root *r, const MdX86 *cpu)
         == MD_NATIVE_V2_OK) { r->owner = OWN_NV2_REP; }
 
     before = *md_native_v2g_stats();
-    if (md_native_v2g_compile_loop_graph(cpu->memory, r->cs, r->ip, &code, &gs) == MD_NATIVE_V2_OK) {
+    if (md_native_v2g_compile_loop(guest, window, r->ip, &code, &gs) == MD_NATIVE_V2_OK) {
         if (r->owner == OWN_NONE) r->owner = OWN_NV2G;
         r->g_reason = 0u;
     } else {

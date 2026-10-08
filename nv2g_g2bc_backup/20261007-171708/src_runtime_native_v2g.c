@@ -41,8 +41,6 @@ typedef enum GKind {
     G_STOS8,
     G_PUSH16,
     G_POP16,
-    G_CALL16,
-    G_RET16,
     G_ALU16_RR,
     G_ALU16_RI,
     G_ALU16_RM,
@@ -145,10 +143,6 @@ typedef struct GMeta {
     uint8_t has_store;
     uint8_t requires_df_clear;
     uint8_t untracked;   /* G-2B1 compact layout: no inline tracked-page check */
-    uint8_t has_local_call; /* G-2C: one bounded static near CALL/RET leaf */
-    uint8_t call_len;
-    uint16_t call_ip;
-    uint16_t call_return_ip;
     GRecipe exits[NV2G_MAX_EXITS];
     GRecipe budget;
 } GMeta;
@@ -739,62 +733,6 @@ static int g_decode_op(const uint8_t *image, size_t image_size,
     return 0;
 }
 
-
-/*
- * G-2C bounded leaf body. The first general CALL milestone deliberately
- * accepts one static near CALL discovered in the bounded graph window,
- * after the <=64-byte caller loop, ending in a plain C3 RET, with no nested
- * control flow, performs no stores/PUSH/POP and never writes SP.
- */
-static int g_leaf_op_ok(const GOp *o)
-{
-    switch ((GKind)o->kind) {
-        case G_MOV_R16_IMM:
-        case G_MOV_R8_IMM:
-        case G_MOV_RR16:
-        case G_MOV_RR8:
-        case G_LOAD16:
-        case G_LOAD8:
-        case G_LODS16:
-        case G_LODS8:
-        case G_ALU16_RR:
-        case G_ALU16_RI:
-        case G_ALU16_RM:
-        case G_ALU8_RR:
-        case G_ALU8_RI:
-        case G_ALU8_RM:
-        case G_TEST16_RI:
-        case G_TEST8_RI:
-        case G_INC16:
-        case G_DEC16:
-        case G_NOT16:
-        case G_NEG16:
-        case G_NOP:
-            break;
-        default:
-            return 0;
-    }
-
-    switch ((GKind)o->kind) {
-        case G_MOV_R16_IMM:
-        case G_MOV_RR16:
-        case G_LOAD16:
-        case G_ALU16_RR:
-        case G_ALU16_RI:
-        case G_ALU16_RM:
-        case G_INC16:
-        case G_DEC16:
-        case G_NOT16:
-        case G_NEG16:
-            if ((o->dst & 7u) == MD_X86_SP)
-                return 0;
-            break;
-        default:
-            break;
-    }
-    return 1;
-}
-
 static int g_find_ip(const GOp *ops, unsigned n, uint16_t ip)
 {
     unsigned i;
@@ -820,8 +758,6 @@ static uint8_t g_write_mask(const GOp *o)
             return (uint8_t)(1u << MD_X86_SP);
         case G_POP16:
             return (uint8_t)((1u << MD_X86_SP) | (1u << (o->dst & 7u)));
-        case G_CALL16: case G_RET16:
-            return (uint8_t)(1u << MD_X86_SP);
         case G_ALU16_RR: case G_ALU16_RI: case G_ALU16_RM:
             return o->alu == 7u ? 0u : (uint8_t)(1u << (o->dst & 7u));
         case G_ALU8_RR: case G_ALU8_RI: case G_ALU8_RM:
@@ -996,126 +932,54 @@ static int g_cond_for(unsigned recipe_kind, unsigned cc)
  * the entry state: a G-1 flag-consuming branch must have a producer in the
  * current iteration. Merges with different producers are rejected. */
 static int g_flag_dataflow(const GOp *ops, unsigned n,
-                           int16_t *in_prod, uint64_t *in_pset,
-                           uint8_t *in_entry, uint8_t *in_clob)
+                           int16_t *in_prod, uint8_t *in_clobber)
 {
     uint8_t seen[NV2G_MAX_OPS];
     unsigned changed = 1u, pass = 0u;
     unsigned i;
-
     memset(seen, 0, sizeof(seen));
-    for (i = 0u; i < n; ++i) {
-        in_prod[i] = -2;
-        in_pset[i] = 0u;
-        in_entry[i] = 0u;
-        in_clob[i] = 0u;
-    }
+    for (i = 0u; i < n; ++i) { in_prod[i] = -2; in_clobber[i] = 0u; }
+    in_prod[0] = -1; seen[0] = 1u;
 
-    /*
-     * G-2B2: FLAGS state at a join is a SET of possible last producers plus
-     * an optional "entry/carried FLAGS" source. G-2B1 rejected immediately
-     * when two predecessor paths named different producers. That was overly
-     * conservative for exits: if every path-specific producer writes exact
-     * canonical lazy state (NLM), the join can simply preserve cpu FLAGS.
-     *
-     * Conditional branches still require one exact producer; only exits and
-     * carried/budget states consume a merged set in G-2B2.
-     */
-    in_entry[0] = 1u;
-    seen[0] = 1u;
-
-    while (changed && pass++ < NV2G_MAX_OPS * 3u) {
+    while (changed && pass++ < NV2G_MAX_OPS * 2u) {
         changed = 0u;
         for (i = 0u; i < n; ++i) {
-            uint64_t pset;
-            uint8_t ent, clob;
+            int16_t prod;
+            uint8_t clob;
             int succ[2] = {-1,-1};
             unsigned ns = 0u, k;
-
             if (!seen[i]) continue;
-
-            pset = in_pset[i];
-            ent = in_entry[i];
-            clob = in_clob[i];
-
-            if (g_is_producer(&ops[i])) {
-                pset = UINT64_C(1) << i;
-                ent = 0u;
-                clob = 0u;
-            } else {
-                clob |= g_write_mask(&ops[i]);
-            }
+            prod = in_prod[i]; clob = in_clobber[i];
+            if (g_is_producer(&ops[i])) { prod = (int16_t)i; clob = 0u; }
+            else clob |= g_write_mask(&ops[i]);
 
             switch ((GKind)ops[i].kind) {
                 case G_JCC: case G_JCXZ: case G_LOOP:
-                    if (!ops[i].external && !ops[i].latch)
-                        succ[ns++] = g_find_ip(ops, n, ops[i].target);
-                    if (i + 1u < n)
-                        succ[ns++] = (int)(i + 1u);
+                    if (!ops[i].external && !ops[i].latch) succ[ns++] = g_find_ip(ops,n,ops[i].target);
+                    if (i + 1u < n) succ[ns++] = (int)(i + 1u);
                     break;
                 case G_JMP:
-                    if (!ops[i].external && !ops[i].latch)
-                        succ[ns++] = g_find_ip(ops, n, ops[i].target);
+                    if (!ops[i].external && !ops[i].latch) succ[ns++] = g_find_ip(ops,n,ops[i].target);
                     break;
                 default:
-                    if (i + 1u < n)
-                        succ[ns++] = (int)(i + 1u);
+                    if (i + 1u < n) succ[ns++] = (int)(i + 1u);
                     break;
             }
 
             for (k = 0u; k < ns; ++k) {
                 const int s = succ[k];
-                uint64_t new_pset;
-                uint8_t new_ent, new_clob;
-
-                if (s < 0)
-                    return 0;
-
+                if (s < 0) return 0;
                 if (!seen[s]) {
-                    seen[s] = 1u;
-                    in_pset[s] = pset;
-                    in_entry[s] = ent;
-                    in_clob[s] = clob;
-                    changed = 1u;
-                    continue;
-                }
-
-                new_pset = in_pset[s] | pset;
-                new_ent = (uint8_t)(in_entry[s] | ent);
-                new_clob = (uint8_t)(in_clob[s] | clob);
-
-                if (new_pset != in_pset[s] ||
-                    new_ent != in_entry[s] ||
-                    new_clob != in_clob[s]) {
-                    in_pset[s] = new_pset;
-                    in_entry[s] = new_ent;
-                    in_clob[s] = new_clob;
-                    changed = 1u;
+                    seen[s] = 1u; in_prod[s] = prod; in_clobber[s] = clob; changed = 1u;
+                } else {
+                    if (in_prod[s] != prod) return 0;
+                    if ((uint8_t)(in_clobber[s] | clob) != in_clobber[s]) {
+                        in_clobber[s] |= clob; changed = 1u;
+                    }
                 }
             }
         }
     }
-
-    for (i = 0u; i < n; ++i) {
-        uint64_t s;
-
-        if (!seen[i]) {
-            in_prod[i] = -2;
-            continue;
-        }
-
-        s = in_pset[i];
-        if (s == 0u && in_entry[i]) {
-            in_prod[i] = -1;
-        } else if (!in_entry[i] && s != 0u && (s & (s - 1u)) == 0u) {
-            unsigned bit = 0u;
-            while (((s >> bit) & 1u) == 0u) ++bit;
-            in_prod[i] = (int16_t)bit;
-        } else {
-            in_prod[i] = -3;
-        }
-    }
-
     return 1;
 }
 
@@ -1204,8 +1068,6 @@ static int emit_store_safety(TBuf *b, unsigned width,
                              GPatch *patch, unsigned *np,
                              unsigned cpexecoff,
                              unsigned code_span,
-                             unsigned extra_code_off,
-                             unsigned extra_code_span,
                              uint16_t op_ip,
                              int tracked)
 {
@@ -1239,31 +1101,6 @@ static int emit_store_safety(TBuf *b, unsigned width,
 
     if (!tpatch_bcc(b, below_code_at, G_CC, b->at))
         return 0;
-
-
-    if (extra_code_span != 0u) {
-        size_t below_extra_at;
-
-        tldr_w_imm(b, 12u, 13u, 4u);
-        if (extra_code_off != 0u)
-            tadd_imm(b, 12u, 12u, extra_code_off);
-        tldr_w_imm(b, 14u, 13u, 0u);
-        if (width == 16u)
-            tadd_imm(b, 14u, 14u, 1u);
-        tcmp_reg_shift(b, 14u, 12u, 0u);
-        below_extra_at = tbcc(b, G_CC);
-
-        if (extra_code_span > 1u)
-            tadd_imm(b, 12u, 12u, extra_code_span - 1u);
-        tldr_w_imm(b, 14u, 13u, 0u);
-        tcmp_reg_shift(b, 14u, 12u, 0u);
-        if (!g_add_guard_patch(patch, np, tbcc(b, G_LS), G_LS,
-                               guard_tag, op_ip))
-            return 0;
-
-        if (!tpatch_bcc(b, below_extra_at, G_CC, b->at))
-            return 0;
-    }
 
     if (!tracked) {
         /* Compact layout: execute refuses entry when a tracker is present. */
@@ -1348,10 +1185,7 @@ static int emit_hoisted_guard(TBuf *b, const GOp *o, uint8_t tag,
                               GPatch *patch, unsigned *np,
                               unsigned esoff, unsigned dsoff,
                               unsigned ssoff, unsigned cpexecoff,
-                              unsigned code_span,
-                              unsigned extra_code_off,
-                              unsigned extra_code_span,
-                              int tracked)
+                              unsigned code_span, int tracked)
 {
     size_t at = 0u;
     int ng = 0;
@@ -1364,7 +1198,7 @@ static int emit_hoisted_guard(TBuf *b, const GOp *o, uint8_t tag,
             if (ng && !g_add_guard_patch(patch, np, at, G_EQ, tag, o->ip))
                 return 0;
             return emit_store_safety(b, w, tag, patch, np, cpexecoff,
-                                     code_span, extra_code_off, extra_code_span, o->ip, tracked);
+                                     code_span, o->ip, tracked);
         }
 
         case G_LOAD16:
@@ -1383,7 +1217,7 @@ static int emit_hoisted_guard(TBuf *b, const GOp *o, uint8_t tag,
             if (ng && !g_add_guard_patch(patch, np, at, G_EQ, tag, o->ip))
                 return 0;
             return emit_store_safety(b, w, tag, patch, np, cpexecoff,
-                                     code_span, extra_code_off, extra_code_span, o->ip, tracked);
+                                     code_span, o->ip, tracked);
         }
 
         case G_PUSH16:
@@ -1399,7 +1233,7 @@ static int emit_hoisted_guard(TBuf *b, const GOp *o, uint8_t tag,
             tadd_reg(b, 12u, 12u, 14u);
             twrap20(b, 12u);
             return emit_store_safety(b, 16u, tag, patch, np, cpexecoff,
-                                     code_span, extra_code_off, extra_code_span, o->ip, tracked);
+                                     code_span, o->ip, tracked);
 
         case G_POP16:
             emit_reg_linear(b, MD_X86_SP, ssoff, 0, 16u, &at, &ng, 1);
@@ -1677,8 +1511,6 @@ static int g_nlm_lazy_op(const GOp *o)
             if (alu == 1u || alu == 4u || alu == 6u)
                 return w16 ? MD_LAZY_LOGIC16 : MD_LAZY_LOGIC8;
             return -1;
-        case G_INC16: return MD_LAZY_INC16;
-        case G_DEC16: return MD_LAZY_DEC16;
         default:
             return -1;
     }
@@ -1724,39 +1556,6 @@ static int emit_nlm(TBuf *b, const GOp *o)
     unsigned x;
 
     if (lop < 0) return 0;
-
-
-    if (o->kind == G_INC16 || o->kind == G_DEC16) {
-        const unsigned dst = kArmReg[o->dst & 7u];
-
-        if (o->arm_cond == 0xffu) {
-            tldrb_w_imm(b, 12u, 8u, coff);
-        } else {
-            emit_recipe_flags(b, &o->branch_recipe);
-            if (b->failed || o->arm_cond >= 14u)
-                return 0;
-            tmovw(b, 12u, 0u);
-            t16(b, (uint16_t)(0xD001u |
-                              (((o->arm_cond ^ 1u) & 15u) << 8)));
-            tmovw(b, 12u, 1u);
-        }
-
-        tstrb_w_imm(b, 12u, 8u, coff);
-
-        t16(b, tmovhi(12u, dst));
-        tstrh_w_imm(b, 12u, 8u, res_off);
-        if (o->kind == G_INC16)
-            tsub_imm(b, 12u, 12u, 1u);
-        else
-            tadd_imm(b, 12u, 12u, 1u);
-        tuxth_any(b, 12u);
-        tstrh_w_imm(b, 12u, 8u, aoff);
-        tmovw(b, 12u, 1u);
-        tstrh_w_imm(b, 12u, 8u, boff);
-        tmovw(b, 12u, (uint16_t)lop);
-        tstrb_w_imm(b, 12u, 8u, opoff);
-        return !b->failed;
-    }
 
     /* r14 = right operand b, zero-extended to the operand width. */
     if (is_rr) {
@@ -1833,21 +1632,12 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
     const unsigned moff = (unsigned)offsetof(MdX86, memory);
     const unsigned cpexecoff = (unsigned)offsetof(MdX86, code_page_executable);
     const unsigned code_span = (unsigned)(uint16_t)(end_ip - entry_ip);
-    const unsigned extra_code_off = m->has_local_call
-        ? (unsigned)(uint16_t)(m->call_ip - entry_ip) : 0u;
-    const unsigned extra_code_span = m->has_local_call
-        ? (unsigned)m->call_len : 0u;
     const int tracked = !compact;
     size_t loop_top;
 
     memset(out, 0, sizeof(*out));
     b.p = out->bytes;
-    /*
-     * TEMP RP2350 isolation:
-     * physical MdNativeV2Code remains 2 KiB, but NV2-G emission retains
-     * the old 1 KiB capacity/layout decision.
-     */
-    b.cap = 1024u;
+    b.cap = sizeof(out->bytes);
     b.at = 0u;
     b.failed = 0;
 
@@ -1901,9 +1691,7 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
             if (ops[i].hoisted &&
                 !emit_hoisted_guard(&b, &ops[i], NV2G_TAG_BUDGET,
                                     patch, &np, esoff, dsoff, ssoff,
-                                    cpexecoff, code_span,
-                                    extra_code_off, extra_code_span,
-                                    tracked))
+                                    cpexecoff, code_span, tracked))
                 return G_EMIT_FAIL(b);
         }
         if (b.failed)
@@ -1950,7 +1738,7 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                 if (!o->hoisted &&
                     !emit_store_safety(&b, w, o->guard_tag,
                                        patch, &np, cpexecoff,
-                                       code_span, extra_code_off, extra_code_span, o->ip, tracked))
+                                       code_span, o->ip, tracked))
                     return G_EMIT_FAIL(b);
 
                 if (o->has_imm) {
@@ -2014,7 +1802,7 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                 if (!o->hoisted &&
                     !emit_store_safety(&b, w, o->guard_tag,
                                        patch, &np, cpexecoff,
-                                       code_span, extra_code_off, extra_code_span, o->ip, tracked))
+                                       code_span, o->ip, tracked))
                     return G_EMIT_FAIL(b);
 
                 if (w == 16u) {
@@ -2055,7 +1843,7 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                 if (!o->hoisted &&
                     !emit_store_safety(&b, 16u, o->guard_tag,
                                        patch, &np, cpexecoff,
-                                       code_span, extra_code_off, extra_code_span, o->ip, tracked))
+                                       code_span, o->ip, tracked))
                     return G_EMIT_FAIL(b);
 
                 if ((o->src & 7u) == MD_X86_SP) {
@@ -2095,29 +1883,6 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
                 }
                 break;
             }
-
-
-            case G_CALL16: {
-                t16(&b, tmovhi(12u, kArmReg[MD_X86_SP]));
-                tsub_imm(&b, 12u, 12u, 2u);
-                tuxth_any(&b, 12u);
-                tldrh_w_imm(&b, 14u, 8u, ssoff);
-                tshift(&b, 0u, 14u, 14u, 4u);
-                tadd_reg(&b, 12u, 12u, 14u);
-                twrap20(&b, 12u);
-                tmovw(&b, 14u, o->imm);
-                tstrh_w_reg(&b, 14u, 9u, 12u);
-                tsub_imm(&b, kArmReg[MD_X86_SP],
-                         kArmReg[MD_X86_SP], 2u);
-                tuxth_any(&b, kArmReg[MD_X86_SP]);
-                break;
-            }
-
-            case G_RET16:
-                tadd_imm(&b, kArmReg[MD_X86_SP],
-                         kArmReg[MD_X86_SP], 2u);
-                tuxth_any(&b, kArmReg[MD_X86_SP]);
-                break;
 
             case G_LOAD16:
             case G_LOAD8:
@@ -2394,16 +2159,6 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
     out->has_store = m->has_store;
     out->dynamic_retire = 3u;
     out->retire_base_ops = 0u;
-    if (m->has_local_call) {
-        out->local_call_graph = 1u;
-        out->call_stack_bytes = 2u;
-        out->requires_safe_ss_word = 1u;
-        out->guest_span_count = 2u;
-        out->guest_span_ip[0] = entry_ip;
-        out->guest_span_len[0] = (uint8_t)(uint16_t)(end_ip - entry_ip);
-        out->guest_span_ip[1] = m->call_ip;
-        out->guest_span_len[1] = m->call_len;
-    }
     memcpy(out->g_meta, m, sizeof(*m));
     return MD_NATIVE_V2_OK;
 }
@@ -2423,135 +2178,32 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
  * index `pi` (-1: none yet in this iteration) and clobber mask `clob`.
  * May mark producers NLM; NLM marks never invalidate earlier decisions.
  */
-static int g_prepare_nlm_index(GOp *ops, unsigned n,
-                               const int16_t *in_prod,
-                               const uint8_t *in_clob,
-                               unsigned idx)
+static int g_carried_ok(GOp *ops, unsigned n, const int16_t *in_prod)
 {
-    GOp *p;
-    int q;
-    GRecipe rr;
-    int cond;
-
-    if (idx >= n)
-        return 0;
-
-    p = &ops[idx];
-    if (p->nlm)
-        return 1;
-
-    if (p->kind != G_INC16 && p->kind != G_DEC16) {
-        if (g_nlm_lazy_op(p) < 0)
-            return 0;
-        p->nlm = 1u;
-        return 1;
-    }
-
-    q = in_prod[idx];
-    if (q < 0)
-        return 0;
-
-    if (ops[(unsigned)q].kind == G_INC16 ||
-        ops[(unsigned)q].kind == G_DEC16) {
-        if (!g_prepare_nlm_index(ops, n, in_prod, in_clob, (unsigned)q))
-            return 0;
-        memset(&p->branch_recipe, 0, sizeof(p->branch_recipe));
-        p->branch_recipe.kind = GR_PRESERVE;
-        p->arm_cond = 0xffu;
-        p->nlm = 1u;
-        return 1;
-    }
-
-    if (g_nlm_lazy_op(&ops[(unsigned)q]) >= 0) {
-        if (!g_prepare_nlm_index(ops, n, in_prod, in_clob, (unsigned)q))
-            return 0;
-        memset(&rr, 0, sizeof(rr));
-        rr.kind = (uint8_t)g_nlm_branch_kind(&ops[(unsigned)q]);
-        cond = g_cond_for(rr.kind, 2u);
-        if (cond < 0)
-            return 0;
-        p->branch_recipe = rr;
-        p->arm_cond = (uint8_t)cond;
-        p->nlm = 1u;
-        return 1;
-    }
-
-    if (((uint8_t)(in_clob[idx] | g_write_mask(p)) &
-         g_required_mask(&ops[(unsigned)q])) != 0u)
-        return 0;
-    if (!g_recipe_from_producer(&ops[(unsigned)q], &rr))
-        return 0;
-    cond = g_cond_for(rr.kind, 2u);
-    if (cond < 0)
-        return 0;
-    p->branch_recipe = rr;
-    p->arm_cond = (uint8_t)cond;
-    p->nlm = 1u;
-    return 1;
-}
-
-static int g_mark_pset_nlm(GOp *ops, unsigned n,
-                           const int16_t *in_prod,
-                           const uint8_t *in_clob,
-                           uint64_t pset)
-{
-    unsigned i;
-    for (i = 0u; i < n; ++i) {
-        if ((pset & (UINT64_C(1) << i)) != 0u &&
-            !g_prepare_nlm_index(ops, n, in_prod, in_clob, i))
-            return 0;
-    }
-    return 1;
-}
-
-static int g_carried_ok(GOp *ops, unsigned n,
-                        const int16_t *in_prod,
-                        const uint64_t *in_pset,
-                        const uint8_t *in_entry,
-                        const uint8_t *in_clob)
-{
+    /* FLAGS at the root on iteration >= 2 are the latch producer's. */
     const int pl = in_prod[n - 1u];
-
-    (void)in_entry;
-
-    if (pl == -2)
-        return 0;
-    if (pl == -1)
+    if (pl < 0)
+        return 1;                 /* no producer reaches the latch: entry FLAGS */
+    if (ops[pl].nlm)
         return 1;
-    if (pl == -3)
-        return g_mark_pset_nlm(
-            ops, n, in_prod, in_clob, in_pset[n - 1u]);
-
-    return g_prepare_nlm_index(
-        ops, n, in_prod, in_clob, (unsigned)pl);
+    if (g_nlm_lazy_op(&ops[pl]) < 0)
+        return 0;
+    ops[pl].nlm = 1u;
+    return 1;
 }
 
-static int g_exit_flags(GOp *ops, unsigned n,
-                        const int16_t *in_prod,
-                        const uint64_t *in_pset,
-                        const uint8_t *in_entry,
-                        const uint8_t *in_clob,
-                        int any_producer, int pi,
-                        uint64_t pset, uint8_t has_entry,
-                        uint8_t clob, GRecipe *r)
+static int g_exit_flags(GOp *ops, unsigned n, const int16_t *in_prod,
+                        int any_producer, int pi, uint8_t clob, GRecipe *r)
 {
     GOp *p;
 
     memset(r, 0, sizeof(*r));
     r->kind = GR_PRESERVE;
 
-    if (pi == -3) {
-        if (!g_mark_pset_nlm(ops, n, in_prod, in_clob, pset))
-            return 0;
-        if (has_entry &&
-            !g_carried_ok(ops, n, in_prod, in_pset, in_entry, in_clob))
-            return 0;
-        return 1;
-    }
-
     if (pi < 0) {
-        return !any_producer ||
-            g_carried_ok(ops, n, in_prod, in_pset, in_entry, in_clob);
+        /* Iteration 1: entry FLAGS (cpu untouched). Later iterations: the
+           latch producer's state, which must therefore be in cpu. */
+        return !any_producer || g_carried_ok(ops, n, in_prod);
     }
 
     p = &ops[(unsigned)pi];
@@ -2561,62 +2213,48 @@ static int g_exit_flags(GOp *ops, unsigned n,
     if ((clob & g_required_mask(p)) == 0u && g_recipe_from_producer(p, r)) {
         if (r->kind != GR_INC16 && r->kind != GR_DEC16)
             return 1;
-
+        /* INC/DEC keep the incoming CF: the C recipe reads it from cpu, so
+           whatever produced that CF must be in cpu at the exit. */
         {
             int q = in_prod[(unsigned)pi];
             unsigned hops = 0u;
-            while (q >= 0 &&
-                   (ops[(unsigned)q].kind == G_INC16 ||
-                    ops[(unsigned)q].kind == G_DEC16) &&
+            /* INC/DEC preserve CF: walk back to the producer that wrote it. */
+            while (q >= 0 && (ops[q].kind == G_INC16 || ops[q].kind == G_DEC16) &&
                    hops++ < n)
                 q = in_prod[(unsigned)q];
-
             if (q < 0) {
                 unsigned k;
                 int cf_writer = 0;
                 for (k = 0u; k < n; ++k)
-                    if (g_is_producer(&ops[k]) &&
-                        ops[k].kind != G_INC16 &&
+                    if (g_is_producer(&ops[k]) && ops[k].kind != G_INC16 &&
                         ops[k].kind != G_DEC16)
                         cf_writer = 1;
-                if (!cf_writer)
-                    return 1;
-                return g_carried_ok(
-                    ops, n, in_prod, in_pset, in_entry, in_clob);
+                if (!cf_writer) return 1;      /* CF invariant = entry */
+                return g_carried_ok(ops, n, in_prod);
             }
-
-            if (!g_prepare_nlm_index(
-                    ops, n, in_prod, in_clob, (unsigned)q))
-                return 0;
+            if (ops[q].nlm) return 1;
+            if (g_nlm_lazy_op(&ops[q]) < 0) return 0;
+            ops[q].nlm = 1u;
             return 1;
         }
     }
 
-    if (!g_prepare_nlm_index(
-            ops, n, in_prod, in_clob, (unsigned)pi))
+    /* Register recipe impossible (memory operand) or clobbered: NLM. */
+    if (g_nlm_lazy_op(p) < 0)
         return 0;
-
+    p->nlm = 1u;
     memset(r, 0, sizeof(*r));
     r->kind = GR_PRESERVE;
     return 1;
 }
 
 static int g_add_exit_g2b1(GMeta *m, GOp *ops, unsigned n,
-                           const int16_t *in_prod,
-                           const uint64_t *in_pset,
-                           const uint8_t *in_entry,
-                           const uint8_t *in_clob,
-                           int any_producer,
-                           uint16_t ip, int pi,
-                           uint64_t pset, uint8_t has_entry,
-                           uint8_t clob, uint8_t *tag_out)
+                           const int16_t *in_prod, int any_producer,
+                           uint16_t ip, int pi, uint8_t clob, uint8_t *tag_out)
 {
     GRecipe r;
-    if (m->exit_count >= NV2G_MAX_EXITS)
-        return 0;
-    if (!g_exit_flags(ops, n, in_prod, in_pset, in_entry, in_clob,
-                      any_producer, pi, pset, has_entry, clob, &r))
-        return 0;
+    if (m->exit_count >= NV2G_MAX_EXITS) return 0;
+    if (!g_exit_flags(ops, n, in_prod, any_producer, pi, clob, &r)) return 0;
     r.ip = ip;
     m->exits[m->exit_count] = r;
     *tag_out = m->exit_count++;
@@ -2636,8 +2274,6 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
 {
     GOp ops[NV2G_MAX_OPS];
     int16_t in_prod[NV2G_MAX_OPS];
-    uint64_t in_pset[NV2G_MAX_OPS];
-    uint8_t in_entry[NV2G_MAX_OPS];
     uint8_t in_clob[NV2G_MAX_OPS];
     GMeta m;
     unsigned n = 0u, i;
@@ -2648,7 +2284,7 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
     ++g_nv2g_stats.attempts;
 
     if (image == NULL || out == NULL || guest_size_out == NULL ||
-        max_size < 2u || max_size > 128u) {
+        max_size < 2u || max_size > 64u) {
         ++g_nv2g_stats.reject_bad_argument;
         return MD_NATIVE_V2_BAD_ARGUMENT;
     }
@@ -2662,7 +2298,7 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
         MdDecodedInstruction d;
         const size_t used = (size_t)(uint16_t)(ip - entry_ip);
 
-        if (used >= (max_size > 64u ? 64u : max_size)) {
+        if (used >= max_size) {
             ++g_nv2g_stats.reject_region;
             return MD_NATIVE_V2_UNSUPPORTED;
         }
@@ -2671,126 +2307,6 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
             ++g_nv2g_stats.reject_decode;
             return MD_NATIVE_V2_DECODE_ERROR;
         }
-        /*
-         * G-2C: inline one bounded static near-CALL leaf into the natural-loop
-         * op graph.
-         */
-        if (d.flow == MD_DECODE_FLOW_CALL &&
-            d.opcode == 0xE8u &&
-            d.prefix_count == 0u &&
-            !d.far_control &&
-            !m.has_local_call) {
-            uint16_t lip;
-            unsigned leaf_ops = 0u;
-            int got_ret = 0;
-            const size_t call_off =
-                (size_t)(uint16_t)(d.target - entry_ip);
-
-            if (d.target <= d.next_ip ||
-                call_off >= max_size ||
-                n + 3u >= NV2G_MAX_OPS) {
-                ++g_nv2g_stats.reject_control;
-                ++g_nv2g_stats.reject_control_call;
-                ++g_nv2g_stats.reject_control_opcode[d.opcode];
-                return MD_NATIVE_V2_UNSUPPORTED;
-            }
-
-            memset(&ops[n], 0, sizeof(ops[n]));
-            ops[n].kind = G_CALL16;
-            ops[n].ip = d.ip;
-            ops[n].next_ip = d.next_ip;
-            ops[n].target = d.target;
-            ops[n].imm = d.next_ip;
-            ops[n].width = 16u;
-            ops[n].guard_tag = 0xffu;
-            ++n;
-
-            m.has_local_call = 1u;
-            m.call_ip = d.target;
-            m.call_return_ip = d.next_ip;
-            m.needs_memory = 1u;
-            m.has_store = 1u;
-            m.uses_ss_word = 1u;
-
-            lip = d.target;
-            while (n < NV2G_MAX_OPS && leaf_ops < 24u) {
-                MdDecodedInstruction ld;
-                GOp lo;
-
-                if (!md_decode_8086(image, max_size, entry_ip, lip, &ld) ||
-                    !ld.valid_8086 ||
-                    ld.prefix_count != 0u ||
-                    ld.far_control) {
-                    break;
-                }
-
-                if (ld.flow == MD_DECODE_FLOW_RETURN && ld.opcode == 0xC3u) {
-                    memset(&ops[n], 0, sizeof(ops[n]));
-                    ops[n].kind = G_RET16;
-                    ops[n].ip = ld.ip;
-                    ops[n].next_ip = d.next_ip;
-                    ops[n].target = d.next_ip;
-                    ops[n].width = 16u;
-                    ops[n].guard_tag = 0xffu;
-                    ++n;
-                    m.call_len = (uint8_t)(uint16_t)(ld.next_ip - d.target);
-                    got_ret = 1;
-                    break;
-                }
-
-                if (ld.flow == MD_DECODE_FLOW_CALL ||
-                    ld.flow == MD_DECODE_FLOW_INDIRECT_CALL ||
-                    ld.flow == MD_DECODE_FLOW_INDIRECT_JUMP ||
-                    ld.flow == MD_DECODE_FLOW_JUMP ||
-                    ld.flow == MD_DECODE_FLOW_CONDITIONAL ||
-                    ld.flow == MD_DECODE_FLOW_RETURN ||
-                    ld.flow == MD_DECODE_FLOW_STOP ||
-                    !g_decode_op(image, max_size, entry_ip, &ld, &lo) ||
-                    !g_leaf_op_ok(&lo)) {
-                    break;
-                }
-
-                ops[n] = lo;
-                if (g_is_producer(&ops[n]))
-                    any_producer = 1;
-
-                if (ops[n].kind == G_LOAD16 ||
-                    ops[n].kind == G_LOAD8 ||
-                    ops[n].kind == G_LODS16 ||
-                    ops[n].kind == G_LODS8 ||
-                    ops[n].kind == G_ALU16_RM ||
-                    ops[n].kind == G_ALU8_RM)
-                    m.needs_memory = 1u;
-
-                if ((ops[n].kind == G_LOAD16 ||
-                     ops[n].kind == G_ALU16_RM) &&
-                    ops[n].mem.uses_ss)
-                    m.uses_ss_word = 1u;
-                else if (ops[n].kind == G_LOAD16 ||
-                         ops[n].kind == G_ALU16_RM ||
-                         ops[n].kind == G_LODS16)
-                    m.uses_ds_word = 1u;
-
-                if (ops[n].kind == G_LODS16 ||
-                    ops[n].kind == G_LODS8)
-                    m.requires_df_clear = 1u;
-
-                ++n;
-                ++leaf_ops;
-                lip = ld.next_ip;
-            }
-
-            if (!got_ret || m.call_len == 0u) {
-                ++g_nv2g_stats.reject_control;
-                ++g_nv2g_stats.reject_control_call;
-                ++g_nv2g_stats.reject_control_opcode[d.opcode];
-                return MD_NATIVE_V2_UNSUPPORTED;
-            }
-
-            ip = d.next_ip;
-            continue;
-        }
-
         if (d.prefix_count != 0u || d.far_control ||
             d.flow == MD_DECODE_FLOW_CALL ||
             d.flow == MD_DECODE_FLOW_INDIRECT_CALL ||
@@ -2888,31 +2404,6 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
         return MD_NATIVE_V2_UNSUPPORTED;
     }
 
-
-    if (m.has_local_call) {
-        unsigned k;
-        const uint16_t call_end =
-            (uint16_t)(m.call_ip + (uint16_t)m.call_len);
-        const size_t caller_len =
-            (size_t)(uint16_t)(end_ip - entry_ip);
-
-        if (m.call_ip < end_ip ||
-            call_end < m.call_ip ||
-            caller_len + (size_t)m.call_len > 64u) {
-            ++g_nv2g_stats.reject_cfg;
-            return MD_NATIVE_V2_UNSUPPORTED;
-        }
-
-        for (k = 0u; k < n; ++k) {
-            if (ops[k].kind != G_CALL16 &&
-                ops[k].kind != G_RET16 &&
-                (g_write_mask(&ops[k]) & (1u << MD_X86_SP)) != 0u) {
-                ++g_nv2g_stats.reject_cfg;
-                return MD_NATIVE_V2_UNSUPPORTED;
-            }
-        }
-    }
-
     /* Classify internal CFG edges vs architectural side exits. */
     for (i = 0u; i < n; ++i) {
         if (ops[i].kind == G_JCC || ops[i].kind == G_JCXZ ||
@@ -2929,7 +2420,7 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
         }
     }
 
-    if (!g_flag_dataflow(ops, n, in_prod, in_pset, in_entry, in_clob)) {
+    if (!g_flag_dataflow(ops, n, in_prod, in_clob)) {
         ++g_nv2g_stats.reject_flags;
         return MD_NATIVE_V2_UNSUPPORTED;
     }
@@ -2978,152 +2469,6 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
     }
 
     /*
-     * G-2B2 selective exit-pressure hoisting.
-     *
-     * Preserve the established G-2A/G-2B guard timing whenever the region
-     * already fits the eight architectural-exit slots. Only when admission
-     * would otherwise overflow that limit do we hoist additional invariant
-     * guards to the loop header.
-     *
-     * First retain the original G-2B0 rule for guards before the current
-     * iteration's first FLAGS producer. Then count projected exit slots.
-     * If relief is required, prefer read guards before store guards so the
-     * original pre-store side-exit behaviour remains unchanged whenever
-     * possible.
-     */
-    {
-        unsigned projected_exits =
-            ops[n - 1u].kind != G_JMP ? 1u : 0u;
-        unsigned pass;
-
-        /* Every external control edge consumes one architectural exit. */
-        for (i = 0u; i < n; ++i) {
-            if (ops[i].external)
-                ++projected_exits;
-        }
-
-        /*
-         * Count guarded accesses after applying the original G-2B0 hoist
-         * policy.
-         */
-        for (i = 0u; i < n; ++i) {
-            const int guarded =
-                ops[i].kind == G_LOAD16 ||
-                ops[i].kind == G_ALU16_RM ||
-                ops[i].kind == G_STORE16 ||
-                ops[i].kind == G_STORE8 ||
-                ops[i].kind == G_LODS16 ||
-                ops[i].kind == G_STOS16 ||
-                ops[i].kind == G_STOS8 ||
-                ops[i].kind == G_PUSH16 ||
-                ops[i].kind == G_POP16;
-
-            if (!guarded)
-                continue;
-
-            if (in_prod[i] < 0 &&
-                any_producer &&
-                g_guard_hoistable(ops, i)) {
-                ops[i].hoisted = 1u;
-                ++g_nv2g_stats.hoisted_guards;
-            }
-
-            if (!ops[i].hoisted)
-                ++projected_exits;
-        }
-
-        /*
-         * G-2B2 merged-state guard priority.
-         *
-         * Once a region is already under exit pressure, prefer hoisting a
-         * guard whose incoming FLAGS state is a producer-set merge. Keeping
-         * such a guard inline would force every possible incoming producer
-         * to materialize NLM solely for that pre-instruction exit.
-         *
-         * This is deliberately pressure-only, so established small G-2A
-         * regions retain their exact inline side-exit timing.
-         */
-        if (projected_exits > NV2G_MAX_EXITS) {
-            for (i = 0u; i < n; ++i) {
-                const int guarded =
-                    ops[i].kind == G_LOAD16 ||
-                    ops[i].kind == G_ALU16_RM ||
-                    ops[i].kind == G_STORE16 ||
-                    ops[i].kind == G_STORE8 ||
-                    ops[i].kind == G_LODS16 ||
-                    ops[i].kind == G_STOS16 ||
-                    ops[i].kind == G_STOS8 ||
-                    ops[i].kind == G_PUSH16 ||
-                    ops[i].kind == G_POP16;
-
-                if (!guarded ||
-                    ops[i].hoisted ||
-                    in_prod[i] != -3 ||
-                    !g_guard_hoistable(ops, i))
-                    continue;
-
-                ops[i].hoisted = 1u;
-                ++g_nv2g_stats.hoisted_guards;
-
-                if (projected_exits != 0u)
-                    --projected_exits;
-            }
-        }
-
-        /*
-         * A large real loop may still exceed NV2G_MAX_EXITS. Hoist only
-         * enough additional invariant guards to fit.
-         *
-         * pass 0: loads/read guards first
-         * pass 1: stores only if still necessary
-         */
-        for (pass = 0u;
-             pass < 2u && projected_exits > NV2G_MAX_EXITS;
-             ++pass) {
-
-            for (i = 0u;
-                 i < n && projected_exits > NV2G_MAX_EXITS;
-                 ++i) {
-
-                const int guarded =
-                    ops[i].kind == G_LOAD16 ||
-                    ops[i].kind == G_ALU16_RM ||
-                    ops[i].kind == G_STORE16 ||
-                    ops[i].kind == G_STORE8 ||
-                    ops[i].kind == G_LODS16 ||
-                    ops[i].kind == G_STOS16 ||
-                    ops[i].kind == G_STOS8 ||
-                    ops[i].kind == G_PUSH16 ||
-                    ops[i].kind == G_POP16;
-
-                const int store_guard =
-                    ops[i].kind == G_STORE16 ||
-                    ops[i].kind == G_STORE8 ||
-                    ops[i].kind == G_STOS16 ||
-                    ops[i].kind == G_STOS8 ||
-                    ops[i].kind == G_PUSH16;
-
-                if (!guarded ||
-                    ops[i].hoisted ||
-                    !g_guard_hoistable(ops, i))
-                    continue;
-
-                if (pass == 0u && store_guard)
-                    continue;
-
-                ops[i].hoisted = 1u;
-                ++g_nv2g_stats.hoisted_guards;
-                --projected_exits;
-            }
-        }
-
-        if (projected_exits > NV2G_MAX_EXITS) {
-            ++g_nv2g_stats.reject_exits;
-            return MD_NATIVE_V2_UNSUPPORTED;
-        }
-    }
-
-    /*
      * Allocate exact exit recipes (G-2B1 policy, see g_exit_flags):
      * register recipe when exact; otherwise the producer becomes NLM and the
      * exit preserves cpu FLAGS. Pre-instruction guards ahead of the
@@ -3146,10 +2491,8 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
                 for (k = 0u; k < n; ++k) w |= g_write_mask(&ops[k]);
                 if ((w & (1u << MD_X86_CX)) == 0u) any = 0;
             }
-            if (!g_add_exit_g2b1(&m, ops, n, in_prod,
-                                 in_pset, in_entry, in_clob, any,
-                                 ops[i].target, in_prod[i],
-                                 in_pset[i], in_entry[i], clob, &tag)) {
+            if (!g_add_exit_g2b1(&m, ops, n, in_prod, any,
+                                 ops[i].target, in_prod[i], clob, &tag)) {
                 ++g_nv2g_stats.reject_exits;
                 return MD_NATIVE_V2_UNSUPPORTED;
             }
@@ -3163,15 +2506,12 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
             ops[i].kind == G_PUSH16 || ops[i].kind == G_POP16) {
             uint8_t tag;
 
-            if (ops[i].hoisted) {
-                /* Proven and selected by the exit-pressure prepass below. */
+            if (in_prod[i] < 0 && any_producer && g_guard_hoistable(ops, i)) {
+                ops[i].hoisted = 1u;
+                ++g_nv2g_stats.hoisted_guards;
             } else {
-                if (!g_add_exit_g2b1(&m, ops, n, in_prod,
-                                     in_pset, in_entry, in_clob,
-                                     any_producer,
-                                     ops[i].ip, in_prod[i],
-                                     in_pset[i], in_entry[i],
-                                     in_clob[i], &tag)) {
+                if (!g_add_exit_g2b1(&m, ops, n, in_prod, any_producer,
+                                     ops[i].ip, in_prod[i], in_clob[i], &tag)) {
                     ++g_nv2g_stats.reject_memory;
                     return MD_NATIVE_V2_UNSUPPORTED;
                 }
@@ -3205,11 +2545,8 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
 
         if (ops[li].kind != G_JMP) {
             uint8_t tag;
-            if (!g_add_exit_g2b1(&m, ops, n, in_prod,
-                                 in_pset, in_entry, in_clob,
-                                 any_producer,
-                                 end_ip, in_prod[li],
-                                 in_pset[li], in_entry[li], clob, &tag)) {
+            if (!g_add_exit_g2b1(&m, ops, n, in_prod, any_producer,
+                                 end_ip, in_prod[li], clob, &tag)) {
                 ++g_nv2g_stats.reject_exits;
                 return MD_NATIVE_V2_UNSUPPORTED;
             }
@@ -3217,10 +2554,7 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
         }
 
         /* Budget exit occurs at the next loop header, after a full iteration. */
-        if (!g_exit_flags(ops, n, in_prod,
-                          in_pset, in_entry, in_clob,
-                          any_producer, in_prod[li],
-                          in_pset[li], in_entry[li], clob,
+        if (!g_exit_flags(ops, n, in_prod, any_producer, in_prod[li], clob,
                           &m.budget)) {
             ++g_nv2g_stats.reject_flags;
             return MD_NATIVE_V2_UNSUPPORTED;
@@ -3259,34 +2593,6 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
     out->needs_memory = m.needs_memory;
     ++g_nv2g_stats.compiles;
     return MD_NATIVE_V2_OK;
-}
-
-
-#define NV2G_GRAPH_WINDOW 128u
-
-MdNativeV2Status md_native_v2g_compile_loop_graph(const uint8_t *memory,
-                                                   uint16_t cs,
-                                                   uint16_t entry_ip,
-                                                   MdNativeV2Code *out,
-                                                   size_t *guest_size_out)
-{
-    uint8_t image[NV2G_GRAPH_WINDOW];
-    size_t n = NV2G_GRAPH_WINDOW;
-    size_t i;
-
-    if (memory == NULL || out == NULL || guest_size_out == NULL)
-        return MD_NATIVE_V2_BAD_ARGUMENT;
-
-    if (n > (size_t)(0x10000u - entry_ip))
-        n = (size_t)(0x10000u - entry_ip);
-    if (n < 2u)
-        return MD_NATIVE_V2_UNSUPPORTED;
-
-    for (i = 0u; i < n; ++i)
-        image[i] = memory[md_x86_linear(cs, (uint16_t)(entry_ip + i))];
-
-    return md_native_v2g_compile_loop(
-        image, n, entry_ip, out, guest_size_out);
 }
 
 /* -------------------------------------------------------------------------
@@ -3365,49 +2671,11 @@ uint32_t MD_HOT_FUNC(md_native_v2g_execute)(MdX86 *cpu,
     const GMeta *m;
     uint32_t rc,remaining,tag,code_start;
     uintptr_t entry;
-    unsigned gi;
     if(!cpu||!code||!md_native_v2g_is_code(code)||code->size==0u||budget==0u||budget>0x00ffffffu)return MD_NATIVE_V2_EXEC_FALLBACK;
     if(code->needs_memory&&!cpu->memory)return MD_NATIVE_V2_EXEC_FALLBACK;
     if(code->requires_safe_ds_word&&cpu->ds>0xefffu)return MD_NATIVE_V2_EXEC_FALLBACK;
     if(code->requires_safe_ss_word&&cpu->ss>0xefffu)return MD_NATIVE_V2_EXEC_FALLBACK;
     m=(const GMeta *)code->g_meta;
-
-    if (code->local_call_graph) {
-        const unsigned depth = code->call_stack_bytes;
-        uint16_t low_sp;
-        uint32_t data_start, data_end;
-
-        if (depth != 2u ||
-            code->guest_span_count != 2u ||
-            cpu->ss > 0xefffu ||
-            cpu->r[MD_X86_SP] < depth)
-            return MD_NATIVE_V2_EXEC_FALLBACK;
-
-        low_sp = (uint16_t)(cpu->r[MD_X86_SP] - depth);
-        data_start = md_x86_linear(cpu->ss, low_sp);
-        data_end = data_start + depth - 1u;
-        if (data_end >= MD_X86_ADDRESS_SPACE)
-            return MD_NATIVE_V2_EXEC_FALLBACK;
-
-        for (gi = 0u; gi < code->guest_span_count; ++gi) {
-            const uint32_t cs =
-                md_x86_linear(cpu->cs, code->guest_span_ip[gi]);
-            const unsigned len = code->guest_span_len[gi];
-            const uint32_t ce = cs + len - 1u;
-            if (len == 0u || ce >= MD_X86_ADDRESS_SPACE ||
-                !(data_end < cs || data_start > ce))
-                return MD_NATIVE_V2_EXEC_FALLBACK;
-        }
-
-        if (cpu->code_page_executable != NULL) {
-            const unsigned p0 = data_start >> MD_X86_CODE_PAGE_SHIFT;
-            const unsigned p1 = data_end >> MD_X86_CODE_PAGE_SHIFT;
-            if (cpu->code_page_executable[p0] != 0u ||
-                cpu->code_page_executable[p1] != 0u)
-                return MD_NATIVE_V2_EXEC_FALLBACK;
-        }
-    }
-
     if(m->uses_es_word&&cpu->es>0xefffu)return MD_NATIVE_V2_EXEC_FALLBACK;
     if(m->requires_df_clear&&(cpu->flags_raw&MD_X86_FLAG_DF)!=0u)
         return MD_NATIVE_V2_EXEC_FALLBACK;

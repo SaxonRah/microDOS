@@ -1842,12 +1842,7 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
 
     memset(out, 0, sizeof(*out));
     b.p = out->bytes;
-    /*
-     * TEMP RP2350 isolation:
-     * physical MdNativeV2Code remains 2 KiB, but NV2-G emission retains
-     * the old 1 KiB capacity/layout decision.
-     */
-    b.cap = 1024u;
+    b.cap = sizeof(out->bytes);
     b.at = 0u;
     b.failed = 0;
 
@@ -2978,152 +2973,6 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
     }
 
     /*
-     * G-2B2 selective exit-pressure hoisting.
-     *
-     * Preserve the established G-2A/G-2B guard timing whenever the region
-     * already fits the eight architectural-exit slots. Only when admission
-     * would otherwise overflow that limit do we hoist additional invariant
-     * guards to the loop header.
-     *
-     * First retain the original G-2B0 rule for guards before the current
-     * iteration's first FLAGS producer. Then count projected exit slots.
-     * If relief is required, prefer read guards before store guards so the
-     * original pre-store side-exit behaviour remains unchanged whenever
-     * possible.
-     */
-    {
-        unsigned projected_exits =
-            ops[n - 1u].kind != G_JMP ? 1u : 0u;
-        unsigned pass;
-
-        /* Every external control edge consumes one architectural exit. */
-        for (i = 0u; i < n; ++i) {
-            if (ops[i].external)
-                ++projected_exits;
-        }
-
-        /*
-         * Count guarded accesses after applying the original G-2B0 hoist
-         * policy.
-         */
-        for (i = 0u; i < n; ++i) {
-            const int guarded =
-                ops[i].kind == G_LOAD16 ||
-                ops[i].kind == G_ALU16_RM ||
-                ops[i].kind == G_STORE16 ||
-                ops[i].kind == G_STORE8 ||
-                ops[i].kind == G_LODS16 ||
-                ops[i].kind == G_STOS16 ||
-                ops[i].kind == G_STOS8 ||
-                ops[i].kind == G_PUSH16 ||
-                ops[i].kind == G_POP16;
-
-            if (!guarded)
-                continue;
-
-            if (in_prod[i] < 0 &&
-                any_producer &&
-                g_guard_hoistable(ops, i)) {
-                ops[i].hoisted = 1u;
-                ++g_nv2g_stats.hoisted_guards;
-            }
-
-            if (!ops[i].hoisted)
-                ++projected_exits;
-        }
-
-        /*
-         * G-2B2 merged-state guard priority.
-         *
-         * Once a region is already under exit pressure, prefer hoisting a
-         * guard whose incoming FLAGS state is a producer-set merge. Keeping
-         * such a guard inline would force every possible incoming producer
-         * to materialize NLM solely for that pre-instruction exit.
-         *
-         * This is deliberately pressure-only, so established small G-2A
-         * regions retain their exact inline side-exit timing.
-         */
-        if (projected_exits > NV2G_MAX_EXITS) {
-            for (i = 0u; i < n; ++i) {
-                const int guarded =
-                    ops[i].kind == G_LOAD16 ||
-                    ops[i].kind == G_ALU16_RM ||
-                    ops[i].kind == G_STORE16 ||
-                    ops[i].kind == G_STORE8 ||
-                    ops[i].kind == G_LODS16 ||
-                    ops[i].kind == G_STOS16 ||
-                    ops[i].kind == G_STOS8 ||
-                    ops[i].kind == G_PUSH16 ||
-                    ops[i].kind == G_POP16;
-
-                if (!guarded ||
-                    ops[i].hoisted ||
-                    in_prod[i] != -3 ||
-                    !g_guard_hoistable(ops, i))
-                    continue;
-
-                ops[i].hoisted = 1u;
-                ++g_nv2g_stats.hoisted_guards;
-
-                if (projected_exits != 0u)
-                    --projected_exits;
-            }
-        }
-
-        /*
-         * A large real loop may still exceed NV2G_MAX_EXITS. Hoist only
-         * enough additional invariant guards to fit.
-         *
-         * pass 0: loads/read guards first
-         * pass 1: stores only if still necessary
-         */
-        for (pass = 0u;
-             pass < 2u && projected_exits > NV2G_MAX_EXITS;
-             ++pass) {
-
-            for (i = 0u;
-                 i < n && projected_exits > NV2G_MAX_EXITS;
-                 ++i) {
-
-                const int guarded =
-                    ops[i].kind == G_LOAD16 ||
-                    ops[i].kind == G_ALU16_RM ||
-                    ops[i].kind == G_STORE16 ||
-                    ops[i].kind == G_STORE8 ||
-                    ops[i].kind == G_LODS16 ||
-                    ops[i].kind == G_STOS16 ||
-                    ops[i].kind == G_STOS8 ||
-                    ops[i].kind == G_PUSH16 ||
-                    ops[i].kind == G_POP16;
-
-                const int store_guard =
-                    ops[i].kind == G_STORE16 ||
-                    ops[i].kind == G_STORE8 ||
-                    ops[i].kind == G_STOS16 ||
-                    ops[i].kind == G_STOS8 ||
-                    ops[i].kind == G_PUSH16;
-
-                if (!guarded ||
-                    ops[i].hoisted ||
-                    !g_guard_hoistable(ops, i))
-                    continue;
-
-                if (pass == 0u && store_guard)
-                    continue;
-
-                ops[i].hoisted = 1u;
-                ++g_nv2g_stats.hoisted_guards;
-                --projected_exits;
-            }
-        }
-
-        if (projected_exits > NV2G_MAX_EXITS) {
-            ++g_nv2g_stats.reject_exits;
-            return MD_NATIVE_V2_UNSUPPORTED;
-        }
-    }
-
-    /*
      * Allocate exact exit recipes (G-2B1 policy, see g_exit_flags):
      * register recipe when exact; otherwise the producer becomes NLM and the
      * exit preserves cpu FLAGS. Pre-instruction guards ahead of the
@@ -3163,8 +3012,9 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
             ops[i].kind == G_PUSH16 || ops[i].kind == G_POP16) {
             uint8_t tag;
 
-            if (ops[i].hoisted) {
-                /* Proven and selected by the exit-pressure prepass below. */
+            if (g_guard_hoistable(ops, i)) {
+                ops[i].hoisted = 1u;
+                ++g_nv2g_stats.hoisted_guards;
             } else {
                 if (!g_add_exit_g2b1(&m, ops, n, in_prod,
                                      in_pset, in_entry, in_clob,

@@ -1842,12 +1842,7 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
 
     memset(out, 0, sizeof(*out));
     b.p = out->bytes;
-    /*
-     * TEMP RP2350 isolation:
-     * physical MdNativeV2Code remains 2 KiB, but NV2-G emission retains
-     * the old 1 KiB capacity/layout decision.
-     */
-    b.cap = 1024u;
+    b.cap = sizeof(out->bytes);
     b.at = 0u;
     b.failed = 0;
 
@@ -3030,44 +3025,6 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
 
             if (!ops[i].hoisted)
                 ++projected_exits;
-        }
-
-        /*
-         * G-2B2 merged-state guard priority.
-         *
-         * Once a region is already under exit pressure, prefer hoisting a
-         * guard whose incoming FLAGS state is a producer-set merge. Keeping
-         * such a guard inline would force every possible incoming producer
-         * to materialize NLM solely for that pre-instruction exit.
-         *
-         * This is deliberately pressure-only, so established small G-2A
-         * regions retain their exact inline side-exit timing.
-         */
-        if (projected_exits > NV2G_MAX_EXITS) {
-            for (i = 0u; i < n; ++i) {
-                const int guarded =
-                    ops[i].kind == G_LOAD16 ||
-                    ops[i].kind == G_ALU16_RM ||
-                    ops[i].kind == G_STORE16 ||
-                    ops[i].kind == G_STORE8 ||
-                    ops[i].kind == G_LODS16 ||
-                    ops[i].kind == G_STOS16 ||
-                    ops[i].kind == G_STOS8 ||
-                    ops[i].kind == G_PUSH16 ||
-                    ops[i].kind == G_POP16;
-
-                if (!guarded ||
-                    ops[i].hoisted ||
-                    in_prod[i] != -3 ||
-                    !g_guard_hoistable(ops, i))
-                    continue;
-
-                ops[i].hoisted = 1u;
-                ++g_nv2g_stats.hoisted_guards;
-
-                if (projected_exits != 0u)
-                    --projected_exits;
-            }
         }
 
         /*

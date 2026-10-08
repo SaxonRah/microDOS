@@ -337,7 +337,7 @@ bool MD_HOT_FUNC(md_native_v2_runtime_try_execute)(MdNativeV2Runtime *runtime,
     ++runtime->probes;
 
     {
-        static MdNativeV2Code code;
+        MdNativeV2Code code;
         MdNativeV2Status st;
         size_t guest_size = 0u;
         uint8_t counter_reg = 0xFFu;
@@ -369,14 +369,13 @@ bool MD_HOT_FUNC(md_native_v2_runtime_try_execute)(MdNativeV2Runtime *runtime,
 
 #if defined(MICRODOS_ENABLE_NATIVE_V2G)
         if (st != MD_NATIVE_V2_OK) {
-            st = md_native_v2g_compile_loop_graph(
-                cpu->memory, cpu->cs, candidate_ip,
+            st = md_native_v2g_compile_loop(
+                guest, window, candidate_ip,
                 &code, &guest_size);
             if (st == MD_NATIVE_V2_OK)
                 counter_reg = 0xFFu;
         }
 #endif
-
 
         if (st != MD_NATIVE_V2_OK ||
             guest_size == 0u ||

@@ -1842,12 +1842,7 @@ static MdNativeV2Status g_emit(GOp *ops, unsigned n, uint16_t entry_ip,
 
     memset(out, 0, sizeof(*out));
     b.p = out->bytes;
-    /*
-     * TEMP RP2350 isolation:
-     * physical MdNativeV2Code remains 2 KiB, but NV2-G emission retains
-     * the old 1 KiB capacity/layout decision.
-     */
-    b.cap = 1024u;
+    b.cap = sizeof(out->bytes);
     b.at = 0u;
     b.failed = 0;
 

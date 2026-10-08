@@ -377,7 +377,6 @@ bool MD_HOT_FUNC(md_native_v2_runtime_try_execute)(MdNativeV2Runtime *runtime,
         }
 #endif
 
-
         if (st != MD_NATIVE_V2_OK ||
             guest_size == 0u ||
             guest_size > MD_NATIVE_V2_RT_MAX_GUEST_BYTES ||

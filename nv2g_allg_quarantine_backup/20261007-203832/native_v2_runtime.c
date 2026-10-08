@@ -377,6 +377,22 @@ bool MD_HOT_FUNC(md_native_v2_runtime_try_execute)(MdNativeV2Runtime *runtime,
         }
 #endif
 
+#if defined(MICRODOS_ENABLE_NATIVE_V2G)
+        /*
+         * TEMP G-2B2 hardware A/B probe.
+         *
+         * Keep the 2 KiB runtime/cache layout unchanged, but refuse
+         * execution of newly admitted NV2-G regions above the old
+         * 1 KiB production ceiling. This distinguishes a large-region
+         * execution bug from stack/SRAM/cache-layout effects.
+         */
+        if (st == MD_NATIVE_V2_OK &&
+            code.phase == 17u &&
+            code.dynamic_retire == 3u &&
+            code.size > 1024u) {
+            st = MD_NATIVE_V2_TOO_LARGE;
+        }
+#endif
 
         if (st != MD_NATIVE_V2_OK ||
             guest_size == 0u ||

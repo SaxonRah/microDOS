@@ -53,27 +53,13 @@ extern "C" {
  *     used only when the normal layout overflows the code buffer; execute
  *     refuses such code when a code-page tracker is present.
  *
-
- *
- * G-2B2:
- *   - path-dependent FLAGS merges are accepted for architectural exits when
- *     every possible producer can write exact canonical lazy state;
- *   - INC/DEC may itself become NLM so preserved CF remains exact.
- *
- * G-2C:
- *   - one bounded static near CALL/RET leaf may be inlined into a natural
- *     loop from a 128-byte discovery window while the caller stays <=64
- *     bytes; the callee follows the caller span and has no nested control
- *     flow/stores/stack mutation and
- *     ends in plain C3 RET;
- *   - caller and callee are separate byte-validated guest spans and both are
- *     protected by stack/store coherency guards.
- *
  * Still deferred:
  *   - segment overrides and SCAS/CMPS single -> G-2B;
  *   - REP string forms stay with the existing special compiler;
  *   - ADC/SBB, CL shifts, CBW/CWD, XCHG -> G-3;
- *   - nested/multiple CALLs, non-leaf RET graphs, INT/far/indirect control;
+ *   - CALL/RET/INT/far/indirect control stays outside the general loop
+ *     (the largest remaining census item: SORT's read loop);
+ *   - different producers merging at a join (MASM 21A5:00E3);
  *   - parity Jcc, and INC/DEC exits whose incoming CF cannot be placed in
  *     cpu state (e.g. an INC/DEC latch producer with carried FLAGS).
  */
@@ -82,12 +68,6 @@ MdNativeV2Status md_native_v2g_compile_loop(const uint8_t *image,
                                              uint16_t entry_ip,
                                              MdNativeV2Code *out,
                                              size_t *guest_size_out);
-
-/* G-2C runtime/census entry: copies a bounded forward same-CS graph
-   window from the full 1 MiB guest image, then invokes NV2-G. */
-MdNativeV2Status md_native_v2g_compile_loop_graph(
-    const uint8_t *memory, uint16_t cs, uint16_t entry_ip,
-    MdNativeV2Code *out, size_t *guest_size_out);
 
 typedef struct MdNativeV2GStats {
     uint64_t attempts;

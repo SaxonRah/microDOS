@@ -252,7 +252,6 @@ target_compile_definitions(microdos_pico_nativev2g PRIVATE
     MICRODOS_ENABLE_NATIVE_V2=1
     MICRODOS_PICO_NATIVE_V2=1
     MICRODOS_ENABLE_NATIVE_V2G=1
-    MD_NATIVE_V2_CODE_BYTES=2048
     MD_X86_TRACK_WRITES=0
     MICRODOS_TRANSLATION_SUPPORT=0)
 pico_set_program_name(microdos_pico_nativev2g "microDOS Native-v2G G-1A")

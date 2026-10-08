@@ -233,18 +233,13 @@ int main(void)
     /* Carried FLAGS need an NLM-capable latch producer: INC cannot be. */
     ok &= expect_reject("carried-inc-latch", carried_inc_latch,
                         sizeof(carried_inc_latch), 0x0100u);
-    /*
-     * G-2B2: different FLAGS producers may merge at a join when every
-     * incoming producer can materialize exact native lazy state.
-     * producer_merge contains a guarded byte store, so validate the normal
-     * G memory/store metadata as well as successful compilation.
-     */
-    ok &= expect_ok_mem("producer-merge", producer_merge,
-                        sizeof(producer_merge), 1u);
+    /* Different producers merging at a join (21A5:00E3 shape): G-3. */
+    ok &= expect_reject("producer-merge", producer_merge,
+                        sizeof(producer_merge), 0x0100u);
 
     if (!ok)
         return 1;
 
-    puts("native-v2g G-1A/G-2B0/G-2B1/G-2B2 compiler tests PASS");
+    puts("native-v2g G-1A/G-2B0/G-2B1 compiler tests PASS");
     return 0;
 }

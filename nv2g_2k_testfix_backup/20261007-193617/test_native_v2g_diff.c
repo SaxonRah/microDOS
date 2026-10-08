@@ -1297,20 +1297,11 @@ static unsigned run_g2b1_guard_checks(MdNativeV2Code *compiled,
         uint32_t rem, retired = 0u, k;
         unsigned d;
         int ok;
-        int compact;
-        int expect_fallback;
-        int require_exact_retire;
         memset(compiled, 0, sizeof(*compiled));
         if (!compile_region(pc->code, pc->size, compiled)) {
             printf("[nv2g-diff] G-2B1 %s compile FAILED\n", pc->name);
             ++fails; continue;
         }
-
-        /* Compact layout has no inline tracker checks; normal layout does. */
-        compact = ((const uint8_t *)compiled->g_meta)[9] != 0u;
-        expect_fallback = pc->expect_fallback && compact;
-        require_exact_retire = !(pc->expect_fallback && !compact);
-
         setup_runtime(&a, mem_a, pc->code, pc->size, 0x2B10u + ci);
         setup_runtime(&b, mem_b, pc->code, pc->size, 0x2B10u + ci);
         sync_runtime_b(&a, &b, mem_a, mem_b);
@@ -1326,13 +1317,12 @@ static unsigned run_g2b1_guard_checks(MdNativeV2Code *compiled,
         b.cpu.code_page_executable = NULL;
         if (rem == MD_NATIVE_V2_EXEC_FALLBACK) {
             d = compare_state(&a, &b, 0u, 0u);
-            ok = expect_fallback && d == 0u;
+            ok = pc->expect_fallback && d == 0u;
         } else {
             retired = budget - rem;
             for (k = 0u; k < retired; ++k) (void)md_interp_step(&a);
             d = compare_state(&a, &b, rem, rem);
-            ok = !expect_fallback && d == 0u &&
-                 (!require_exact_retire || retired == pc->expect_retired);
+            ok = !pc->expect_fallback && d == 0u && retired == pc->expect_retired;
         }
         if (!ok) {
             printf("[nv2g-diff] G-2B1 %s FAILED kind=%u fallback=%d retired=%u expect=%u\n",

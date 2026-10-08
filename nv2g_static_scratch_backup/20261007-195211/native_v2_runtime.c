@@ -337,7 +337,7 @@ bool MD_HOT_FUNC(md_native_v2_runtime_try_execute)(MdNativeV2Runtime *runtime,
     ++runtime->probes;
 
     {
-        static MdNativeV2Code code;
+        MdNativeV2Code code;
         MdNativeV2Status st;
         size_t guest_size = 0u;
         uint8_t counter_reg = 0xFFu;
@@ -376,7 +376,6 @@ bool MD_HOT_FUNC(md_native_v2_runtime_try_execute)(MdNativeV2Runtime *runtime,
                 counter_reg = 0xFFu;
         }
 #endif
-
 
         if (st != MD_NATIVE_V2_OK ||
             guest_size == 0u ||

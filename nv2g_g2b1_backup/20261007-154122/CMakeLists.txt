@@ -284,7 +284,7 @@ if(MD_BUILD_TESTS)
             "${CMAKE_CURRENT_LIST_DIR}/include"
             "${CMAKE_CURRENT_LIST_DIR}/tests"
             "${CMAKE_CURRENT_LIST_DIR}/src/host" "${CMAKE_CURRENT_LIST_DIR}/src/system" "${MD_GENERATED_DIR}")
-        target_compile_definitions(microdos_nv2g_census PRIVATE MICRODOS_ENABLE_NATIVE_V2G=1 MD_NATIVE_V2_CODE_BYTES=2048)
+        target_compile_definitions(microdos_nv2g_census PRIVATE MICRODOS_ENABLE_NATIVE_V2G=1)
         if(MSVC)
             target_compile_definitions(microdos_nv2g_census PRIVATE _CRT_SECURE_NO_WARNINGS)
         endif()
