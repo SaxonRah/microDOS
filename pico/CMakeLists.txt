@@ -692,15 +692,20 @@ target_include_directories(blitzbus_pico_b86_dos PRIVATE
     "${MD_ROOT}/src/system"
     "${MD_ROOT}/pico")
 target_compile_definitions(blitzbus_pico_b86_dos PRIVATE
-    B86_MAXB=256 B86_MAP_BITS=10
+    B86_MAXB=2048 B86_MAP_BITS=12 B86_FAST_BITS=10
+    BB_CODE_BYTES=196608u BB_HOT_BYTES=32768u
+    B86_CALLOC=bb_meta_calloc B86_FREE=bb_meta_free B86_NOW=bb_now_us B86_MISSES=bb_xip_misses
+    B86_RAM_FUNCS=1
+    MICRODOS_SYSTEM_ENABLE_AOT=0 MICRODOS_SYSTEM_ENABLE_CACHE=0
     BLITZBUS_LIVE_BACKEND=1
     BLITZBUS_LCD_CONSOLE=1
     MR_LCD_PANEL_ST7796S=1 MR_ILI9341_MADCTL=0xE8 MR_LCD_SPI_BAUD=40000000u)
 target_sources(blitzbus_pico_b86_dos PRIVATE
-    "${MD_ROOT}/blitzbus-overlay/bb_lcd_console.c"
+    "C:/blitzBUS/src/bb_lcd_console.c"
     "${MD_ROOT}/blitzbus-overlay/mr_pico_ili9341.c"
     "${MD_ROOT}/blitzbus-overlay/gfx_font5x7.c")
 target_include_directories(blitzbus_pico_b86_dos PRIVATE "${MD_ROOT}/blitzbus-overlay")
 target_link_libraries(blitzbus_pico_b86_dos PRIVATE hardware_spi hardware_dma)
 pico_set_program_name(blitzbus_pico_b86_dos "blitzBUS DOS + blitz86 gated")
 # === blitzBUS v0.7 LIVE DOS END ===
+
