@@ -282,3 +282,9 @@ add_custom_command(TARGET microdos_pi0w_native3_bench.elf POST_BUILD
     COMMAND "${CMAKE_SIZE}" "$<TARGET_FILE:microdos_pi0w_native3_bench.elf>"
     BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/kernel8_native3_bench.img"
     COMMENT "Producing Native-3 kernel8_native3_bench.img")
+
+# Optional blitz86 external Pi probe
+include("${MD_ROOT}/pi0w/blitz86_pi_target.cmake")
+
+# Optional blitz86 native JIT diagnostic target
+include("${MD_ROOT}/pi0w/blitz86_pi_jit_target.cmake")

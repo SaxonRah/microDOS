@@ -637,3 +637,9 @@ target_compile_definitions(microdos_pico_native3_bench PRIVATE
     MD_JIT_LEGACY_HOTNESS=0
     MD_JIT_BLOCK_SLOTS=256)
 pico_set_program_name(microdos_pico_native3_bench "microDOS Native-3 40MIPS gate")
+
+# Optional blitz86 sidecar (does not modify existing targets)
+include("${MD_ROOT}/pico/blitz86_target.cmake")
+
+# Optional blitz86 native JIT diagnostic target
+include("${MD_ROOT}/pico/blitz86_pico_jit_target.cmake")
