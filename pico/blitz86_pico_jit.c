@@ -11,42 +11,85 @@ static uint8_t __uninitialized_psram("b86_jit_guest") __attribute__((aligned(64)
 /* Executable JIT code must live in internal SRAM, not external PSRAM or XIP flash. */
 static uint8_t __attribute__((aligned(64))) codebuf[96u*1024u];
 static B86Cpu cpu;
-static const uint8_t program[]={0xB8,1,0,0xB9,0,0x20,0x83,0xC0,3,0x49,0x75,0xFA,0xF4};
-static void reset_cpu(void){memset(guest,0,sizeof guest);memcpy(guest+0x10100,program,sizeof program);b86_init(&cpu,guest);b86_set_seg(&cpu,B86_CS,0x1000);b86_set_seg(&cpu,B86_DS,0x1000);b86_set_seg(&cpu,B86_SS,0x1000);b86_set_seg(&cpu,B86_ES,0x1000);cpu.ip=0x100;}
+
+/* Exact byte arrays copied from microDOS Pico Native-3 benchmark. */
+static const uint8_t wl_loop[]={0xB9,0,0x80,0x49,0x75,0xFD,0xF4};
+static const uint8_t wl_regmix[]={0xB8,1,0,0xBB,3,0,0xB9,0,0x80,0x31,0xD2,0x03,0xC3,0x33,0xD8,0x03,0xD0,0x49,0x75,0xF7,0xF4};
+static const uint8_t wl_callmix[]={0xB9,0,0x80,0xBB,0,0,0xE8,4,0,0x49,0x75,0xFA,0xF4,0x83,0xC3,3,0xC3};
+struct Work { const char *name; const uint8_t *bytes; unsigned size; };
+static const struct Work workloads[]={
+ {"loop",wl_loop,sizeof wl_loop},{"regmix",wl_regmix,sizeof wl_regmix},
+ {"callmix",wl_callmix,sizeof wl_callmix}
+};
+struct Snapshot {uint16_t reg[8],seg[4],ip,flags;uint32_t memhash;};
+static uint32_t memhash(void) {uint32_t h=2166136261u;for(unsigned i=0;i<B86_MEM_BYTES;i++){h^=guest[i];h*=16777619u;}return h;}
+static uint32_t normhash(void) {uint32_t h=2166136261u;for(unsigned i=0;i<65536u;i++){h^=guest[i];h*=16777619u;}return h;}
+static void snapshot(struct Snapshot *s) {for(unsigned i=0;i<8;i++)s->reg[i]=(uint16_t)cpu.r[i];for(unsigned i=0;i<4;i++)s->seg[i]=(uint16_t)cpu.seg[i];s->ip=(uint16_t)cpu.ip;s->flags=b86_get_flags(&cpu);s->memhash=memhash();}
+static uint32_t state32(const struct Snapshot *s){
+ uint32_t h=2166136261u;uint16_t v[14];unsigned i;
+ for(i=0;i<8;i++)v[i]=s->reg[i];
+ for(i=0;i<4;i++)v[i+8]=s->seg[i];
+ v[12]=s->ip;v[13]=(uint16_t)(s->flags & 0x08D7u);
+ for(i=0;i<14;i++){h^=(uint8_t)v[i];h*=16777619u;h^=(uint8_t)(v[i]>>8);h*=16777619u;}
+ return h;
+}
+static int equals(const struct Snapshot *a,const struct Snapshot *b){return memcmp(a,b,sizeof *a)==0;}
+static void reset_cpu(const struct Work *w){
+ memset(guest,0,sizeof guest);memcpy(guest+0x100,w->bytes,w->size);b86_init(&cpu,guest);
+ for(unsigned i=0;i<4;i++)b86_set_seg(&cpu,(int)i,0);
+ cpu.ip=0x100;cpu.r[B86_SP]=0xFFFEu;
+}
+static void emit(const char *work,const char *phase,int ok,uint64_t us,uint64_t retired,const struct Snapshot *got,const B86JitStats *st) {
+ printf("[bench] arch=pico workload=%s engine=blitz86-jit phase=%s result=%s us=%llu retired_ref=%llu hash=%08lx norm64=%08lx state32=%08lx blocks=%llu chains=%llu lookups=%llu\n",work,phase,ok?"PASS":"FAIL",(unsigned long long)us,(unsigned long long)retired,(unsigned long)got->memhash,(unsigned long)normhash(),(unsigned long)state32(got),(unsigned long long)st->blocks,(unsigned long long)st->chains,(unsigned long long)st->lookups);
+ stdio_flush();
+}
+static uint64_t now_us(void){return time_us_64();}
+
+static void sort7(uint64_t *x){for(unsigned i=1;i<7;i++){uint64_t v=x[i];unsigned j=i;while(j&&x[j-1]>v){x[j]=x[j-1];j--;}x[j]=v;}}
 static int run(void){
- if(!psram_is_available()||!psram_check_address(&guest[0])||!psram_check_address(&guest[B86_MEM_BYTES-1])){
-  printf("[b86-jit] PSRAM FAIL\n"); return 0;
- }
- reset_cpu();
- uint64_t t=time_us_64(); int ref=b86_run_interp(&cpu,100000); uint64_t dt=time_us_64()-t;
- printf("[b86-jit] interp result=%d AX=%04lX CX=%04lX us=%llu\n",ref,(unsigned long)(cpu.r[B86_AX]&65535u),(unsigned long)(cpu.r[B86_CX]&65535u),(unsigned long long)dt);
- if(ref!=B86_HALT||(cpu.r[B86_AX]&65535u)!=0x6001u||(cpu.r[B86_CX]&65535u)!=0)return 0;
- static const struct { const char *name; unsigned fast, chain; } modes[]={
-  {"baseline",0,0},{"fast-only",1,0},{"chain-only",0,1},{"full",1,1}
- };
- for(unsigned k=0;k<sizeof modes/sizeof modes[0];++k){
-  const char *name=modes[k].name;
-  reset_cpu(); b86_hw_alloc_reset();
-  struct B86Jit *j=b86_jit_create(&cpu,codebuf,sizeof codebuf);
-  if(!j){printf("[b86-jit] mode=%s ALLOC FAIL\n",name);return 0;}
-  b86_jit_set_max_block(j,48);
-  b86_jit_set_no_fast(j,!modes[k].fast);
-  uint32_t calls=0; int rc=B86_BUDGET;
-  t=time_us_64();
-  while(calls<30000u){
-   /* chain disabled: one C dispatch per call, so no patch_site survives.
-      chain enabled: dispatcher may patch direct successor branches. */
-   rc=b86_jit_run(&cpu,modes[k].chain?30000u:1u);
-   calls++;
-   if(rc==B86_HALT||rc==B86_EXIT||rc!=B86_BUDGET)break;
+ if(!psram_is_available()||!psram_check_address(&guest[0])||!psram_check_address(&guest[B86_MEM_BYTES-1]))return 0;
+ uint64_t samples[7];
+ for(unsigned w=0;w<sizeof workloads/sizeof workloads[0];w++){
+  const struct Work *p=&workloads[w];struct Snapshot oracle,got;
+  reset_cpu(p);uint64_t t=now_us();int ref=b86_run_interp(&cpu,1000000);uint64_t ref_us=now_us()-t;
+  uint64_t retired=cpu.icount;snapshot(&oracle);
+  if(ref!=B86_HALT)return 0;
+  printf("[bench] arch=pico workload=%s engine=blitz86-interp phase=cold result=PASS us=%llu retired=%llu\n",p->name,(unsigned long long)ref_us,(unsigned long long)retired);stdio_flush();
+  reset_cpu(p);b86_hw_alloc_reset();struct B86Jit *j=b86_jit_create(&cpu,codebuf,sizeof codebuf);
+  if(!j)return 0;
+  b86_jit_set_max_block(j,48);b86_jit_set_no_fast(j,1);
+  /* Preserve the post-creation CPU: it contains codemap/fast/JIT pointers.
+     Reinitialize guest RAM directly, but do NOT b86_init() a live JIT CPU. */
+  B86Cpu initial=cpu;
+  for(unsigned pass=0;pass<11;pass++){
+   const char *phase=pass==0?"cold":(pass<4?"warmup":"sample");
+   memset(guest,0,sizeof guest);memcpy(guest+0x100,p->bytes,p->size);
+   cpu=initial;
+   uint64_t started=now_us();int rc=b86_jit_run(&cpu,500000);uint64_t elapsed=now_us()-started;
+   snapshot(&got);
+   int ok=rc==B86_HALT&&equals(&oracle,&got);
+   const B86JitStats *st=b86_jit_stats(j);
+   if(pass==0)emit(p->name,"cold",ok,elapsed,retired,&got,st);
+   if(pass>=4){samples[pass-4]=elapsed;}
+   if(!ok){
+    printf("[bench] ERROR workload=%s phase=%s rc=%d\n",p->name,phase,rc);return 0;
+   }
   }
-  dt=time_us_64()-t;
-  const B86JitStats *st=b86_jit_stats(j);
-  int ok=rc==B86_HALT&&(cpu.r[B86_AX]&65535u)==0x6001u&&(cpu.r[B86_CX]&65535u)==0;
-  printf("[b86-jit] mode=%s result=%s rc=%d AX=%04lX CX=%04lX calls=%lu us=%llu blocks=%llu chains=%llu lookups=%llu dispatches=%llu\n",name,ok?"PASS":"FAIL",rc,(unsigned long)(cpu.r[B86_AX]&65535u),(unsigned long)(cpu.r[B86_CX]&65535u),(unsigned long)calls,(unsigned long long)dt,(unsigned long long)st->blocks,(unsigned long long)st->chains,(unsigned long long)st->lookups,(unsigned long long)st->dispatches);
-  if(!ok)return 0;
+  sort7(samples);
+  emit(p->name,"warm-median-7",1,samples[3],retired,&got,b86_jit_stats(j));
  }
  return 1;
 }
-int main(void){stdio_init_all();set_sys_clock_khz(300000,false);if(psram_configure_params(PICO_DEFAULT_PSRAM_MAX_FREQ,PICO_DEFAULT_PSRAM_MAX_SELECT,PICO_DEFAULT_PSRAM_MIN_DESELECT)!=0||psram_reinitialize()!=0){while(!stdio_usb_connected())sleep_ms(20);printf("[b86-jit] COMPLETE result=FAIL PSRAM initialization\n");for(;;)sleep_ms(1000);}
- while(!stdio_usb_connected())sleep_ms(20);sleep_ms(300);printf("[b86-jit] BEGIN Thumb-2 control-flow matrix\n");int ok=run();printf("[b86-jit] COMPLETE result=%s\n",ok?"PASS":"FAIL");stdio_flush();for(;;)sleep_ms(1000);}
+
+int main(void){
+ stdio_init_all();set_sys_clock_khz(300000,false);
+ if(psram_configure_params(PICO_DEFAULT_PSRAM_MAX_FREQ,PICO_DEFAULT_PSRAM_MAX_SELECT,PICO_DEFAULT_PSRAM_MIN_DESELECT)!=0||psram_reinitialize()!=0){
+  while(!stdio_usb_connected())sleep_ms(20);
+  printf("[b86-jit] COMPLETE result=FAIL PSRAM initialization\n");for(;;)sleep_ms(1000);
+ }
+ while(!stdio_usb_connected())sleep_ms(20);
+ sleep_ms(300);
+ printf("[b86-jit] BEGIN warm median comparison (cold + 7 measured)\n");
+ int ok=run();printf("[b86-jit] COMPLETE result=%s\n",ok?"PASS":"FAIL");
+ stdio_flush();for(;;)sleep_ms(1000);
+}
