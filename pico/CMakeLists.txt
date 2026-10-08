@@ -705,7 +705,7 @@ target_sources(blitzbus_pico_b86_dos PRIVATE
     "${MD_ROOT}/blitzbus-overlay/mr_pico_ili9341.c"
     "${MD_ROOT}/blitzbus-overlay/gfx_font5x7.c")
 target_include_directories(blitzbus_pico_b86_dos PRIVATE "${MD_ROOT}/blitzbus-overlay")
-target_link_libraries(blitzbus_pico_b86_dos PRIVATE hardware_spi hardware_dma)
+target_link_libraries(blitzbus_pico_b86_dos PRIVATE hardware_spi hardware_dma pico_multicore)
 pico_set_program_name(blitzbus_pico_b86_dos "blitzBUS DOS + blitz86 gated")
 # === blitzBUS v0.7 LIVE DOS END ===
 
