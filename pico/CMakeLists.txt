@@ -710,3 +710,18 @@ target_link_libraries(blitzbus_pico_b86_dos PRIVATE hardware_spi hardware_dma ha
 pico_set_program_name(blitzbus_pico_b86_dos "blitzBUS DOS + blitz86 gated")
 # === blitzBUS v0.7 LIVE DOS END ===
 
+
+# blitz86 Thumb-2 effective-address immediate optimization
+if(TARGET blitzbus_pico_b86_dos)
+    target_compile_definitions(
+        blitzbus_pico_b86_dos
+        PRIVATE B86_EA_IMM12_FAST=1
+    )
+    target_compile_definitions(
+	blitzbus_pico_b86_dos
+	PRIVATE B86_OPT_PAGE_ZERO=1
+    )
+    target_compile_definitions(blitzbus_pico_b86_dos PRIVATE
+        B86_OPT_CS_CONST=0
+    )
+endif()
