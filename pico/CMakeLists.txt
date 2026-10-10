@@ -697,6 +697,7 @@ target_compile_definitions(blitzbus_pico_b86_dos PRIVATE
     B86_PAGED=1 BB_BBUF_SRAM=1
     B86_CALLOC=bb_meta_calloc B86_FREE=bb_meta_free B86_NOW=bb_now_us B86_MISSES=bb_xip_misses
     B86_RAM_FUNCS=1
+    PICO_STACK_SIZE=0x1000 PICO_CORE1_STACK_SIZE=0x1000
     MICRODOS_SYSTEM_ENABLE_AOT=0 MICRODOS_SYSTEM_ENABLE_CACHE=0
     BLITZBUS_LIVE_BACKEND=1
     BLITZBUS_LCD_CONSOLE=1
@@ -707,6 +708,8 @@ target_sources(blitzbus_pico_b86_dos PRIVATE
     "${MD_ROOT}/blitzbus-overlay/gfx_font5x7.c")
 target_include_directories(blitzbus_pico_b86_dos PRIVATE "${MD_ROOT}/blitzbus-overlay")
 target_link_libraries(blitzbus_pico_b86_dos PRIVATE hardware_spi hardware_dma hardware_clocks pico_multicore)
+# v51: quiesce before the USB reset interface's BOOTSEL reboot (picotool reboot -f)
+target_link_options(blitzbus_pico_b86_dos PRIVATE "-Wl,--wrap=reset_usb_boot")
 pico_set_program_name(blitzbus_pico_b86_dos "blitzBUS DOS + blitz86 gated")
 # === blitzBUS v0.7 LIVE DOS END ===
 
