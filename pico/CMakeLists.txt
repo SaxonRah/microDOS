@@ -728,3 +728,35 @@ if(TARGET blitzbus_pico_b86_dos)
         B86_OPT_CS_CONST=0
     )
 endif()
+
+
+
+
+
+
+
+
+
+
+
+
+
+# === BB SD BOOT STAGE1 BEGIN ===
+set(BB_SD_LIB_ROOT "C:/microconsole/third_party/pico-fatfs-sd" CACHE PATH "microconsole pico-fatfs-sd checkout")
+if(NOT EXISTS "${BB_SD_LIB_ROOT}/src/CMakeLists.txt")
+    message(FATAL_ERROR "SD stage1 requires pico-fatfs-sd at ${BB_SD_LIB_ROOT}; see README")
+endif()
+if(NOT TARGET pico-fatfs-sd)
+    add_subdirectory("${BB_SD_LIB_ROOT}/src" "${CMAKE_CURRENT_BINARY_DIR}/bb-pico-fatfs-sd")
+endif()
+target_sources(blitzbus_pico_b86_dos PRIVATE
+    "C:/blitzBUS/sd_boot/bb_sd_hw.c"
+    "C:/blitzBUS/sd_boot/bb_sd_boot.c")
+target_link_libraries(blitzbus_pico_b86_dos PRIVATE pico-fatfs-sd hardware_spi)
+# Both projects define HardFault_Handler. Keep the blitzBUS handler with its
+# watchdog scratch diagnostics; do not compile the SD library crash handler
+# into this executable. HEADER_FILE_ONLY suppresses its INTERFACE_SOURCES
+# compilation without changing files in the shared microconsole checkout.
+set_source_files_properties("${BB_SD_LIB_ROOT}/src/src/crash.c"
+    PROPERTIES HEADER_FILE_ONLY TRUE)
+# === BB SD BOOT STAGE1 END ===
