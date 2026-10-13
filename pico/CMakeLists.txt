@@ -693,7 +693,7 @@ target_include_directories(blitzbus_pico_b86_dos PRIVATE
     "${MD_ROOT}/pico")
 target_compile_definitions(blitzbus_pico_b86_dos PRIVATE
     B86_MAXB=2048 B86_MAP_BITS=12 B86_FAST_BITS=10
-    BB_CODE_BYTES=237568u BB_HOT_BYTES=40960u BB_HOT_THRESHOLD=64u
+    BB_CODE_BYTES=237568u BB_HOT_BYTES=40960u BB_HOT_THRESHOLD=64u BB_CPU_MODEL=2u
     B86_PAGED=1 BB_BBUF_SRAM=1
     B86_CALLOC=bb_meta_calloc B86_FREE=bb_meta_free B86_NOW=bb_now_us B86_MISSES=bb_xip_misses
     B86_RAM_FUNCS=1 B86_TV_SRAM=0 BB_PC_PROFILE=0
