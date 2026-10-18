@@ -679,22 +679,22 @@ md_pico_dos(blitzbus_pico_b86_dos 0 0 300000 0 0 0 0 0 0)
 get_target_property(_bb_src blitzbus_pico_b86_dos SOURCES)
 list(REMOVE_ITEM _bb_src "${CMAKE_CURRENT_LIST_DIR}/microdos_pico.c")
 list(REMOVE_ITEM _bb_src "${MD_ROOT}/src/system/md_dos2_system.c")
-list(APPEND _bb_src "C:/blitzBUS-product/build/generated/bb_microdos_pico.c"
-    "C:/blitzBUS-product/build/generated/bb_md_dos2_system.c"
-    "C:/blitzBUS-product/src/bb_live.c"
+list(APPEND _bb_src "C:/blitzBUS/generated/bb_microdos_pico.c"
+    "C:/blitzBUS/generated/bb_md_dos2_system.c"
+    "C:/blitzBUS/src/bb_live.c"
     "C:/blitz86_v2/src/interp.c"
     "C:/blitz86_v2/src/jit.c"
     "C:/blitz86_v2/src/be_t2.c")
 set_property(TARGET blitzbus_pico_b86_dos PROPERTY SOURCES "${_bb_src}")
 target_include_directories(blitzbus_pico_b86_dos PRIVATE
-    "C:/blitzBUS-product/src"
+    "C:/blitzBUS/src"
     "C:/blitz86_v2/include"
     "${MD_ROOT}/src/system"
     "${MD_ROOT}/pico")
 target_compile_definitions(blitzbus_pico_b86_dos PRIVATE
     B86_MAXB=2048 B86_MAP_BITS=12 B86_FAST_BITS=10 B86_EVICT_CHUNK=4096u B86_EVICT_ROOM=2048u
-    BB_CODE_BYTES=237568u BB_HOT_BYTES=40960u BB_HOT_THRESHOLD=32u BB_CPU_MODEL=2u BB_NO_CHAIN=0 BB_CHAIN_PROFILE=1
-    B86_PAGED=1 BB_BBUF_SRAM=0 BB_NATIVE_BIOS=1 BB_SPARSE_SHADOW=1 BB386_PICO_PROBE=0
+    BB_CODE_BYTES=237568u BB_HOT_BYTES=40960u BB_HOT_THRESHOLD=32u BB_CPU_MODEL=3u BB_NO_CHAIN=0 BB_CHAIN_PROFILE=1
+    B86_PAGED=1 BB_BBUF_SRAM=0
     B86_CALLOC=bb_meta_calloc B86_FREE=bb_meta_free B86_NOW=bb_now_us B86_MISSES=bb_xip_misses
     B86_RAM_FUNCS=1 B86_TV_SRAM=0 BB_PC_PROFILE=0
     PICO_STACK_SIZE=0x1000 PICO_CORE1_STACK_SIZE=0x1000
@@ -703,7 +703,7 @@ target_compile_definitions(blitzbus_pico_b86_dos PRIVATE
     BLITZBUS_LCD_CONSOLE=1
     MR_LCD_PANEL_ST7796S=1 MR_ILI9341_MADCTL=0xE8 MR_LCD_SPI_BAUD=75000000u BB_LCD_PERI_HZ=150000000u BB_LCD_LACE=1)
 target_sources(blitzbus_pico_b86_dos PRIVATE
-    "C:/blitzBUS-product/src/bb_lcd_console.c"
+    "C:/blitzBUS/src/bb_lcd_console.c"
     "${MD_ROOT}/blitzbus-overlay/mr_pico_ili9341.c"
     "${MD_ROOT}/blitzbus-overlay/gfx_font5x7.c")
 target_include_directories(blitzbus_pico_b86_dos PRIVATE "${MD_ROOT}/blitzbus-overlay")
@@ -739,8 +739,8 @@ if(NOT TARGET pico-fatfs-sd)
     add_subdirectory("${BB_SD_LIB_ROOT}/src" "${CMAKE_CURRENT_BINARY_DIR}/bb-pico-fatfs-sd")
 endif()
 target_sources(blitzbus_pico_b86_dos PRIVATE
-    "C:/blitzBUS-product/sd_boot/bb_sd_hw.c"
-    "C:/blitzBUS-product/sd_boot/bb_sd_boot.c")
+    "C:/blitzBUS/sd_boot/bb_sd_hw.c"
+    "C:/blitzBUS/sd_boot/bb_sd_boot.c")
 target_link_libraries(blitzbus_pico_b86_dos PRIVATE pico-fatfs-sd hardware_spi)
 set_source_files_properties("${BB_SD_LIB_ROOT}/src/src/crash.c"
     PROPERTIES HEADER_FILE_ONLY TRUE)
@@ -750,6 +750,6 @@ set_source_files_properties("${BB_SD_LIB_ROOT}/src/src/crash.c"
 get_target_property(_bb_c_sources blitzbus_pico_b86_dos SOURCES)
 list(REMOVE_ITEM _bb_c_sources "${MD_ROOT}/src/host/msdos2_boot.c")
 list(REMOVE_ITEM _bb_c_sources "${CMAKE_CURRENT_LIST_DIR}/../src/host/msdos2_boot.c")
-list(APPEND _bb_c_sources "C:/blitzBUS-product/sd_boot/bb_msdos2_boot.c")
+list(APPEND _bb_c_sources "C:/blitzBUS/sd_boot/bb_msdos2_boot.c")
 set_property(TARGET blitzbus_pico_b86_dos PROPERTY SOURCES "${_bb_c_sources}")
 # BB_STAGE2B_V3_END
