@@ -455,9 +455,13 @@ void md_x86_store16_tracked(MdX86 *cpu, uint32_t a0, uint16_t value);
    per-page bookkeeping when the range does not wrap (disk transfers). */
 void md_x86_write_block(MdX86 *cpu, uint16_t segment, uint16_t offset,
                         const uint8_t *data, uint32_t len);
+/* BB_V36_MD_SCALAR_DIRTY_V1: observational guest-physical write notification.
+ * The target runtime supplies this symbol even without linked blitz86. */
+void md_v36_scalar_note(uint32_t physical, uint32_t bytes);
 
 static inline void md_x86_write8_tracked_inline(MdX86 *cpu, uint32_t a0, uint8_t value)
 {
+    md_v36_scalar_note(a0, 1u);
     cpu->memory[a0] = value;
     md_x86_note_code_write(cpu, a0);
 }
@@ -471,6 +475,7 @@ static inline void md_x86_write16_tracked_inline(MdX86 *cpu, uint32_t a0, uint16
     const unsigned f0 = md_x86_page_flags(cpu, a0);
     const unsigned f1 = p1 == p0 ? f0 : md_x86_page_flags(cpu, a1);
 
+    md_v36_scalar_note(a0, 2u);
     cpu->memory[a0] = (uint8_t)value;
     cpu->memory[a1] = (uint8_t)(value >> 8);
     /* Page generations: once per touched TRANSLATED page. AOT: every byte. */
@@ -486,7 +491,7 @@ static inline void md_x86_write16_tracked_inline(MdX86 *cpu, uint32_t a0, uint16
 static inline void md_x86_write8_linear(MdX86 *cpu, uint32_t address, uint8_t value)
 {
     const uint32_t a0 = address & MD_X86_ADDRESS_MASK;
-    if (!md_x86_page_executable(cpu, a0)) { cpu->memory[a0] = value; return; }
+    if (!md_x86_page_executable(cpu, a0)) { md_v36_scalar_note(a0, 1u); cpu->memory[a0] = value; return; }
     md_x86_store8_tracked(cpu, a0, value);
 }
 
@@ -496,6 +501,7 @@ static inline void md_x86_write16_linear(MdX86 *cpu, uint32_t address, uint16_t 
     const uint32_t a1 = (a0 + 1u) & MD_X86_ADDRESS_MASK;
     if (!md_x86_page_executable(cpu, a0) &&
         ((a0 & MD_X86_CODE_PAGE_MASK) != MD_X86_CODE_PAGE_MASK || !md_x86_page_executable(cpu, a1))) {
+        md_v36_scalar_note(a0, 2u);
         cpu->memory[a0] = (uint8_t)value;
         cpu->memory[a1] = (uint8_t)(value >> 8);
         return;
@@ -505,6 +511,7 @@ static inline void md_x86_write16_linear(MdX86 *cpu, uint32_t address, uint16_t 
 #else
 static inline void md_x86_write8_linear(MdX86 *cpu, uint32_t address, uint8_t value)
 {
+    md_v36_scalar_note(address & MD_X86_ADDRESS_MASK, 1u);
     cpu->memory[address & MD_X86_ADDRESS_MASK] = value;
 }
 
@@ -512,6 +519,7 @@ static inline void md_x86_write16_linear(MdX86 *cpu, uint32_t address, uint16_t 
 {
     const uint32_t a0 = address & MD_X86_ADDRESS_MASK;
     const uint32_t a1 = (a0 + 1u) & MD_X86_ADDRESS_MASK;
+    md_v36_scalar_note(a0, 2u);
     cpu->memory[a0] = (uint8_t)value;
     cpu->memory[a1] = (uint8_t)(value >> 8);
 }

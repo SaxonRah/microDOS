@@ -320,6 +320,70 @@ void md_x86_store16_tracked(MdX86 *cpu, uint32_t a0, uint16_t value)
     md_x86_write16_tracked_inline(cpu, a0, value);
 }
 
+/* BB_V35_MD_BULK_DIRTY_V1: physical-page observation for microDOS bulk writes.
+ * Optional weak blitz86 bridge: standalone microDOS remains linkable.
+ * Mark before the store; do not use these observations to skip exact validation.
+ * The fallback path wraps at segment and linear-address boundaries. */
+#if defined(__GNUC__) || defined(__clang__)
+extern void b86_v34_note_host_phys(uint32_t phys, uint32_t n) __attribute__((weak));
+#endif
+/* BB_V36_MD_SCALAR_DIRTY_V1: scalar real-mode/BIOS writer bridge.
+ * One notification per scalar store, or two spans if the physical window wraps.
+ * Retain the existing tracked/untracked writer behavior and exact checks. */
+static uint32_t md_v36_byte, md_v36_word, md_v36_wrapped, md_v36_notify;
+void md_v36_scalar_stats(uint32_t out[4])
+{
+    if (out == 0) return;
+    out[0] = md_v36_byte;
+    out[1] = md_v36_word;
+    out[2] = md_v36_wrapped;
+    out[3] = md_v36_notify;
+}
+void md_v36_scalar_note(uint32_t addr, uint32_t len)
+{
+    const uint32_t size = MD_X86_ADDRESS_SPACE;
+    uint32_t a, first;
+    if (len == 0u) return;
+    if (len == 1u) ++md_v36_byte;
+    else if (len == 2u) ++md_v36_word;
+    a = addr & MD_X86_ADDRESS_MASK;
+    first = size - a;
+    if (first > len) first = len;
+    if (first < len) ++md_v36_wrapped;
+#if defined(__GNUC__) || defined(__clang__)
+    if (b86_v34_note_host_phys != 0) {
+        b86_v34_note_host_phys(a, first);
+        ++md_v36_notify;
+        if (first < len) {
+            b86_v34_note_host_phys(0u, len - first);
+            ++md_v36_notify;
+        }
+    }
+#endif
+}
+static uint32_t md_v35_direct_calls, md_v35_wrapped_calls;
+static uint32_t md_v35_notify_calls, md_v35_bytes;
+void md_v35_bulk_stats(uint32_t out[4])
+{
+    if (out == 0) return;
+    out[0] = md_v35_direct_calls;
+    out[1] = md_v35_wrapped_calls;
+    out[2] = md_v35_notify_calls;
+    out[3] = md_v35_bytes;
+}
+static void md_v35_mark_phys(uint32_t phys, uint32_t len)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    if (b86_v34_note_host_phys != 0) {
+        b86_v34_note_host_phys(phys, len);
+        ++md_v35_notify_calls;
+        md_v35_bytes += len;
+    }
+#else
+    (void)phys; (void)len;
+#endif
+}
+
 void MD_DOS_HOT_FUNC(md_x86_write_block)(MdX86 *cpu, uint16_t segment, uint16_t offset,
                         const uint8_t *data, uint32_t len)
 {
@@ -327,9 +391,26 @@ void MD_DOS_HOT_FUNC(md_x86_write_block)(MdX86 *cpu, uint16_t segment, uint16_t 
     uint32_t i;
     if (len == 0u) return;
     if ((uint32_t)offset + len > 0x10000u || lin + len > MD_X86_ADDRESS_SPACE) {
+        /* Do not assume that a 64 KiB segment wrap is contiguous physical RAM.
+         * Determine all destination spans before any guest write occurs. */
+        uint32_t j = 0u;
+        ++md_v35_wrapped_calls;
+        while (j < len) {
+            const uint16_t off = (uint16_t)((uint32_t)offset + j);
+            const uint32_t addr = md_x86_linear(segment, off);
+            uint32_t span = len - j;
+            const uint32_t to_seg_end = 0x10000u - (uint32_t)off;
+            const uint32_t to_mem_end = MD_X86_ADDRESS_SPACE - addr;
+            if (span > to_seg_end) span = to_seg_end;
+            if (span > to_mem_end) span = to_mem_end;
+            md_v35_mark_phys(addr, span);
+            j += span;
+        }
         for (i = 0; i < len; ++i) md_x86_write8(cpu, segment, (uint16_t)(offset + i), data[i]);
         return;
     }
+    ++md_v35_direct_calls;
+    md_v35_mark_phys(lin, len);
     memcpy(cpu->memory + lin, data, len);
 #if MICRODOS_TRANSLATION_SUPPORT
     {
