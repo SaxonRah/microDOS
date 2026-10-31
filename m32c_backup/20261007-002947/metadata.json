@@ -1,9 +1,0 @@
-{
-  "created": "20261007-002947",
-  "files": [
-    "include/microdos/translate.h",
-    "src/runtime/translate.c",
-    "pico/microdos_pico.c",
-    "pico/CMakeLists.txt"
-  ]
-}
