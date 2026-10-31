@@ -675,7 +675,9 @@ pico_set_program_name(blitzbus_b86_jit_probe "blitzBUS Thumb2 JIT proof")
 
 # === blitzBUS v0.7 LIVE DOS BEGIN ===
 # The original microdos_pico target and original source files remain untouched.
-md_pico_dos(blitzbus_pico_b86_dos 0 0 400000 0 0 0 0 0 0)
+# Generated DOS target defaults to the same conservative BB profile as blitzBUS.
+# scripts/install_live.py refreshes this block for explicit overrides.
+md_pico_dos(blitzbus_pico_b86_dos 0 0 300000 0 0 0 0 0 0)
 get_target_property(_bb_src blitzbus_pico_b86_dos SOURCES)
 list(REMOVE_ITEM _bb_src "${CMAKE_CURRENT_LIST_DIR}/microdos_pico.c")
 list(REMOVE_ITEM _bb_src "${MD_ROOT}/src/system/md_dos2_system.c")
@@ -696,7 +698,7 @@ target_compile_definitions(blitzbus_pico_b86_dos PRIVATE
     BB_CODE_BYTES=131072u BB_HOT_BYTES=40960u BB_HOT_THRESHOLD=32u BB_CPU_MODEL=3u BB_NO_CHAIN=0 BB_CHAIN_PROFILE=1
     B86_PAGED=1 BB_BBUF_SRAM=0
     B86_CALLOC=bb_meta_calloc B86_FREE=bb_meta_free B86_NOW=bb_now_us B86_MISSES=bb_xip_misses
-    BB386_PM_IRQ0=0 BB386_PM_KBD=1 B86_RAM_FUNCS=1 B86_PJ=1 B86_PJ_HASH=512u B86_PJ_CPS=256u BB_PJ_PSRAM=1 BB_PJ_CODE_KB=1024 BB_PJ_HOT_KB=128 B86_PM_RAM=1 B86_TV_SRAM=0 BB_PC_PROFILE=1
+    BB386_PM_IRQ0=0 BB386_PM_KBD=1 B86_RAM_FUNCS=1 B86_PJ=1 B86_PJ_HASH=512u B86_PJ_CPS=256u BB_PJ_PSRAM=1 BB_PJ_CODE_KB=1024 BB_PJ_HOT_KB=96 B86_PJ_V85_TIER_SPLIT=1 B86_PM_RAM=1 B86_TV_SRAM=0 BB_PC_PROFILE=1
     PICO_STACK_SIZE=0x1000 PICO_CORE1_STACK_SIZE=0x1000
     MICRODOS_SYSTEM_ENABLE_AOT=0 MICRODOS_SYSTEM_ENABLE_CACHE=0
     BLITZBUS_LIVE_BACKEND=1
