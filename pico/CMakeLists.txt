@@ -658,24 +658,10 @@ include("${MD_ROOT}/pico/blitz86_target.cmake")
 # Optional blitz86 native JIT diagnostic target
 include("${MD_ROOT}/pico/blitz86_pico_jit_target.cmake")
 
-# === blitzBUS v0.6 JIT PROBE BEGIN ===
-# Standalone hardware gate: not connected to DOS runtime yet.
-add_executable(blitzbus_b86_jit_probe
-    "C:/blitzBUS/pico/bb_jit_probe.c"
-    "C:/blitz86_v2/src/interp.c"
-    "C:/blitz86_v2/src/jit.c"
-    "C:/blitz86_v2/src/be_t2.c")
-target_include_directories(blitzbus_b86_jit_probe PRIVATE "C:/blitz86_v2/include")
-# Bounded metadata footprint, independent of the benchmark's JIT configuration.
-target_compile_definitions(blitzbus_b86_jit_probe PRIVATE
-    B86_MAXB=256 B86_MAP_BITS=10 MICRODOS_PICO_SYS_KHZ=300000)
-md_pico_common(blitzbus_b86_jit_probe 0)
-pico_set_program_name(blitzbus_b86_jit_probe "blitzBUS Thumb2 JIT proof")
-# === blitzBUS v0.6 JIT PROBE END ===
 
 # === blitzBUS v0.7 LIVE DOS BEGIN ===
 # The original microdos_pico target and original source files remain untouched.
-md_pico_dos(blitzbus_pico_b86_dos 0 0 400000 0 0 0 0 0 0)
+md_pico_dos(blitzbus_pico_b86_dos 0 0 360000 0 0 0 0 0 0)
 get_target_property(_bb_src blitzbus_pico_b86_dos SOURCES)
 list(REMOVE_ITEM _bb_src "${CMAKE_CURRENT_LIST_DIR}/microdos_pico.c")
 list(REMOVE_ITEM _bb_src "${MD_ROOT}/src/system/md_dos2_system.c")
@@ -696,14 +682,15 @@ target_compile_definitions(blitzbus_pico_b86_dos PRIVATE
     BB_CODE_BYTES=131072u BB_HOT_BYTES=40960u BB_HOT_THRESHOLD=32u BB_CPU_MODEL=3u BB_NO_CHAIN=0 BB_CHAIN_PROFILE=1
     B86_PAGED=1 BB_BBUF_SRAM=0
     B86_CALLOC=bb_meta_calloc B86_FREE=bb_meta_free B86_NOW=bb_now_us B86_MISSES=bb_xip_misses
-    BB386_PM_IRQ0=0 BB386_PM_KBD=1 B86_RAM_FUNCS=1 B86_PJ=1 B86_PJ_HASH=512u B86_PJ_CPS=256u BB_PJ_PSRAM=1 BB_PJ_CODE_KB=1024 BB_PJ_HOT_KB=128 BB_META_BYTES=655360u B86_PM_RAM=1 B86_TV_SRAM=0 BB_PC_PROFILE=1
+    BB386_PM_IRQ0=0 BB386_PM_KBD=1 B86_RAM_FUNCS=1 B86_PJ=1 B86_PJ_HASH=512u BB_PJ_STATE_BYTES=8192u B86_PJ_CPS=256u BB_PJ_PSRAM=1 BB_PJ_CODE_KB=1024 BB_PJ_HOT_KB=92 BB_META_BYTES=917504u B86_PM_RAM=1 B86_TV_SRAM=0 BB_PC_PROFILE=1
     PICO_STACK_SIZE=0x1000 PICO_CORE1_STACK_SIZE=0x1000
     MICRODOS_SYSTEM_ENABLE_AOT=0 MICRODOS_SYSTEM_ENABLE_CACHE=0
     BLITZBUS_LIVE_BACKEND=1
-    B86_RAM_BYTES=4653056u
+    B86_RAM_BYTES=4194304u
     BLITZBUS_LCD_CONSOLE=1
-    MR_LCD_PANEL_ST7796S=1 MR_ILI9341_MADCTL=0xE8 MR_LCD_SPI_BAUD=75000000u BB_LCD_PERI_HZ=150000000u BB_LCD_LACE=1
-    BB622_SD_SPI_HZ=18750000u BB622_SD_MULTI=64u)
+    MR_LCD_PANEL_ST7796S=1 MR_ILI9341_MADCTL=0xE8 MR_LCD_SPI_BAUD=75000000u BB_LCD_PERI_HZ=120000000u BB_LCD_PERI_SYSDIV=3 BB_LCD_LACE=1
+    BB622_SD_SPI_HZ=12500000u BB622_SD_MULTI=64u
+    B86_V90_INTERP_HIST=0 B86_PJ_V91_PM16=0 BB_PJ_PM16_ADAPTIVE=0 B86_PJ_V93_PM16_LINK=0)
 target_sources(blitzbus_pico_b86_dos PRIVATE
     "C:/blitzBUS/src/bb_lcd_console.c"
     "${MD_ROOT}/blitzbus-overlay/mr_pico_ili9341.c"
