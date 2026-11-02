@@ -682,7 +682,7 @@ target_compile_definitions(blitzbus_pico_b86_dos PRIVATE
     BB_CODE_BYTES=131072u BB_HOT_BYTES=40960u BB_HOT_THRESHOLD=32u BB_CPU_MODEL=3u BB_NO_CHAIN=0 BB_CHAIN_PROFILE=1
     B86_PAGED=1 BB_BBUF_SRAM=0
     B86_CALLOC=bb_meta_calloc B86_FREE=bb_meta_free B86_NOW=bb_now_us B86_MISSES=bb_xip_misses
-    BB386_PM_IRQ0=0 BB386_PM_KBD=1 B86_RAM_FUNCS=1 B86_PJ=1 B86_PJ_HASH=512u BB_PJ_STATE_BYTES=8192u B86_PJ_CPS=256u BB_PJ_PSRAM=1 BB_PJ_CODE_KB=1024 BB_PJ_HOT_KB=92 BB_META_BYTES=917504u B86_PM_RAM=1 B86_TV_SRAM=0 BB_PC_PROFILE=1
+    BB386_PM_IRQ0=1 BB386_PM_KBD=1 B86_RAM_FUNCS=1 B86_PJ=1 B86_PJ_HASH=512u BB_PJ_STATE_BYTES=8192u B86_PJ_CPS=256u BB_PJ_PSRAM=1 BB_PJ_CODE_KB=1024 BB_PJ_HOT_KB=92 BB_META_BYTES=917504u B86_PM_RAM=1 B86_TV_SRAM=0 BB_PC_PROFILE=1
     PICO_STACK_SIZE=0x1000 PICO_CORE1_STACK_SIZE=0x1000
     MICRODOS_SYSTEM_ENABLE_AOT=0 MICRODOS_SYSTEM_ENABLE_CACHE=0
     BLITZBUS_LIVE_BACKEND=1
@@ -696,7 +696,7 @@ target_sources(blitzbus_pico_b86_dos PRIVATE
     "${MD_ROOT}/blitzbus-overlay/mr_pico_ili9341.c"
     "${MD_ROOT}/blitzbus-overlay/gfx_font5x7.c")
 target_include_directories(blitzbus_pico_b86_dos PRIVATE "${MD_ROOT}/blitzbus-overlay")
-target_link_libraries(blitzbus_pico_b86_dos PRIVATE hardware_spi hardware_dma hardware_clocks pico_multicore)
+target_link_libraries(blitzbus_pico_b86_dos PRIVATE hardware_spi hardware_dma hardware_clocks pico_multicore hardware_pio)
 # v51: quiesce before the USB reset interface's BOOTSEL reboot (picotool reboot -f)
 target_link_options(blitzbus_pico_b86_dos PRIVATE "-Wl,--wrap=reset_usb_boot")
 pico_set_program_name(blitzbus_pico_b86_dos "blitzBUS DOS + blitz86 gated")
